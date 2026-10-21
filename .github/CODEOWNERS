@@ -1,0 +1,8 @@
+# Everything is owned by the maintainer; sensitive paths are listed explicitly
+# so they stay protected if ownership is ever split.
+*                       @Ulysses
+/api/internal/auth/     @Ulysses
+/api/internal/session/  @Ulysses
+/.github/               @Ulysses
+/CLAUDE.md              @Ulysses
+/.claude/               @Ulysses

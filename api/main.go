@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -24,7 +25,12 @@ func mustEnv(name string) string {
 }
 
 func main() {
-	codec, err := session.NewCodec([]byte(mustEnv("SESSION_KEY")), os.Getenv("COOKIE_INSECURE") != "true")
+	key, err := base64.StdEncoding.DecodeString(mustEnv("SESSION_KEY"))
+	if err != nil {
+		slog.Error("SESSION_KEY must be base64 (generate with: openssl rand -base64 32)")
+		os.Exit(1)
+	}
+	codec, err := session.NewCodec(key, os.Getenv("COOKIE_INSECURE") != "true")
 	if err != nil {
 		slog.Error("session key", "err", err)
 		os.Exit(1)

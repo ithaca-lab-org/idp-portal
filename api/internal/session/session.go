@@ -1,4 +1,4 @@
-// Package session implements stateless signed cookies (HMAC-SHA256 over a JSON payload).
+// Package session implements stateless signed cookies (HMAC-SHA256 over purpose + JSON payload).
 package session
 
 import (
@@ -12,7 +12,13 @@ import (
 	"time"
 )
 
-var ErrInvalid = errors.New("invalid or expired cookie")
+// maxCookieBytes keeps cookies under the ~4 KB browser limit; browsers drop larger ones silently.
+const maxCookieBytes = 4000
+
+var (
+	ErrInvalid  = errors.New("invalid or expired cookie")
+	ErrTooLarge = errors.New("cookie value too large")
+)
 
 type Codec struct {
 	key    []byte
@@ -27,19 +33,31 @@ func NewCodec(key []byte, secure bool) (*Codec, error) {
 	return &Codec{key: key, Secure: secure, now: time.Now}, nil
 }
 
+// Name returns the cookie name to use: with the __Host- prefix when cookies are Secure, which
+// makes browsers refuse cookies set by sibling subdomains or with a Domain attribute.
+func (c *Codec) Name(base string) string {
+	if c.Secure {
+		return "__Host-" + base
+	}
+	return base
+}
+
 type envelope struct {
 	Exp  int64           `json:"exp"`
 	Data json.RawMessage `json:"data"`
 }
 
-func (c *Codec) sign(payload []byte) []byte {
+// sign binds the MAC to the purpose, so a cookie minted for one use cannot be replayed as another.
+func (c *Codec) sign(purpose string, payload []byte) []byte {
 	m := hmac.New(sha256.New, c.key)
+	m.Write([]byte(purpose))
+	m.Write([]byte{0})
 	m.Write(payload)
 	return m.Sum(nil)
 }
 
-// Encode returns "payload.signature" (both base64url) for v, valid for ttl.
-func (c *Codec) Encode(v any, ttl time.Duration) (string, error) {
+// Encode returns "payload.signature" (both base64url) for v, valid for ttl, bound to purpose.
+func (c *Codec) Encode(purpose string, v any, ttl time.Duration) (string, error) {
 	data, err := json.Marshal(v)
 	if err != nil {
 		return "", err
@@ -49,11 +67,15 @@ func (c *Codec) Encode(v any, ttl time.Duration) (string, error) {
 		return "", err
 	}
 	enc := base64.RawURLEncoding
-	return enc.EncodeToString(payload) + "." + enc.EncodeToString(c.sign(payload)), nil
+	out := enc.EncodeToString(payload) + "." + enc.EncodeToString(c.sign(purpose, payload))
+	if len(out) > maxCookieBytes {
+		return "", ErrTooLarge
+	}
+	return out, nil
 }
 
-// Decode verifies the signature and expiry, then unmarshals the data into v.
-func (c *Codec) Decode(value string, v any) error {
+// Decode verifies purpose, signature and expiry, then unmarshals the data into v.
+func (c *Codec) Decode(purpose, value string, v any) error {
 	p, s, ok := strings.Cut(value, ".")
 	if !ok {
 		return ErrInvalid
@@ -64,7 +86,7 @@ func (c *Codec) Decode(value string, v any) error {
 		return ErrInvalid
 	}
 	sig, err := enc.DecodeString(s)
-	if err != nil || !hmac.Equal(sig, c.sign(payload)) {
+	if err != nil || !hmac.Equal(sig, c.sign(purpose, payload)) {
 		return ErrInvalid
 	}
 	var e envelope
@@ -74,9 +96,10 @@ func (c *Codec) Decode(value string, v any) error {
 	return json.Unmarshal(e.Data, v)
 }
 
-// Set writes the cookie: HttpOnly, SameSite=Lax, Secure unless disabled for local dev.
+// Set writes the cookie (name is also the signing purpose): HttpOnly, SameSite=Lax, Path=/,
+// no Domain, Secure unless disabled for local development.
 func (c *Codec) Set(w http.ResponseWriter, name string, v any, ttl time.Duration) error {
-	val, err := c.Encode(v, ttl)
+	val, err := c.Encode(name, v, ttl)
 	if err != nil {
 		return err
 	}
@@ -100,5 +123,5 @@ func (c *Codec) Get(r *http.Request, name string, v any) error {
 	if err != nil {
 		return ErrInvalid
 	}
-	return c.Decode(ck.Value, v)
+	return c.Decode(name, ck.Value, v)
 }

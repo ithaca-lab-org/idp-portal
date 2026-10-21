@@ -1,0 +1,14 @@
+name: Proposal
+description: Propose a change (large ones should become an ADR)
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal and alternatives considered

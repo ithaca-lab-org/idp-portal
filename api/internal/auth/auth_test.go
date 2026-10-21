@@ -25,6 +25,7 @@ func fakeIssuer(t *testing.T) *httptest.Server {
 			"authorization_endpoint": srv.URL + "/auth",
 			"token_endpoint":         srv.URL + "/token",
 			"jwks_uri":               srv.URL + "/jwks",
+			"end_session_endpoint":   srv.URL + "/logout",
 		})
 	}))
 	t.Cleanup(srv.Close)
@@ -48,6 +49,15 @@ func serve(h *Handler, r *http.Request) *httptest.ResponseRecorder {
 	return w
 }
 
+func cookieFor(t *testing.T, codec *session.Codec, name string, v any) *http.Cookie {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	if err := codec.Set(rec, name, v, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	return rec.Result().Cookies()[0]
+}
+
 func TestLoginRedirectsWithPKCEStateNonce(t *testing.T) {
 	iss := fakeIssuer(t)
 	h, _ := newHandler(t, iss.URL)
@@ -62,8 +72,8 @@ func TestLoginRedirectsWithPKCEStateNonce(t *testing.T) {
 		t.Fatalf("missing params: %v", q)
 	}
 	ck := w.Result().Cookies()
-	if len(ck) != 1 || !ck[0].HttpOnly || !ck[0].Secure || ck[0].SameSite != http.SameSiteLaxMode {
-		t.Fatalf("login cookie flags: %+v", ck)
+	if len(ck) != 1 || ck[0].Name != "__Host-idp_login" || !ck[0].HttpOnly || !ck[0].Secure || ck[0].SameSite != http.SameSiteLaxMode {
+		t.Fatalf("login cookie: %+v", ck)
 	}
 }
 
@@ -83,12 +93,27 @@ func TestCallbackWithoutLoginCookie(t *testing.T) {
 
 func TestCallbackStateMismatch(t *testing.T) {
 	h, codec := newHandler(t, "http://127.0.0.1:1")
-	rec := httptest.NewRecorder()
-	if err := codec.Set(rec, loginCookie, loginState{State: "good", Nonce: "n", Verifier: "v"}, time.Minute); err != nil {
-		t.Fatal(err)
-	}
 	r := httptest.NewRequest("GET", "/auth/callback?code=x&state=evil", nil)
-	r.AddCookie(rec.Result().Cookies()[0])
+	r.AddCookie(cookieFor(t, codec, h.loginName, loginState{State: "good", Nonce: "n", Verifier: "v"}))
+	if w := serve(h, r); w.Code != http.StatusBadRequest {
+		t.Fatalf("status %d", w.Code)
+	}
+}
+
+func TestCallbackRejectsEmptyLoginState(t *testing.T) {
+	h, codec := newHandler(t, "http://127.0.0.1:1")
+	r := httptest.NewRequest("GET", "/auth/callback?code=x&state=", nil)
+	r.AddCookie(cookieFor(t, codec, h.loginName, loginState{}))
+	if w := serve(h, r); w.Code != http.StatusBadRequest {
+		t.Fatalf("empty state must be rejected, status %d", w.Code)
+	}
+}
+
+func TestSessionCookieCannotBeReplayedAsLoginCookie(t *testing.T) {
+	h, codec := newHandler(t, "http://127.0.0.1:1")
+	sess := cookieFor(t, codec, h.sessionName, User{Sub: "u1", Username: "alice"})
+	r := httptest.NewRequest("GET", "/auth/callback?code=x&state=", nil)
+	r.AddCookie(&http.Cookie{Name: h.loginName, Value: sess.Value})
 	if w := serve(h, r); w.Code != http.StatusBadRequest {
 		t.Fatalf("status %d", w.Code)
 	}
@@ -103,12 +128,8 @@ func TestMeUnauthorizedWithoutSession(t *testing.T) {
 
 func TestMeWithSession(t *testing.T) {
 	h, codec := newHandler(t, "http://127.0.0.1:1")
-	rec := httptest.NewRecorder()
-	if err := codec.Set(rec, sessionCookie, User{Sub: "u1", Username: "alice", Groups: []string{"payments-bu"}}, time.Minute); err != nil {
-		t.Fatal(err)
-	}
 	r := httptest.NewRequest("GET", "/auth/me", nil)
-	r.AddCookie(rec.Result().Cookies()[0])
+	r.AddCookie(cookieFor(t, codec, h.sessionName, User{Sub: "u1", Username: "alice", Groups: []string{"payments-bu"}}))
 	w := serve(h, r)
 	var u User
 	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &u) != nil || u.Username != "alice" || u.Groups[0] != "payments-bu" {
@@ -119,11 +140,52 @@ func TestMeWithSession(t *testing.T) {
 func TestForgedSessionRejected(t *testing.T) {
 	h, _ := newHandler(t, "http://127.0.0.1:1")
 	other, _ := session.NewCodec([]byte(strings.Repeat("x", 32)), true)
-	rec := httptest.NewRecorder()
-	_ = other.Set(rec, sessionCookie, User{Sub: "evil", Username: "admin"}, time.Minute)
 	r := httptest.NewRequest("GET", "/auth/me", nil)
-	r.AddCookie(rec.Result().Cookies()[0])
+	r.AddCookie(cookieFor(t, other, h.sessionName, User{Sub: "evil", Username: "admin"}))
 	if w := serve(h, r); w.Code != http.StatusUnauthorized {
 		t.Fatalf("status %d", w.Code)
+	}
+}
+
+func TestLogoutRejectsCrossSite(t *testing.T) {
+	h, _ := newHandler(t, "http://127.0.0.1:1")
+	for name, hdr := range map[string]map[string]string{
+		"sec-fetch-site cross-site": {"Sec-Fetch-Site": "cross-site"},
+		"same-site (sibling)":       {"Sec-Fetch-Site": "same-site"},
+		"foreign origin":            {"Origin": "https://evil.example"},
+	} {
+		r := httptest.NewRequest("POST", "/auth/logout", nil)
+		for k, v := range hdr {
+			r.Header.Set(k, v)
+		}
+		if w := serve(h, r); w.Code != http.StatusForbidden {
+			t.Fatalf("%s: status %d", name, w.Code)
+		}
+	}
+}
+
+func TestLogoutSameOriginReturnsEndSessionURL(t *testing.T) {
+	iss := fakeIssuer(t)
+	h, _ := newHandler(t, iss.URL)
+	if serve(h, httptest.NewRequest("GET", "/auth/login", nil)).Code != http.StatusFound { // primes discovery
+		t.Fatal("discovery failed")
+	}
+	r := httptest.NewRequest("POST", "/auth/logout", nil)
+	r.Header.Set("Origin", "https://portal.test")
+	w := serve(h, r)
+	var resp map[string]string
+	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &resp) != nil ||
+		!strings.HasPrefix(resp["end_session_url"], iss.URL+"/logout?") ||
+		!strings.Contains(resp["end_session_url"], "client_id=idp-portal") {
+		t.Fatalf("status %d body %s", w.Code, w.Body.String())
+	}
+	cleared := false
+	for _, c := range w.Result().Cookies() {
+		if c.Name == "__Host-idp_session" && c.MaxAge < 0 {
+			cleared = true
+		}
+	}
+	if !cleared {
+		t.Fatal("session cookie not cleared")
 	}
 }
