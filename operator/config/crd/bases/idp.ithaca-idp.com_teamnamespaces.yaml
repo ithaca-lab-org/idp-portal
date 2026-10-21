@@ -1,0 +1,182 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.23.0
+  name: teamnamespaces.idp.ithaca-idp.com
+spec:
+  group: idp.ithaca-idp.com
+  names:
+    kind: TeamNamespace
+    listKind: TeamNamespaceList
+    plural: teamnamespaces
+    shortNames:
+    - tns
+    singular: teamnamespace
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.owner
+      name: Owner
+      type: string
+    - jsonPath: .spec.businessUnit
+      name: BU
+      type: string
+    - jsonPath: .spec.size
+      name: Size
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: TeamNamespace requests a guarded namespace whose name equals
+          metadata.name.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            properties:
+              businessUnit:
+                description: businessUnit owning the namespace; used for cost attribution.
+                maxLength: 63
+                minLength: 1
+                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                type: string
+                x-kubernetes-validations:
+                - message: businessUnit is immutable
+                  rule: self == oldSelf
+              orderId:
+                description: orderId is the portal order that requested this namespace.
+                maxLength: 64
+                pattern: ^[A-Za-z0-9][A-Za-z0-9-]*$
+                type: string
+              owner:
+                description: owner email; bound to the built-in admin ClusterRole
+                  in the namespace.
+                maxLength: 254
+                type: string
+                x-kubernetes-validations:
+                - message: owner must be an email address
+                  rule: self.matches('^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9-]+([.][a-zA-Z0-9-]+)+$')
+              size:
+                default: small
+                description: size selects the ResourceQuota and LimitRange profile.
+                enum:
+                - small
+                - medium
+                type: string
+            required:
+            - businessUnit
+            - owner
+            type: object
+            x-kubernetes-validations:
+            - message: orderId is immutable once set
+              rule: '!has(oldSelf.orderId) || (has(self.orderId) && self.orderId ==
+                oldSelf.orderId)'
+          status:
+            properties:
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              namespace:
+                description: namespace managed by this resource, set once it exists.
+                type: string
+              observedGeneration:
+                format: int64
+                type: integer
+              phase:
+                type: string
+            type: object
+        required:
+        - spec
+        type: object
+        x-kubernetes-validations:
+        - message: name must be at most 40 characters
+          rule: self.metadata.name.size() <= 40
+        - message: name must be a DNS-1123 label
+          rule: self.metadata.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
+        - message: name is reserved for the platform
+          rule: '!(self.metadata.name in [''default'', ''argocd'', ''cert-manager'',
+            ''tailscale'', ''identity'', ''idp-system'', ''echo'']) && ![''kube-'',
+            ''istio-'', ''gke-''].exists(p, self.metadata.name.startsWith(p))'
+    served: true
+    storage: true
+    subresources:
+      status: {}

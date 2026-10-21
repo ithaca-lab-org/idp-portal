@@ -1,0 +1,144 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: idp-operator
+rules:
+- apiGroups:
+  - ""
+  resourceNames:
+  - idp-limits
+  resources:
+  - limitranges
+  verbs:
+  - update
+- apiGroups:
+  - ""
+  resources:
+  - limitranges
+  - resourcequotas
+  verbs:
+  - create
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - namespaces
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resourceNames:
+  - idp-quota
+  resources:
+  - resourcequotas
+  verbs:
+  - update
+- apiGroups:
+  - authentication.k8s.io
+  resources:
+  - tokenreviews
+  verbs:
+  - create
+- apiGroups:
+  - authorization.k8s.io
+  resources:
+  - subjectaccessreviews
+  verbs:
+  - create
+- apiGroups:
+  - idp.ithaca-idp.com
+  resources:
+  - teamnamespaces
+  verbs:
+  - get
+  - list
+  - update
+  - watch
+- apiGroups:
+  - idp.ithaca-idp.com
+  resources:
+  - teamnamespaces/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - idp.ithaca-idp.com
+  resources:
+  - teamnamespaces/status
+  verbs:
+  - get
+  - update
+- apiGroups:
+  - networking.k8s.io
+  resources:
+  - networkpolicies
+  verbs:
+  - create
+  - get
+  - list
+  - watch
+- apiGroups:
+  - networking.k8s.io
+  resourceNames:
+  - idp-allow-same-namespace
+  - idp-default-deny-ingress
+  resources:
+  - networkpolicies
+  verbs:
+  - update
+- apiGroups:
+  - rbac.authorization.k8s.io
+  resourceNames:
+  - admin
+  resources:
+  - clusterroles
+  verbs:
+  - bind
+- apiGroups:
+  - rbac.authorization.k8s.io
+  resources:
+  - rolebindings
+  verbs:
+  - create
+  - get
+  - list
+  - watch
+- apiGroups:
+  - rbac.authorization.k8s.io
+  resourceNames:
+  - idp-namespace-admin
+  resources:
+  - rolebindings
+  verbs:
+  - delete
+  - update
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: idp-operator
+  namespace: idp-system
+rules:
+- apiGroups:
+  - ""
+  - events.k8s.io
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - create
+  - get
+  - update
