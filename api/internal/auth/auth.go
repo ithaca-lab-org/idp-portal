@@ -6,12 +6,15 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"sync"
 	"time"
 
@@ -34,6 +37,9 @@ type Config struct {
 	ClientID    string
 	RedirectURL string
 	SessionTTL  time.Duration
+	// ExtraCAFile is an optional PEM bundle trusted in addition to the system roots when talking
+	// to the issuer. Used only while the platform serves Let's Encrypt staging certificates.
+	ExtraCAFile string
 }
 
 type User struct {
@@ -52,6 +58,7 @@ type loginState struct {
 type Handler struct {
 	cfg         Config
 	codec       *session.Codec
+	client      *http.Client
 	loginName   string
 	sessionName string
 	origin      string // scheme://host of RedirectURL, for the same-origin check
@@ -63,18 +70,49 @@ type Handler struct {
 	endSession string
 }
 
-func New(cfg Config, codec *session.Codec) *Handler {
+// httpClient returns the client used for discovery and the token exchange.
+func httpClient(extraCAFile string) (*http.Client, error) {
+	if extraCAFile == "" {
+		return &http.Client{Timeout: 10 * time.Second}, nil
+	}
+	pem, err := os.ReadFile(extraCAFile)
+	if err != nil {
+		return nil, err
+	}
+	pool, err := x509.SystemCertPool()
+	if err != nil || pool == nil {
+		pool = x509.NewCertPool()
+	}
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, errors.New("no certificates found in " + extraCAFile)
+	}
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+	return &http.Client{Timeout: 10 * time.Second, Transport: tr}, nil
+}
+
+func New(cfg Config, codec *session.Codec) (*Handler, error) {
 	if cfg.SessionTTL == 0 {
 		cfg.SessionTTL = defaultSessionTTL
 	}
+	hc, err := httpClient(cfg.ExtraCAFile)
+	if err != nil {
+		return nil, err
+	}
 	h := &Handler{
-		cfg: cfg, codec: codec,
+		client: hc,
+		cfg:    cfg, codec: codec,
 		loginName: codec.Name(loginCookieBase), sessionName: codec.Name(sessionCookieBase),
 	}
 	if u, err := url.Parse(cfg.RedirectURL); err == nil {
 		h.origin = u.Scheme + "://" + u.Host
 	}
-	return h
+	return h, nil
+}
+
+// withClient makes oidc and oauth2 use the handler's HTTP client.
+func (h *Handler) withClient(ctx context.Context) context.Context {
+	return oidc.ClientContext(ctx, h.client)
 }
 
 // Routes registers /auth/login, /auth/callback, /auth/logout and /auth/me.
@@ -95,7 +133,7 @@ func (h *Handler) discover(ctx context.Context) (*oauth2.Config, *oidc.IDTokenVe
 		return oc, v, nil
 	}
 	ch := h.sf.DoChan("discover", func() (any, error) {
-		dctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		dctx, cancel := context.WithTimeout(h.withClient(context.Background()), 10*time.Second)
 		defer cancel()
 		p, err := oidc.NewProvider(dctx, h.cfg.Issuer)
 		if err != nil {
@@ -187,14 +225,14 @@ func (h *Handler) callback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "identity provider unavailable", http.StatusBadGateway)
 		return
 	}
-	tok, err := oc.Exchange(r.Context(), q.Get("code"), oauth2.VerifierOption(ls.Verifier))
+	tok, err := oc.Exchange(h.withClient(r.Context()), q.Get("code"), oauth2.VerifierOption(ls.Verifier))
 	if err != nil {
 		slog.Warn("code exchange failed", "err", err)
 		http.Error(w, "login failed", http.StatusUnauthorized)
 		return
 	}
 	raw, _ := tok.Extra("id_token").(string)
-	idt, err := verifier.Verify(r.Context(), raw)
+	idt, err := verifier.Verify(h.withClient(r.Context()), raw)
 	if err != nil || subtle.ConstantTimeCompare([]byte(idt.Nonce), []byte(ls.Nonce)) != 1 {
 		slog.Warn("id token rejected", "err", err)
 		http.Error(w, "login failed", http.StatusUnauthorized)

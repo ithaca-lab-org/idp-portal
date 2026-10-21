@@ -35,11 +35,16 @@ func main() {
 		slog.Error("session key", "err", err)
 		os.Exit(1)
 	}
-	h := auth.New(auth.Config{
+	h, err := auth.New(auth.Config{
 		Issuer:      mustEnv("OIDC_ISSUER"),
 		ClientID:    mustEnv("OIDC_CLIENT_ID"),
 		RedirectURL: mustEnv("OIDC_REDIRECT_URL"),
+		ExtraCAFile: os.Getenv("OIDC_EXTRA_CA_FILE"),
 	}, codec)
+	if err != nil {
+		slog.Error("auth setup", "err", err)
+		os.Exit(1)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
