@@ -10,7 +10,9 @@ Self-service portal for the ithaca IDP. Today: `api/`, a Go service with OIDC lo
 | `POST /auth/logout` | Same-origin only. Clears the session cookie and returns `end_session_url` so the browser also ends the Keycloak SSO session |
 | `GET /healthz` | Liveness |
 
-Environment: `OIDC_ISSUER` (for example `https://<host>/auth/realms/ithaca`), `OIDC_CLIENT_ID` (`idp-portal`), `OIDC_REDIRECT_URL`, `SESSION_KEY` (base64 of 32+ random bytes, `openssl rand -base64 32`, from a Secret), optional `LISTEN_ADDR`, `COOKIE_INSECURE=true` for plain-HTTP local runs.
+Container image: `us-central1-docker.pkg.dev/project-324502ff-9928-4b17-a89/idp/portal-api:<git sha>`, built by `.github/workflows/image.yml` (distroless, non-root, digest-pinned bases, Trivy gate, provenance and SBOM attestations). Pull requests build and scan only; pushes to `main` push through Workload Identity Federation.
+
+Environment: `OIDC_ISSUER` (for example `https://<host>/auth/realms/ithaca`), `OIDC_CLIENT_ID` (`idp-portal`), `OIDC_REDIRECT_URL`, `SESSION_KEY` (base64 of 32+ random bytes, `openssl rand -base64 32`, from a Secret), optional `OIDC_EXTRA_CA_FILE` (extra trusted CA for the issuer, only while the platform serves Let's Encrypt staging certificates), optional `LISTEN_ADDR`, `COOKIE_INSECURE=true` for plain-HTTP local runs.
 
 `make check` runs vet and tests.
 

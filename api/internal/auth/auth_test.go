@@ -2,9 +2,11 @@ package auth
 
 import (
 	"encoding/json"
+	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -38,7 +40,11 @@ func newHandler(t *testing.T, issuer string) (*Handler, *session.Codec) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return New(Config{Issuer: issuer, ClientID: "idp-portal", RedirectURL: "https://portal.test/auth/callback"}, codec), codec
+	h, err := New(Config{Issuer: issuer, ClientID: "idp-portal", RedirectURL: "https://portal.test/auth/callback"}, codec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return h, codec
 }
 
 func serve(h *Handler, r *http.Request) *httptest.ResponseRecorder {
@@ -187,5 +193,59 @@ func TestLogoutSameOriginReturnsEndSessionURL(t *testing.T) {
 	}
 	if !cleared {
 		t.Fatal("session cookie not cleared")
+	}
+}
+
+func tlsIssuer(t *testing.T) (*httptest.Server, string) {
+	t.Helper()
+	var srv *httptest.Server
+	srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/.well-known/openid-configuration" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"issuer": srv.URL, "authorization_endpoint": srv.URL + "/auth",
+			"token_endpoint": srv.URL + "/token", "jwks_uri": srv.URL + "/jwks",
+		})
+	}))
+	t.Cleanup(srv.Close)
+	pemFile := t.TempDir() + "/ca.pem"
+	block := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
+	if err := os.WriteFile(pemFile, block, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return srv, pemFile
+}
+
+func TestUntrustedIssuerCertFailsWithoutExtraCA(t *testing.T) {
+	srv, _ := tlsIssuer(t)
+	h, _ := newHandler(t, srv.URL)
+	if w := serve(h, httptest.NewRequest("GET", "/auth/login", nil)); w.Code != http.StatusBadGateway {
+		t.Fatalf("an untrusted issuer certificate must fail, status %d", w.Code)
+	}
+}
+
+func TestExtraCAFileMakesIssuerTrusted(t *testing.T) {
+	srv, pemFile := tlsIssuer(t)
+	codec, _ := session.NewCodec([]byte(strings.Repeat("k", 32)), true)
+	h, err := New(Config{Issuer: srv.URL, ClientID: "idp-portal", RedirectURL: "https://portal.test/auth/callback", ExtraCAFile: pemFile}, codec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := serve(h, httptest.NewRequest("GET", "/auth/login", nil)); w.Code != http.StatusFound {
+		t.Fatalf("status %d", w.Code)
+	}
+}
+
+func TestExtraCAFileMustContainACertificate(t *testing.T) {
+	f := t.TempDir() + "/bad.pem"
+	_ = os.WriteFile(f, []byte("not a certificate"), 0o600)
+	codec, _ := session.NewCodec([]byte(strings.Repeat("k", 32)), true)
+	if _, err := New(Config{ExtraCAFile: f}, codec); err == nil {
+		t.Fatal("expected an error for a bundle without certificates")
+	}
+	if _, err := New(Config{ExtraCAFile: "/nonexistent"}, codec); err == nil {
+		t.Fatal("expected an error for a missing file")
 	}
 }
