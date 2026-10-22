@@ -5,10 +5,10 @@ name: image
 on:
   pull_request:
     branches: [main]
-    paths: [Dockerfile, .dockerignore, api/**, .github/workflows/image.yml]
+    paths: [Dockerfile, .dockerignore, api/**, operator/**, .github/workflows/image.yml]
   push:
     branches: [main]
-    paths: [Dockerfile, .dockerignore, api/**, .github/workflows/image.yml]
+    paths: [Dockerfile, .dockerignore, api/**, operator/**, .github/workflows/image.yml]
 
 permissions: {}
 
