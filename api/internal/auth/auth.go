@@ -11,6 +11,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"html/template"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -121,6 +122,7 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /auth/callback", h.callback)
 	mux.HandleFunc("POST /auth/logout", h.logout)
 	mux.HandleFunc("GET /auth/me", h.me)
+	mux.HandleFunc("GET /{$}", h.home)
 }
 
 // discover resolves the provider lazily so the API can start before Keycloak is ready. Concurrent
@@ -306,4 +308,29 @@ func (h *Handler) UserFrom(r *http.Request) (User, bool) {
 		return User{}, false
 	}
 	return u, true
+}
+
+var homeTmpl = template.Must(template.New("home").Parse(`<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>IDP portal</title></head>
+<body><h1>IDP portal</h1>
+<p>Signed in as <strong>{{.Username}}</strong>{{if .Email}} ({{.Email}}){{end}}.</p>
+<p>Groups: {{range $i, $g := .Groups}}{{if $i}}, {{end}}{{$g}}{{else}}none{{end}}</p>
+<p><a href="/auth/me">Session details (JSON)</a></p>
+</body></html>`))
+
+// home is a placeholder landing page until the web UI exists: it sends anonymous visitors to
+// login and shows the session to signed-in users. Output is HTML-escaped by html/template.
+func (h *Handler) home(w http.ResponseWriter, r *http.Request) {
+	u, ok := h.UserFrom(r)
+	if !ok {
+		http.Redirect(w, r, "/auth/login", http.StatusFound)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+	if err := homeTmpl.Execute(w, u); err != nil {
+		slog.Error("render home", "err", err)
+	}
 }

@@ -249,3 +249,32 @@ func TestExtraCAFileMustContainACertificate(t *testing.T) {
 		t.Fatal("expected an error for a missing file")
 	}
 }
+
+func TestHomeRedirectsAnonymousToLogin(t *testing.T) {
+	h, _ := newHandler(t, "http://127.0.0.1:1")
+	w := serve(h, httptest.NewRequest("GET", "/", nil))
+	if w.Code != http.StatusFound || w.Header().Get("Location") != "/auth/login" {
+		t.Fatalf("status %d location %q", w.Code, w.Header().Get("Location"))
+	}
+}
+
+func TestHomeShowsEscapedUser(t *testing.T) {
+	h, codec := newHandler(t, "http://127.0.0.1:1")
+	r := httptest.NewRequest("GET", "/", nil)
+	r.AddCookie(cookieFor(t, codec, h.sessionName, User{Sub: "u1", Username: "<script>alert(1)</script>", Groups: []string{"payment-bu"}}))
+	w := serve(h, r)
+	body := w.Body.String()
+	if w.Code != http.StatusOK || strings.Contains(body, "<script>") || !strings.Contains(body, "&lt;script&gt;") || !strings.Contains(body, "payment-bu") {
+		t.Fatalf("status %d body %s", w.Code, body)
+	}
+	if w.Header().Get("Content-Security-Policy") == "" || w.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("missing security headers: %v", w.Header())
+	}
+}
+
+func TestHomeOnlyMatchesRoot(t *testing.T) {
+	h, _ := newHandler(t, "http://127.0.0.1:1")
+	if w := serve(h, httptest.NewRequest("GET", "/nope", nil)); w.Code != http.StatusNotFound {
+		t.Fatalf("status %d", w.Code)
+	}
+}
