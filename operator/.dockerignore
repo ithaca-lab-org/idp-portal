@@ -1,0 +1,4 @@
+bin/
+config/
+*.md
+**/*_test.go
