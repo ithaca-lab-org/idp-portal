@@ -13,98 +13,98 @@ spec:
     # so that a later RBAC change cannot open a side door. DELETE also covers
     # deletecollection: the apiserver admits each item as a separate DELETE.
     resourceRules:
-    - apiGroups: [""]
-      apiVersions: ["*"]
-      operations: ["CREATE", "UPDATE", "DELETE"]
-      resources: ["namespaces", "namespaces/*", "resourcequotas", "resourcequotas/*", "limitranges", "limitranges/*"]
-    - apiGroups: ["networking.k8s.io"]
-      apiVersions: ["*"]
-      operations: ["CREATE", "UPDATE", "DELETE"]
-      resources: ["networkpolicies", "networkpolicies/*"]
-    - apiGroups: ["rbac.authorization.k8s.io"]
-      apiVersions: ["*"]
-      operations: ["CREATE", "UPDATE", "DELETE"]
-      resources: ["rolebindings", "rolebindings/*"]
+      - apiGroups: [""]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["namespaces", "namespaces/*", "resourcequotas", "resourcequotas/*", "limitranges", "limitranges/*"]
+      - apiGroups: ["networking.k8s.io"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["networkpolicies", "networkpolicies/*"]
+      - apiGroups: ["rbac.authorization.k8s.io"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["rolebindings", "rolebindings/*"]
   matchConditions:
-  - name: is-idp-operator
-    expression: "request.userInfo.username == 'system:serviceaccount:idp-system:idp-operator'"
+    - name: is-idp-operator
+      expression: "request.userInfo.username == 'system:serviceaccount:idp-system:idp-operator'"
   variables:
-  - name: isNamespace
-    expression: "request.resource.resource == 'namespaces'"
-  # Both labels, and the team-namespace label must equal the namespace name
-  # (the operator always names the namespace after its TeamNamespace).
-  - name: newOwned
-    expression: >-
-      request.operation != 'DELETE' && variables.isNamespace &&
-      has(object.metadata.labels) &&
-      object.metadata.labels[?'app.kubernetes.io/managed-by'] == optional.of('idp-operator') &&
-      object.metadata.labels[?'idp.ithaca-idp.com/team-namespace'] == optional.of(object.metadata.name)
-  # oldObject is the stored object, so a label added in the same request cannot
-  # make an unmanaged namespace adoptable.
-  - name: oldOwned
-    expression: >-
-      request.operation != 'CREATE' && variables.isNamespace &&
-      has(oldObject.metadata.labels) &&
-      oldObject.metadata.labels[?'app.kubernetes.io/managed-by'] == optional.of('idp-operator') &&
-      oldObject.metadata.labels[?'idp.ithaca-idp.com/team-namespace'] == optional.of(oldObject.metadata.name)
-  # namespaceObject is null for cluster-scoped kinds and comes from the apiserver's
-  # namespace informer for namespaced kinds.
-  - name: parentOwned
-    expression: >-
-      namespaceObject != null && has(namespaceObject.metadata.labels) &&
-      namespaceObject.metadata.labels[?'app.kubernetes.io/managed-by'] == optional.of('idp-operator') &&
-      namespaceObject.metadata.labels[?'idp.ithaca-idp.com/team-namespace'] == optional.of(namespaceObject.metadata.name)
+    - name: isNamespace
+      expression: "request.resource.resource == 'namespaces'"
+    # Both labels, and the team-namespace label must equal the namespace name
+    # (the operator always names the namespace after its TeamNamespace).
+    - name: newOwned
+      expression: >-
+        request.operation != 'DELETE' && variables.isNamespace &&
+        has(object.metadata.labels) &&
+        object.metadata.labels[?'app.kubernetes.io/managed-by'] == optional.of('idp-operator') &&
+        object.metadata.labels[?'idp.ithaca-idp.com/team-namespace'] == optional.of(object.metadata.name)
+    # oldObject is the stored object, so a label added in the same request cannot
+    # make an unmanaged namespace adoptable.
+    - name: oldOwned
+      expression: >-
+        request.operation != 'CREATE' && variables.isNamespace &&
+        has(oldObject.metadata.labels) &&
+        oldObject.metadata.labels[?'app.kubernetes.io/managed-by'] == optional.of('idp-operator') &&
+        oldObject.metadata.labels[?'idp.ithaca-idp.com/team-namespace'] == optional.of(oldObject.metadata.name)
+    # namespaceObject is null for cluster-scoped kinds and comes from the apiserver's
+    # namespace informer for namespaced kinds.
+    - name: parentOwned
+      expression: >-
+        namespaceObject != null && has(namespaceObject.metadata.labels) &&
+        namespaceObject.metadata.labels[?'app.kubernetes.io/managed-by'] == optional.of('idp-operator') &&
+        namespaceObject.metadata.labels[?'idp.ithaca-idp.com/team-namespace'] == optional.of(namespaceObject.metadata.name)
   validations:
-  - expression: >-
-      !variables.isNamespace ||
-      (request.operation == 'CREATE' ? variables.newOwned :
-       request.operation == 'UPDATE' ? variables.oldOwned && variables.newOwned :
-       variables.oldOwned)
-    reason: Forbidden
-    messageExpression: >-
-      'idp-operator may only ' + request.operation + ' namespaces labelled app.kubernetes.io/managed-by=idp-operator and idp.ithaca-idp.com/team-namespace=<name>, and may not change those labels (namespace ' + request.name + ')'
-  # Mirrors the reserved names in internal/controller/resources.go; stops a
-  # compromised operator from pre-creating namespaces that platform components
-  # will later deploy into.
-  - expression: >-
-      !variables.isNamespace || request.operation != 'CREATE' ||
-      (!(request.name in ['default', 'argocd', 'cert-manager', 'tailscale', 'identity', 'idp-system', 'echo']) &&
-       !['kube-', 'istio-', 'gke-'].exists(p, request.name.startsWith(p)))
-    reason: Forbidden
-    messageExpression: "'idp-operator may not create reserved namespace ' + request.name"
-  # Without this, the operator could relax Pod Security on a namespace it owns.
-  - expression: >-
-      !variables.isNamespace || request.operation == 'DELETE' ||
-      object.metadata.labels[?'pod-security.kubernetes.io/enforce'].orValue('') in ['baseline', 'restricted']
-    reason: Forbidden
-    message: "idp-operator must keep pod-security.kubernetes.io/enforce at baseline or restricted"
-  - expression: "variables.isNamespace || variables.parentOwned"
-    reason: Forbidden
-    messageExpression: >-
-      'idp-operator may only write ' + request.resource.resource + ' in namespaces labelled app.kubernetes.io/managed-by=idp-operator (namespace ' + request.namespace + ')'
-  # Child names are fixed in the controller; pinning them stops extra objects
-  # (e.g. an allow-all NetworkPolicy) from being added next to the managed ones.
-  - expression: >-
-      variables.isNamespace ||
-      request.name in {
-        'resourcequotas': ['idp-quota'],
-        'limitranges': ['idp-limits'],
-        'networkpolicies': ['idp-default-deny-ingress', 'idp-allow-same-namespace'],
-        'rolebindings': ['idp-namespace-admin']
-      }[request.resource.resource]
-    reason: Forbidden
-    messageExpression: "'idp-operator may not write ' + request.resource.resource + ' named ' + request.name"
-  # One User subject that looks like an email: no Groups, no ServiceAccounts,
-  # and no 'system:' users (a ServiceAccount can also be named as a User
-  # system:serviceaccount:<ns>:<name>).
-  - expression: >-
-      request.resource.resource != 'rolebindings' || request.operation == 'DELETE' ||
-      (object.roleRef.apiGroup == 'rbac.authorization.k8s.io' &&
-       object.roleRef.kind == 'ClusterRole' && object.roleRef.name == 'admin' &&
-       has(object.subjects) && size(object.subjects) == 1 &&
-       object.subjects.all(s, s.kind == 'User' && !s.name.startsWith('system:') && s.name.contains('@')))
-    reason: Forbidden
-    message: "idp-operator RoleBindings must bind ClusterRole admin to exactly one User subject (no groups, service accounts or system: users)"
+    - expression: >-
+        !variables.isNamespace ||
+        (request.operation == 'CREATE' ? variables.newOwned :
+         request.operation == 'UPDATE' ? variables.oldOwned && variables.newOwned :
+         variables.oldOwned)
+      reason: Forbidden
+      messageExpression: >-
+        'idp-operator may only ' + request.operation + ' namespaces labelled app.kubernetes.io/managed-by=idp-operator and idp.ithaca-idp.com/team-namespace=<name>, and may not change those labels (namespace ' + request.name + ')'
+    # Mirrors the reserved names in internal/controller/resources.go; stops a
+    # compromised operator from pre-creating namespaces that platform components
+    # will later deploy into.
+    - expression: >-
+        !variables.isNamespace || request.operation != 'CREATE' ||
+        (!(request.name in ['default', 'argocd', 'cert-manager', 'tailscale', 'identity', 'idp-system', 'echo']) &&
+         !['kube-', 'istio-', 'gke-'].exists(p, request.name.startsWith(p)))
+      reason: Forbidden
+      messageExpression: "'idp-operator may not create reserved namespace ' + request.name"
+    # Without this, the operator could relax Pod Security on a namespace it owns.
+    - expression: >-
+        !variables.isNamespace || request.operation == 'DELETE' ||
+        object.metadata.labels[?'pod-security.kubernetes.io/enforce'].orValue('') in ['baseline', 'restricted']
+      reason: Forbidden
+      message: "idp-operator must keep pod-security.kubernetes.io/enforce at baseline or restricted"
+    - expression: "variables.isNamespace || variables.parentOwned"
+      reason: Forbidden
+      messageExpression: >-
+        'idp-operator may only write ' + request.resource.resource + ' in namespaces labelled app.kubernetes.io/managed-by=idp-operator (namespace ' + request.namespace + ')'
+    # Child names are fixed in the controller; pinning them stops extra objects
+    # (e.g. an allow-all NetworkPolicy) from being added next to the managed ones.
+    - expression: >-
+        variables.isNamespace ||
+        request.name in {
+          'resourcequotas': ['idp-quota'],
+          'limitranges': ['idp-limits'],
+          'networkpolicies': ['idp-default-deny-ingress', 'idp-allow-same-namespace'],
+          'rolebindings': ['idp-namespace-admin']
+        }[request.resource.resource]
+      reason: Forbidden
+      messageExpression: "'idp-operator may not write ' + request.resource.resource + ' named ' + request.name"
+    # One User subject that looks like an email: no Groups, no ServiceAccounts,
+    # and no 'system:' users (a ServiceAccount can also be named as a User
+    # system:serviceaccount:<ns>:<name>).
+    - expression: >-
+        request.resource.resource != 'rolebindings' || request.operation == 'DELETE' ||
+        (object.roleRef.apiGroup == 'rbac.authorization.k8s.io' &&
+         object.roleRef.kind == 'ClusterRole' && object.roleRef.name == 'admin' &&
+         has(object.subjects) && size(object.subjects) == 1 &&
+         object.subjects.all(s, s.kind == 'User' && !s.name.startsWith('system:') && s.name.contains('@')))
+      reason: Forbidden
+      message: "idp-operator RoleBindings must bind ClusterRole admin to exactly one User subject (no groups, service accounts or system: users)"
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
