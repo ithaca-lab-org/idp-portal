@@ -44,6 +44,12 @@ func TestMain(m *testing.M) {
 		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
 		ErrorIfCRDPathMissing: true,
 	}
+	// envtest already runs with --authorization-mode=RBAC and the default admission
+	// plugins (ValidatingAdmissionPolicy included); the admin client is system:masters.
+	// OwnerReferencesPermissionEnforcement makes blockOwnerDeletion on child objects
+	// require update on teamnamespaces/finalizers, as on clusters that enable it.
+	env.ControlPlane.GetAPIServer().Configure().
+		Append("enable-admission-plugins", "OwnerReferencesPermissionEnforcement")
 	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
 		env.BinaryAssetsDirectory = filepath.Join("..", "..", "bin", "k8s",
 			fmt.Sprintf("%s-%s-%s", envtestK8sVersion, runtime.GOOS, runtime.GOARCH))
