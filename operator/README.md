@@ -45,10 +45,28 @@ Tool versions are pinned in the `Makefile` and run with `go run`. Generated file
 - Namespaces need `create`, `update` and `delete` cluster-wide; RBAC cannot scope them by label, so the label check in code is the guard.
 - `tokenreviews`/`subjectaccessreviews` `create` protect the HTTPS metrics endpoint; leases and events are a namespaced Role in `idp-system` for leader election.
 
+## Admission policy
+
+`config/policy/operator-scope.yaml` holds a `ValidatingAdmissionPolicy` and its binding (`idp-operator-scope`, `failurePolicy: Fail`, action `Deny`). `matchConditions` limit it to `system:serviceaccount:idp-system:idp-operator`, so other users are not evaluated. Deploy it before (or with) the operator. For that user it enforces:
+
+- Namespaces: `CREATE` only with `managed-by=idp-operator` and `team-namespace=<name>`, and not for a reserved name; `UPDATE`/`DELETE` only if the stored object (`oldObject`) already carries both labels, and an `UPDATE` cannot change or drop them. PSS `enforce` must stay `baseline` or `restricted`. Subresources are included.
+- ResourceQuotas, LimitRanges, NetworkPolicies, RoleBindings: only in namespaces carrying both labels, and only under the fixed child names.
+- RoleBindings: roleRef `ClusterRole admin`, exactly one `User` subject that contains `@` and does not start with `system:` (no groups, ServiceAccounts or `system:serviceaccount:...` users).
+
+What it does not protect:
+
+- Anyone with cluster-admin, or with write access to `validatingadmissionpolicies`/`validatingadmissionpolicybindings`, can delete or edit the policy. Renaming the ServiceAccount or its namespace silently disables it.
+- Other users labelling a namespace to hand it to the operator (see Known limits).
+- Inside managed namespaces the operator can still delete them, rewrite quotas and limits, and grant `admin` to any email-looking user. It can also create labelled namespaces under any non-reserved name (squatting a future team name).
+- `namespaceObject` comes from the apiserver's informer cache, so for a short window after an admin removes the labels the operator may still write children in that namespace.
+- Writes to other kinds are left to RBAC (the policy is not an allowlist of everything the operator can touch).
+
+`internal/controller/policy_envtest_test.go` installs `config/rbac` and `config/policy` in envtest (RBAC on), impersonates the ServiceAccount, runs the reconciler end to end, checks the denials with server-side dry-run, and removes the binding to show those denials come from the policy and not RBAC.
+
 ## Known limits
 
-- RBAC alone would let a compromised operator create objects (including `admin` RoleBindings) in any namespace and delete any namespace. A ValidatingAdmissionPolicy that pins the operator's ServiceAccount to namespaces labelled `managed-by=idp-operator` is planned with the deployment manifests.
-- Anyone who can label namespaces can make an existing namespace adoptable by adding the two operator labels.
+- RBAC alone would let a compromised operator create objects (including `admin` RoleBindings) in any namespace and delete any namespace; the admission policy below closes this.
+- Anyone (other than the operator) who can label namespaces can make an existing namespace adoptable by adding the two operator labels. The policy cannot stop this; restrict namespace `update`/`patch` to platform admins.
 - The informer cache watches all namespaces, quotas, limit ranges, network policies and role bindings cluster-wide.
 - The finalizer is removed once the namespace delete is accepted, not when it has finished terminating; a CR recreated meanwhile waits in `Pending`.
 - In ambient mode, traffic from the Istio ingress gateway or waypoints is blocked by the default-deny policy until a later order adds an allow rule.
