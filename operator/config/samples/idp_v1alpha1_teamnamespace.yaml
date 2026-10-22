@@ -1,0 +1,9 @@
+apiVersion: idp.ithaca-idp.com/v1alpha1
+kind: TeamNamespace
+metadata:
+  name: payments-dev
+spec:
+  businessUnit: payments
+  owner: dev@example.com
+  size: small
+  orderId: ORD-2026-000123

@@ -1,6 +1,8 @@
 extends: default
 ignore: |
   .github/ISSUE_TEMPLATE/
+  operator/config/crd/bases/
+  operator/config/rbac/role.yaml
 rules:
   line-length: disable
   document-start: disable
