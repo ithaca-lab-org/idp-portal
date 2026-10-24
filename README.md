@@ -21,3 +21,24 @@ Environment: `OIDC_ISSUER` (for example `https://<host>/auth/realms/ithaca`), `O
 - Cookies are stateless HMAC-signed values, bound to their purpose (a login cookie cannot be replayed as a session cookie), `HttpOnly`, `SameSite=Lax`, and `__Host-` prefixed when `Secure`, so sibling subdomains cannot set them.
 - Sessions last 15 minutes and groups are read only at login, so group changes apply at the next login. A server-side session store (needed anyway to call Kubernetes and Vault for the user) will add revocation.
 - `email` is not verified by this service and must never be used for authorisation.
+
+## Order API
+
+All routes need a signed-in session (401 JSON otherwise). The caller's email and groups come from the session only.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/business-units` | The caller's groups: the business units they may order for |
+| `POST /api/orders/namespaces` | `{"name","businessUnit","size"}` -> 202 with the order (`PENDING`) |
+| `GET /api/orders` | The caller's orders, newest first (`?limit=`, default 50, max 100) |
+| `GET /api/orders/{id}` | One of the caller's orders (someone else's is a 404, so ids cannot be enumerated) |
+
+Rules enforced on `POST`:
+- the business unit must be exactly one of the caller's `groups` (403 otherwise); the owner is always the session email, and unknown JSON fields (for example a forged `owner`) are rejected;
+- the name must be a lowercase DNS label of at most 40 characters and not reserved (`default`, `kube-*`, `istio-*`, `gke-*`, `argocd`, `cert-manager`, `tailscale`, `identity`, `idp-system`, `echo`); a test fails if this list drifts from the operator's;
+- size is `small` or `medium`; at most 10 active orders per business unit and 5 per user (`ORDER_CAP_PER_BU`, `ORDER_CAP_PER_USER`); the caps are checked without a lock, so simultaneous requests can exceed them slightly;
+- JSON only (`Content-Type: application/json`), 8 KB limit, same-origin only (cross-site requests get 403).
+
+Flow: the order is stored as `PENDING` (number `ORD-<year>-<counter>`, one active order per name), then a `TeamNamespace` is created with the order id. A poller (every 5 s, `PENDING` orders only) and reads move the order to `COMPLETE` or `FAILED` from the resource's status. A resource that belongs to a different order, or never appears within 10 minutes, fails the order.
+
+Environment: `MONGO_URI` (secret, required; the server refuses to start without it), `MONGO_DB` (default `idp`), `ORDER_CAP_PER_BU`, `ORDER_CAP_PER_USER`. The pod's ServiceAccount needs `get`, `list`, `watch` and `create` on `teamnamespaces.idp.ithaca-idp.com` and nothing else.

@@ -1,0 +1,168 @@
+// Package api serves the portal's JSON API. Every route needs a verified session; the caller's
+// identity (email and groups) always comes from the session, never from the request.
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
+	"mime"
+	"net/http"
+	"regexp"
+	"strconv"
+	"time"
+
+	"github.com/ithaca-lab-org/idp-portal/api/internal/auth"
+	"github.com/ithaca-lab-org/idp-portal/api/internal/orders"
+)
+
+const (
+	maxBody        = 8 << 10
+	requestTimeout = 15 * time.Second
+	defaultLimit   = 50
+	maxLimit       = 100
+)
+
+var orderIDRe = regexp.MustCompile(`^ORD-[0-9]{4}-[0-9]{6}$`)
+
+type API struct {
+	Auth *auth.Handler
+	Svc  *orders.Service
+}
+
+func (a *API) Routes(mux *http.ServeMux) {
+	mux.HandleFunc("GET /api/business-units", a.user(a.businessUnits))
+	mux.HandleFunc("POST /api/orders/namespaces", a.user(a.placeNamespace))
+	mux.HandleFunc("GET /api/orders", a.user(a.listOrders))
+	mux.HandleFunc("GET /api/orders/{id}", a.user(a.getOrder))
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeError(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+func (a *API) user(next func(http.ResponseWriter, *http.Request, orders.Requester)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		u, ok := a.Auth.UserFrom(r)
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+		defer cancel()
+		next(w, r.WithContext(ctx), orders.Requester{Email: u.Email, Groups: u.Groups})
+	}
+}
+
+func (a *API) businessUnits(w http.ResponseWriter, _ *http.Request, who orders.Requester) {
+	groups := who.Groups
+	if groups == nil {
+		groups = []string{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"businessUnits": groups})
+}
+
+type namespaceBody struct {
+	Name         string `json:"name"`
+	BusinessUnit string `json:"businessUnit"`
+	Size         string `json:"size"`
+}
+
+func (a *API) placeNamespace(w http.ResponseWriter, r *http.Request, who orders.Requester) {
+	if !a.Auth.SameOrigin(r) {
+		writeError(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	if mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mt != "application/json" {
+		writeError(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json")
+		return
+	}
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBody))
+	dec.DisallowUnknownFields()
+	var body namespaceBody
+	if err := dec.Decode(&body); err != nil {
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		}
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	o, err := a.Svc.PlaceNamespaceOrder(r.Context(), who, orders.NamespaceRequest{
+		Name: body.Name, BusinessUnit: body.BusinessUnit, Size: body.Size})
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, o)
+}
+
+func (a *API) listOrders(w http.ResponseWriter, r *http.Request, who orders.Requester) {
+	limit := defaultLimit
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			writeError(w, http.StatusBadRequest, "limit must be a positive number")
+			return
+		}
+		limit = min(n, maxLimit)
+	}
+	list, err := a.Svc.ListOrders(r.Context(), who, limit)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	if list == nil {
+		list = []orders.Order{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"orders": list})
+}
+
+func (a *API) getOrder(w http.ResponseWriter, r *http.Request, who orders.Requester) {
+	id := r.PathValue("id")
+	if !orderIDRe.MatchString(id) {
+		writeError(w, http.StatusNotFound, "order not found")
+		return
+	}
+	o, err := a.Svc.GetOrder(r.Context(), who, id)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, o)
+}
+
+func (a *API) fail(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, orders.ErrForbidden):
+		writeError(w, http.StatusForbidden, "you cannot order for that business unit")
+	case errors.Is(err, orders.ErrInvalid):
+		writeError(w, http.StatusBadRequest, err.Error())
+	case errors.Is(err, orders.ErrCap):
+		writeError(w, http.StatusTooManyRequests, "order limit reached, try again after an existing order is removed")
+	case errors.Is(err, orders.ErrNameTaken):
+		writeError(w, http.StatusConflict, "a namespace with that name already exists or is already ordered")
+	case errors.Is(err, orders.ErrNotFound):
+		writeError(w, http.StatusNotFound, "order not found")
+	case errors.Is(err, orders.ErrCluster):
+		writeError(w, http.StatusBadGateway, "the cluster request failed, the order was marked FAILED")
+	default:
+		slog.Error("api error", "err", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+	}
+}
