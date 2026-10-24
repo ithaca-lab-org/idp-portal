@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 )
@@ -14,13 +13,17 @@ import (
 type Store interface {
 	Create(ctx context.Context, o *Order) error
 	Get(ctx context.Context, id string) (*Order, error)
-	ListByOwner(ctx context.Context, owner string, limit int) ([]Order, error)
-	ListPending(ctx context.Context, limit int) ([]Order, error)
-	// UpdateStatus moves an order out of PENDING; it returns ErrNotFound if it is not PENDING.
-	UpdateStatus(ctx context.Context, id string, to Status, message string) error
+	ListByOwner(ctx context.Context, ownerSub string, limit int) ([]Order, error)
+	ListByStatus(ctx context.Context, status Status, limit int) ([]Order, error)
+	// UpdateStatus changes the status only if the order is currently in `from`; it returns
+	// ErrNotFound otherwise, so concurrent updaters cannot overwrite each other.
+	UpdateStatus(ctx context.Context, id string, from, to Status, message string) error
 	CountActiveByBusinessUnit(ctx context.Context, bu string) (int, error)
-	CountActiveByOwner(ctx context.Context, owner string) (int, error)
+	CountActiveByOwner(ctx context.Context, ownerSub string) (int, error)
 }
+
+// active orders hold their name and count against the caps.
+func active(st Status) bool { return st == StatusPending || st == StatusComplete }
 
 func orderID(year int, seq int64) string { return fmt.Sprintf("ORD-%d-%06d", year, seq) }
 
@@ -40,7 +43,7 @@ func (m *MemStore) Create(_ context.Context, o *Order) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, e := range m.orders {
-		if e.Kind == o.Kind && e.Name == o.Name && e.Status != StatusFailed {
+		if e.Kind == o.Kind && e.Name == o.Name && active(e.Status) {
 			return ErrNameTaken
 		}
 	}
@@ -82,23 +85,23 @@ func (m *MemStore) filter(pred func(*Order) bool, limit int) []Order {
 	return out
 }
 
-func (m *MemStore) ListByOwner(_ context.Context, owner string, limit int) ([]Order, error) {
+func (m *MemStore) ListByOwner(_ context.Context, ownerSub string, limit int) ([]Order, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.filter(func(o *Order) bool { return strings.EqualFold(o.Owner, owner) }, limit), nil
+	return m.filter(func(o *Order) bool { return o.OwnerSub == ownerSub }, limit), nil
 }
 
-func (m *MemStore) ListPending(_ context.Context, limit int) ([]Order, error) {
+func (m *MemStore) ListByStatus(_ context.Context, status Status, limit int) ([]Order, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.filter(func(o *Order) bool { return o.Status == StatusPending }, limit), nil
+	return m.filter(func(o *Order) bool { return o.Status == status }, limit), nil
 }
 
-func (m *MemStore) UpdateStatus(_ context.Context, id string, to Status, message string) error {
+func (m *MemStore) UpdateStatus(_ context.Context, id string, from, to Status, message string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	o, ok := m.orders[id]
-	if !ok || o.Status != StatusPending {
+	if !ok || o.Status != from {
 		return ErrNotFound
 	}
 	o.Status, o.Message, o.UpdatedAt = to, message, m.Now().UTC()
@@ -108,7 +111,7 @@ func (m *MemStore) UpdateStatus(_ context.Context, id string, to Status, message
 func (m *MemStore) count(pred func(*Order) bool) int {
 	n := 0
 	for _, o := range m.orders {
-		if o.Status != StatusFailed && pred(o) {
+		if active(o.Status) && pred(o) {
 			n++
 		}
 	}
@@ -121,8 +124,8 @@ func (m *MemStore) CountActiveByBusinessUnit(_ context.Context, bu string) (int,
 	return m.count(func(o *Order) bool { return o.BusinessUnit == bu }), nil
 }
 
-func (m *MemStore) CountActiveByOwner(_ context.Context, owner string) (int, error) {
+func (m *MemStore) CountActiveByOwner(_ context.Context, ownerSub string) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.count(func(o *Order) bool { return strings.EqualFold(o.Owner, owner) }), nil
+	return m.count(func(o *Order) bool { return o.OwnerSub == ownerSub }), nil
 }

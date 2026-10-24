@@ -16,6 +16,9 @@ const (
 	StatusPending  Status = "PENDING"
 	StatusComplete Status = "COMPLETE"
 	StatusFailed   Status = "FAILED"
+	// StatusReleased marks a COMPLETE order whose namespace was later removed: it frees the name
+	// and no longer counts against the caps.
+	StatusReleased Status = "RELEASED"
 
 	KindNamespace = "namespace"
 )
@@ -26,6 +29,7 @@ type Order struct {
 	Name         string    `bson:"name" json:"name"`
 	BusinessUnit string    `bson:"businessUnit" json:"businessUnit"`
 	Owner        string    `bson:"owner" json:"owner"`
+	OwnerSub     string    `bson:"ownerSub" json:"-"` // the Keycloak subject: authorization and caps use this, not the email
 	Size         string    `bson:"size" json:"size"`
 	Status       Status    `bson:"status" json:"status"`
 	Message      string    `bson:"message,omitempty" json:"message,omitempty"`

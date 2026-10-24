@@ -97,18 +97,19 @@ func main() {
 		slog.Error("kubernetes in-cluster config", "err", err)
 		os.Exit(1)
 	}
+	restCfg.Timeout = 10 * time.Second // a hung API call must not stall the poller
 	dyn, err := dynamic.NewForConfig(restCfg)
 	if err != nil {
 		slog.Error("kubernetes client", "err", err)
 		os.Exit(1)
 	}
 	svc := orders.NewService(store, orders.DynamicCluster{Client: dyn}, intEnv("ORDER_CAP_PER_BU", 10), intEnv("ORDER_CAP_PER_USER", 5))
-	go svc.RunSyncer(ctx, 5*time.Second)
+	go svc.RunSyncer(ctx, 5*time.Second, 12) // COMPLETE orders are checked every minute
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	h.Routes(mux)
-	(&api.API{Auth: h, Svc: svc}).Routes(mux)
+	api.New(h, svc).Routes(mux)
 
 	addr := os.Getenv("LISTEN_ADDR")
 	if addr == "" {

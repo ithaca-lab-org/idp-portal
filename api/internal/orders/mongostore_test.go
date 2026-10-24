@@ -39,7 +39,7 @@ func newMongoStore(t *testing.T) *MongoStore {
 }
 
 func newOrder(name, owner string) *Order {
-	return &Order{Kind: KindNamespace, Name: name, BusinessUnit: "payment-bu", Owner: owner, Size: "small", Status: StatusPending}
+	return &Order{Kind: KindNamespace, Name: name, BusinessUnit: "payment-bu", Owner: owner, OwnerSub: "sub-" + owner, Size: "small", Status: StatusPending}
 }
 
 func TestMongoCounterIsAtomicUnderConcurrency(t *testing.T) {
@@ -88,7 +88,7 @@ func TestMongoOneActiveOrderPerName(t *testing.T) {
 	if err := s.Create(ctx, newOrder("shared", "b@example.com")); !errors.Is(err, ErrNameTaken) {
 		t.Fatalf("pending duplicate: %v", err)
 	}
-	if err := s.UpdateStatus(ctx, a.ID, StatusComplete, ""); err != nil {
+	if err := s.UpdateStatus(ctx, a.ID, StatusPending, StatusComplete, ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Create(ctx, newOrder("shared", "b@example.com")); !errors.Is(err, ErrNameTaken) {
@@ -96,7 +96,7 @@ func TestMongoOneActiveOrderPerName(t *testing.T) {
 	}
 	f := newOrder("retry", "a@example.com")
 	_ = s.Create(ctx, f)
-	if err := s.UpdateStatus(ctx, f.ID, StatusFailed, "boom"); err != nil {
+	if err := s.UpdateStatus(ctx, f.ID, StatusPending, StatusFailed, "boom"); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Create(ctx, newOrder("retry", "a@example.com")); err != nil {
@@ -110,21 +110,21 @@ func TestMongoStatusAndCounts(t *testing.T) {
 	a, b := newOrder("one", "a@example.com"), newOrder("two", "a@example.com")
 	_ = s.Create(ctx, a)
 	_ = s.Create(ctx, b)
-	_ = s.UpdateStatus(ctx, b.ID, StatusFailed, "x")
-	if err := s.UpdateStatus(ctx, b.ID, StatusComplete, ""); !errors.Is(err, ErrNotFound) {
+	_ = s.UpdateStatus(ctx, b.ID, StatusPending, StatusFailed, "x")
+	if err := s.UpdateStatus(ctx, b.ID, StatusPending, StatusComplete, ""); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("a finished order must not change again: %v", err)
 	}
 	if n, _ := s.CountActiveByBusinessUnit(ctx, "payment-bu"); n != 1 {
 		t.Fatalf("active by bu: %d", n)
 	}
-	if n, _ := s.CountActiveByOwner(ctx, "a@example.com"); n != 1 {
+	if n, _ := s.CountActiveByOwner(ctx, "sub-a@example.com"); n != 1 {
 		t.Fatalf("active by owner: %d", n)
 	}
-	pending, _ := s.ListPending(ctx, 10)
+	pending, _ := s.ListByStatus(ctx, StatusPending, 10)
 	if len(pending) != 1 || pending[0].ID != a.ID {
 		t.Fatalf("pending: %+v", pending)
 	}
-	list, _ := s.ListByOwner(ctx, "a@example.com", 10)
+	list, _ := s.ListByOwner(ctx, "sub-a@example.com", 10)
 	if len(list) != 2 || list[0].ID != b.ID {
 		t.Fatalf("newest first: %+v", list)
 	}
@@ -149,5 +149,27 @@ func TestMongoQueryOperatorsAreTreatedAsLiterals(t *testing.T) {
 		if n, _ := s.CountActiveByBusinessUnit(ctx, evil); n != 0 {
 			t.Errorf("bu %q counted %d", evil, n)
 		}
+	}
+}
+
+func TestMongoReleasedOrdersFreeTheNameAndTheCap(t *testing.T) {
+	s := newMongoStore(t)
+	ctx := context.Background()
+	o := newOrder("gone", "a@example.com")
+	_ = s.Create(ctx, o)
+	if err := s.UpdateStatus(ctx, o.ID, StatusPending, StatusComplete, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateStatus(ctx, o.ID, StatusPending, StatusReleased, ""); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("the from-status guard must stop a stale transition: %v", err)
+	}
+	if err := s.UpdateStatus(ctx, o.ID, StatusComplete, StatusReleased, "removed"); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := s.CountActiveByOwner(ctx, "sub-a@example.com"); n != 0 {
+		t.Fatalf("a released order must not count: %d", n)
+	}
+	if err := s.Create(ctx, newOrder("gone", "b@example.com")); err != nil {
+		t.Fatalf("a released order must free the name: %v", err)
 	}
 }

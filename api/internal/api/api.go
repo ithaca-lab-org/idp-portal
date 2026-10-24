@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"regexp"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/ithaca-lab-org/idp-portal/api/internal/auth"
@@ -25,11 +26,58 @@ const (
 	maxLimit       = 100
 )
 
-var orderIDRe = regexp.MustCompile(`^ORD-[0-9]{4}-[0-9]{6}$`)
+// six digits at least: the counter is not capped at 999999 a year
+var orderIDRe = regexp.MustCompile(`^ORD-[0-9]{4}-[0-9]{6,}$`)
 
 type API struct {
-	Auth *auth.Handler
-	Svc  *orders.Service
+	Auth    *auth.Handler
+	Svc     *orders.Service
+	limiter *limiter
+}
+
+// New builds the API with a per-user limit on order placement: every attempt consumes an order
+// number and a database write, so it must not be unbounded.
+func New(a *auth.Handler, svc *orders.Service) *API {
+	return &API{Auth: a, Svc: svc, limiter: newLimiter(10, time.Minute)}
+}
+
+// limiter allows at most max events per key within a sliding window.
+type limiter struct {
+	mu     sync.Mutex
+	max    int
+	window time.Duration
+	hits   map[string][]time.Time
+	now    func() time.Time
+}
+
+func newLimiter(max int, window time.Duration) *limiter {
+	return &limiter{max: max, window: window, hits: map[string][]time.Time{}, now: time.Now}
+}
+
+func (l *limiter) allow(key string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	cutoff := now.Add(-l.window)
+	recent := l.hits[key][:0]
+	for _, t := range l.hits[key] {
+		if t.After(cutoff) {
+			recent = append(recent, t)
+		}
+	}
+	if len(recent) >= l.max {
+		l.hits[key] = recent
+		return false
+	}
+	l.hits[key] = append(recent, now)
+	if len(l.hits) > 1024 { // keep memory bounded: drop keys with no recent activity
+		for k, v := range l.hits {
+			if len(v) == 0 || !v[len(v)-1].After(cutoff) {
+				delete(l.hits, k)
+			}
+		}
+	}
+	return true
 }
 
 func (a *API) Routes(mux *http.ServeMux) {
@@ -60,7 +108,7 @@ func (a *API) user(next func(http.ResponseWriter, *http.Request, orders.Requeste
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
 		defer cancel()
-		next(w, r.WithContext(ctx), orders.Requester{Email: u.Email, Groups: u.Groups})
+		next(w, r.WithContext(ctx), orders.Requester{Sub: u.Sub, Email: u.Email, Groups: u.Groups})
 	}
 }
 
@@ -81,6 +129,11 @@ type namespaceBody struct {
 func (a *API) placeNamespace(w http.ResponseWriter, r *http.Request, who orders.Requester) {
 	if !a.Auth.SameOrigin(r) {
 		writeError(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	if !a.limiter.allow(who.Sub) {
+		w.Header().Set("Retry-After", "60")
+		writeError(w, http.StatusTooManyRequests, "too many orders, slow down")
 		return
 	}
 	if mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mt != "application/json" {

@@ -3,6 +3,7 @@ package orders
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"regexp"
 	"sort"
@@ -61,7 +62,7 @@ func (f *fakeCluster) set(name, phase, msg string) {
 	f.items[name].Phase, f.items[name].Message = phase, msg
 }
 
-var alice = Requester{Email: "alice@example.com", Groups: []string{"payment-bu", "web-bu"}}
+var alice = Requester{Sub: "sub-alice", Email: "alice@example.com", Groups: []string{"payment-bu", "web-bu"}}
 
 func newSvc() (*Service, *MemStore, *fakeCluster) {
 	st, cl := NewMemStore(), newFakeCluster()
@@ -153,13 +154,14 @@ func TestPlaceOrderAuthorization(t *testing.T) {
 	}{
 		"business unit not in groups":   {alice, NamespaceRequest{"x-team", "other-bu", "small"}, ErrForbidden},
 		"case-sensitive group match":    {alice, NamespaceRequest{"x-team", "Payment-BU", "small"}, ErrForbidden},
-		"empty groups":                  {Requester{Email: "a@example.com"}, NamespaceRequest{"x-team", "payment-bu", "small"}, ErrForbidden},
-		"missing email":                 {Requester{Groups: []string{"payment-bu"}}, NamespaceRequest{"x-team", "payment-bu", "small"}, ErrForbidden},
-		"malformed email":               {Requester{Email: "nope", Groups: []string{"payment-bu"}}, NamespaceRequest{"x-team", "payment-bu", "small"}, ErrForbidden},
+		"empty groups":                  {Requester{Sub: "sub-a", Email: "a@example.com"}, NamespaceRequest{"x-team", "payment-bu", "small"}, ErrForbidden},
+		"missing subject":               {Requester{Email: "a@example.com", Groups: []string{"payment-bu"}}, NamespaceRequest{"x-team", "payment-bu", "small"}, ErrForbidden},
+		"missing email":                 {Requester{Sub: "sub-x", Groups: []string{"payment-bu"}}, NamespaceRequest{"x-team", "payment-bu", "small"}, ErrForbidden},
+		"malformed email":               {Requester{Sub: "sub-x", Email: "nope", Groups: []string{"payment-bu"}}, NamespaceRequest{"x-team", "payment-bu", "small"}, ErrForbidden},
 		"reserved name":                 {alice, NamespaceRequest{"kube-system", "payment-bu", "small"}, ErrInvalid},
 		"invalid name":                  {alice, NamespaceRequest{"Bad_Name", "payment-bu", "small"}, ErrInvalid},
 		"invalid size":                  {alice, NamespaceRequest{"x-team", "payment-bu", "huge"}, ErrInvalid},
-		"group that is not a DNS label": {Requester{Email: "a@example.com", Groups: []string{"Payment BU"}}, NamespaceRequest{"x-team", "Payment BU", "small"}, ErrInvalid},
+		"group that is not a DNS label": {Requester{Sub: "sub-a", Email: "a@example.com", Groups: []string{"Payment BU"}}, NamespaceRequest{"x-team", "Payment BU", "small"}, ErrInvalid},
 	} {
 		if _, err := svc.PlaceNamespaceOrder(ctx, tc.who, tc.req); !errors.Is(err, tc.err) {
 			t.Errorf("%s: want %v, got %v", name, tc.err, err)
@@ -168,7 +170,7 @@ func TestPlaceOrderAuthorization(t *testing.T) {
 	if len(cl.created) != 0 {
 		t.Fatalf("rejected requests must never reach the cluster: %v", cl.created)
 	}
-	if n, _ := st.CountActiveByOwner(ctx, "alice@example.com"); n != 0 {
+	if n, _ := st.CountActiveByOwner(ctx, "sub-alice"); n != 0 {
 		t.Fatalf("rejected requests must not be stored, %d stored", n)
 	}
 }
@@ -187,7 +189,7 @@ func TestCaps(t *testing.T) {
 	}
 	svc2, _, _ := newSvc()
 	svc2.CapPerBU = 1
-	bob := Requester{Email: "bob@example.com", Groups: []string{"payment-bu"}}
+	bob := Requester{Sub: "sub-bob", Email: "bob@example.com", Groups: []string{"payment-bu"}}
 	if _, err := svc2.PlaceNamespaceOrder(ctx, alice, NamespaceRequest{"one", "payment-bu", "small"}); err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +217,7 @@ func TestDuplicateNameAndClusterFailure(t *testing.T) {
 	if !errors.Is(err, ErrCluster) || strings.Contains(err.Error(), "secret details") {
 		t.Fatalf("cluster failure must be generic: %v", err)
 	}
-	list, _ := st.ListByOwner(ctx, alice.Email, 10)
+	list, _ := st.ListByOwner(ctx, alice.Sub, 10)
 	failed := 0
 	for _, o := range list {
 		if o.Status == StatusFailed {
@@ -237,7 +239,7 @@ func TestOrdersAreOwnerScopedAndStatusRefreshes(t *testing.T) {
 	svc, _, cl := newSvc()
 	ctx := context.Background()
 	o, _ := svc.PlaceNamespaceOrder(ctx, alice, NamespaceRequest{"payments-team", "payment-bu", "small"})
-	mallory := Requester{Email: "mallory@example.com", Groups: []string{"payment-bu"}}
+	mallory := Requester{Sub: "sub-mallory", Email: "mallory@example.com", Groups: []string{"payment-bu"}}
 	if _, err := svc.GetOrder(ctx, mallory, o.ID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("another user's order must look absent: %v", err)
 	}
@@ -302,7 +304,7 @@ func TestSyncerUpdatesPendingAndStops(t *testing.T) {
 
 	rctx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
-	go func() { svc.RunSyncer(rctx, 10*time.Millisecond); close(done) }()
+	go func() { svc.RunSyncer(rctx, 10*time.Millisecond, 0); close(done) }()
 	deadline := time.After(2 * time.Second)
 	for {
 		got, _ := st.Get(ctx, o.ID)
@@ -337,10 +339,10 @@ func TestMemStoreNumbersAndNames(t *testing.T) {
 	if err := st.Create(ctx, &Order{Kind: KindNamespace, Name: "a", Status: StatusPending}); !errors.Is(err, ErrNameTaken) {
 		t.Fatalf("duplicate: %v", err)
 	}
-	if err := st.UpdateStatus(ctx, a.ID, StatusComplete, ""); err != nil {
+	if err := st.UpdateStatus(ctx, a.ID, StatusPending, StatusComplete, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.UpdateStatus(ctx, a.ID, StatusFailed, ""); !errors.Is(err, ErrNotFound) {
+	if err := st.UpdateStatus(ctx, a.ID, StatusPending, StatusFailed, ""); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("a finished order must not change again: %v", err)
 	}
 }
@@ -374,5 +376,114 @@ func TestDynamicClusterShape(t *testing.T) {
 	}
 	if _, err := c.TeamNamespace(ctx, "nope"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing: %v", err)
+	}
+}
+
+func TestCapIsEnforcedUnderConcurrency(t *testing.T) {
+	svc, st, _ := newSvc()
+	svc.CapPerUser = 5
+	svc.CapPerBU = 100
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	var ok, capped int32
+	var mu sync.Mutex
+	for i := 0; i < 60; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, err := svc.PlaceNamespaceOrder(ctx, alice, NamespaceRequest{fmt.Sprintf("burst-%d", i), "payment-bu", "medium"})
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				ok++
+			case errors.Is(err, ErrCap):
+				capped++
+			default:
+				t.Errorf("unexpected error: %v", err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	n, _ := st.CountActiveByOwner(ctx, alice.Sub)
+	if ok != 5 || n != 5 || capped != 55 {
+		t.Fatalf("a burst of 60 must create exactly the cap (5): created %d, stored %d, refused %d", ok, n, capped)
+	}
+}
+
+func TestOwnershipFollowsSubjectNotEmail(t *testing.T) {
+	svc, _, cl := newSvc()
+	ctx := context.Background()
+	o, err := svc.PlaceNamespaceOrder(ctx, alice, NamespaceRequest{"payments-team", "payment-bu", "small"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// someone else ends up with alice's email address: they must not see her orders
+	imposter := Requester{Sub: "sub-imposter", Email: "alice@example.com", Groups: []string{"payment-bu"}}
+	if _, err := svc.GetOrder(ctx, imposter, o.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("same email, different subject must not read the order: %v", err)
+	}
+	if list, _ := svc.ListOrders(ctx, imposter, 10); len(list) != 0 {
+		t.Fatal("same email, different subject must not list the orders")
+	}
+	// alice changes her email: she still owns her orders and her caps follow her
+	renamed := Requester{Sub: "sub-alice", Email: "alice.new@example.com", Groups: []string{"payment-bu"}}
+	if _, err := svc.GetOrder(ctx, renamed, o.ID); err != nil {
+		t.Fatalf("an email change must not lock the owner out: %v", err)
+	}
+	svc.CapPerUser = 1
+	if _, err := svc.PlaceNamespaceOrder(ctx, renamed, NamespaceRequest{"another", "payment-bu", "small"}); !errors.Is(err, ErrCap) {
+		t.Fatalf("changing the email must not reset the per-user cap: %v", err)
+	}
+	if len(cl.created) != 1 {
+		t.Fatalf("created %v", cl.created)
+	}
+}
+
+func TestEmailIsNormalised(t *testing.T) {
+	svc, _, cl := newSvc()
+	who := Requester{Sub: "sub-bill", Email: "  Bill.Paxton@Example.COM ", Groups: []string{"payment-bu"}}
+	o, err := svc.PlaceNamespaceOrder(context.Background(), who, NamespaceRequest{"bills-team", "payment-bu", "small"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o.Owner != "bill.paxton@example.com" || !strings.HasPrefix(cl.created[0], "bill.paxton@example.com|") {
+		t.Fatalf("owner %q created %v", o.Owner, cl.created)
+	}
+}
+
+func TestRemovedNamespaceReleasesTheOrder(t *testing.T) {
+	svc, st, cl := newSvc()
+	svc.CapPerUser = 1
+	ctx := context.Background()
+	o, _ := svc.PlaceNamespaceOrder(ctx, alice, NamespaceRequest{"payments-team", "payment-bu", "small"})
+	cl.set("payments-team", "Ready", "")
+	svc.SyncOnce(ctx, true)
+	if got, _ := st.Get(ctx, o.ID); got.Status != StatusComplete {
+		t.Fatalf("status %s", got.Status)
+	}
+	if _, err := svc.PlaceNamespaceOrder(ctx, alice, NamespaceRequest{"second", "payment-bu", "small"}); !errors.Is(err, ErrCap) {
+		t.Fatalf("a COMPLETE order counts against the cap: %v", err)
+	}
+	delete(cl.items, "payments-team") // an admin deleted the namespace
+	svc.SyncOnce(ctx, false)
+	if got, _ := st.Get(ctx, o.ID); got.Status != StatusComplete {
+		t.Fatal("COMPLETE orders are only re-checked on the slow tick")
+	}
+	svc.SyncOnce(ctx, true)
+	if got, _ := st.Get(ctx, o.ID); got.Status != StatusReleased {
+		t.Fatalf("status after removal: %s", got.Status)
+	}
+	if _, err := svc.PlaceNamespaceOrder(ctx, alice, NamespaceRequest{"payments-team", "payment-bu", "small"}); err != nil {
+		t.Fatalf("a released order must free the name and the cap: %v", err)
+	}
+	// a cluster read error must not release anything
+	o2, _ := svc.Store.Get(ctx, "ORD-"+fmt.Sprint(time.Now().UTC().Year())+"-000002")
+	cl.set("payments-team", "Ready", "")
+	svc.SyncOnce(ctx, true)
+	cl.getErr = errors.New("apiserver unreachable")
+	svc.SyncOnce(ctx, true)
+	if got, _ := st.Get(ctx, o2.ID); got.Status != StatusComplete {
+		t.Fatalf("a read error must not release an order, got %s", got.Status)
 	}
 }

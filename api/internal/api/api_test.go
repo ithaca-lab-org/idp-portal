@@ -43,6 +43,7 @@ func (f *fakeCluster) TeamNamespace(_ context.Context, name string) (*orders.Tea
 }
 
 type env struct {
+	api     *API
 	mux     *http.ServeMux
 	codec   *session.Codec
 	cluster *fakeCluster
@@ -62,8 +63,9 @@ func setup(t *testing.T) *env {
 	cl := &fakeCluster{items: map[string]*orders.TeamNamespaceInfo{}}
 	svc := orders.NewService(orders.NewMemStore(), cl, 10, 5)
 	mux := http.NewServeMux()
-	(&API{Auth: h, Svc: svc}).Routes(mux)
-	return &env{mux: mux, codec: codec, cluster: cl, svc: svc}
+	a := New(h, svc)
+	a.Routes(mux)
+	return &env{api: a, mux: mux, codec: codec, cluster: cl, svc: svc}
 }
 
 func (e *env) cookie(t *testing.T, u auth.User) *http.Cookie {
@@ -228,7 +230,7 @@ func TestOrdersAreOwnerScoped(t *testing.T) {
 	if w := e.do(httptest.NewRequest("GET", "/api/orders/"+o.ID, nil), &alice, t); w.Code != 200 {
 		t.Errorf("own order: %d", w.Code)
 	}
-	for _, id := range []string{"abc", "ORD-1-1", "ORD-2026-00000x"} {
+	for _, id := range []string{"abc", "ORD-1-1", "ORD-2026-00000x", "ORD-2026-12345"} {
 		if w := e.do(httptest.NewRequest("GET", "/api/orders/"+id, nil), &alice, t); w.Code != 404 {
 			t.Errorf("malformed id %q: %d", id, w.Code)
 		}
@@ -252,5 +254,38 @@ func TestOrdersAreOwnerScoped(t *testing.T) {
 	}
 	if w := e.do(httptest.NewRequest("GET", "/api/orders?limit=100000", nil), &alice, t); w.Code != 200 {
 		t.Errorf("a huge limit is clamped, not rejected: %d", w.Code)
+	}
+}
+
+func TestOrderPlacementIsRateLimitedPerUser(t *testing.T) {
+	e := setup(t)
+	e.svc.CapPerUser, e.svc.CapPerBU = 100, 100
+	e.api.limiter = newLimiter(3, time.Minute)
+	for i := 0; i < 3; i++ {
+		body := `{"name":"team-` + string(rune('a'+i)) + `","businessUnit":"payment-bu","size":"small"}`
+		if w := e.do(post(body, nil), &alice, t); w.Code != 202 {
+			t.Fatalf("order %d: %d", i, w.Code)
+		}
+	}
+	w := e.do(post(`{"name":"team-z","businessUnit":"payment-bu","size":"small"}`, nil), &alice, t)
+	if w.Code != 429 || w.Header().Get("Retry-After") == "" {
+		t.Fatalf("fourth order within the window: %d", w.Code)
+	}
+	other := auth.User{Sub: "u2", Email: "other@example.com", Groups: []string{"payment-bu"}}
+	if w := e.do(post(`{"name":"other-team","businessUnit":"payment-bu","size":"small"}`, nil), &other, t); w.Code != 202 {
+		t.Fatalf("the limit is per user: %d", w.Code)
+	}
+}
+
+func TestLimiterWindowSlides(t *testing.T) {
+	now := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
+	l := newLimiter(2, time.Minute)
+	l.now = func() time.Time { return now }
+	if !l.allow("u") || !l.allow("u") || l.allow("u") {
+		t.Fatal("two allowed, third refused")
+	}
+	now = now.Add(61 * time.Second)
+	if !l.allow("u") {
+		t.Fatal("allowed again after the window")
 	}
 }

@@ -34,7 +34,7 @@ func (s *MongoStore) EnsureIndexes(ctx context.Context) error {
 			Options: options.Index().SetUnique(true).SetName("active_name").
 				SetPartialFilterExpression(bson.D{{Key: "status", Value: bson.D{{Key: "$in", Value: bson.A{string(StatusPending), string(StatusComplete)}}}}}),
 		},
-		{Keys: bson.D{{Key: "owner", Value: 1}, {Key: "createdAt", Value: -1}}, Options: options.Index().SetName("owner_created")},
+		{Keys: bson.D{{Key: "ownerSub", Value: 1}, {Key: "createdAt", Value: -1}}, Options: options.Index().SetName("owner_created")},
 		{Keys: bson.D{{Key: "status", Value: 1}}, Options: options.Index().SetName("status")},
 	})
 	return err
@@ -110,19 +110,19 @@ func (s *MongoStore) list(ctx context.Context, filter bson.D, limit int) ([]Orde
 	return out, nil
 }
 
-func (s *MongoStore) ListByOwner(ctx context.Context, owner string, limit int) ([]Order, error) {
-	return s.list(ctx, bson.D{{Key: "owner", Value: owner}}, limit)
+func (s *MongoStore) ListByOwner(ctx context.Context, ownerSub string, limit int) ([]Order, error) {
+	return s.list(ctx, bson.D{{Key: "ownerSub", Value: ownerSub}}, limit)
 }
 
-func (s *MongoStore) ListPending(ctx context.Context, limit int) ([]Order, error) {
-	return s.list(ctx, bson.D{{Key: "status", Value: string(StatusPending)}}, limit)
+func (s *MongoStore) ListByStatus(ctx context.Context, status Status, limit int) ([]Order, error) {
+	return s.list(ctx, bson.D{{Key: "status", Value: string(status)}}, limit)
 }
 
-func (s *MongoStore) UpdateStatus(ctx context.Context, id string, to Status, message string) error {
+func (s *MongoStore) UpdateStatus(ctx context.Context, id string, from, to Status, message string) error {
 	ctx, cancel := context.WithTimeout(ctx, opTimeout)
 	defer cancel()
 	res, err := s.orders.UpdateOne(ctx,
-		bson.D{{Key: "_id", Value: id}, {Key: "status", Value: string(StatusPending)}},
+		bson.D{{Key: "_id", Value: id}, {Key: "status", Value: string(from)}},
 		bson.D{{Key: "$set", Value: bson.D{{Key: "status", Value: string(to)}, {Key: "message", Value: message}, {Key: "updatedAt", Value: s.now().UTC()}}}})
 	if err != nil {
 		return err
@@ -147,6 +147,6 @@ func (s *MongoStore) CountActiveByBusinessUnit(ctx context.Context, bu string) (
 	return s.countActive(ctx, "businessUnit", bu)
 }
 
-func (s *MongoStore) CountActiveByOwner(ctx context.Context, owner string) (int, error) {
-	return s.countActive(ctx, "owner", owner)
+func (s *MongoStore) CountActiveByOwner(ctx context.Context, ownerSub string) (int, error) {
+	return s.countActive(ctx, "ownerSub", ownerSub)
 }
