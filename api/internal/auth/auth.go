@@ -269,6 +269,9 @@ func (h *Handler) sameOrigin(r *http.Request) bool {
 	return true
 }
 
+// SameOrigin reports whether a state-changing request comes from this site (see sameOrigin).
+func (h *Handler) SameOrigin(r *http.Request) bool { return h.sameOrigin(r) }
+
 // logout clears the local session and returns the Keycloak end-session URL for the browser to
 // visit, so the SSO session ends too and the next login asks for credentials.
 func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {

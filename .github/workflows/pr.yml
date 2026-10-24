@@ -16,6 +16,11 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
+    services:
+      mongo:
+        image: mongo:8.0@sha256:4a4ab5d4834207389e0d7270fac988e21ffedccecba77991a552f755df229907
+        ports:
+          - 27017:27017
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -29,8 +34,10 @@ jobs:
       - name: vet
         working-directory: api
         run: go vet ./...
-      - name: test
+      - name: test (includes the MongoDB store tests against the service container)
         working-directory: api
+        env:
+          MONGO_TEST_URI: mongodb://localhost:27017
         run: go test -race -count=1 ./...
       - name: vulnerability scan
         working-directory: api
