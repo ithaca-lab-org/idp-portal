@@ -21,6 +21,7 @@ import (
 	"github.com/ithaca-lab-org/idp-portal/api/internal/auth"
 	"github.com/ithaca-lab-org/idp-portal/api/internal/orders"
 	"github.com/ithaca-lab-org/idp-portal/api/internal/session"
+	"github.com/ithaca-lab-org/idp-portal/api/internal/webui"
 )
 
 func mustEnv(name string) string {
@@ -110,6 +111,7 @@ func main() {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	h.Routes(mux)
 	api.New(h, svc).Routes(mux)
+	mux.Handle("GET /", webui.Handler())
 
 	addr := os.Getenv("LISTEN_ADDR")
 	if addr == "" {

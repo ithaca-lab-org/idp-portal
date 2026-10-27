@@ -2,3 +2,5 @@ bin/
 node_modules/
 .env
 *.local
+web/dist/
+api/internal/webui/dist/assets/
