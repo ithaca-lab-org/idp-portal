@@ -3,3 +3,7 @@
 .claude
 **/*_test.go
 *.md
+web/node_modules
+api/internal/webui/dist/assets
+web/dist
+**/*.test.tsx
