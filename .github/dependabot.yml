@@ -23,6 +23,17 @@ updates:
       go:
         patterns: ["*"]
   - package-ecosystem: gomod
+    directory: /notifier
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "build"
+    groups:
+      notifier:
+        patterns: ["*"]
+  - package-ecosystem: gomod
     directory: /operator
     schedule:
       interval: weekly
