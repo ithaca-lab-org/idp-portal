@@ -20,6 +20,7 @@ import (
 	"github.com/ithaca-lab-org/idp-portal/api/internal/api"
 	"github.com/ithaca-lab-org/idp-portal/api/internal/auth"
 	"github.com/ithaca-lab-org/idp-portal/api/internal/orders"
+	"github.com/ithaca-lab-org/idp-portal/api/internal/pubsubpub"
 	"github.com/ithaca-lab-org/idp-portal/api/internal/session"
 	"github.com/ithaca-lab-org/idp-portal/api/internal/webui"
 )
@@ -105,6 +106,17 @@ func main() {
 		os.Exit(1)
 	}
 	svc := orders.NewService(store, orders.DynamicCluster{Client: dyn}, intEnv("ORDER_CAP_PER_BU", 10), intEnv("ORDER_CAP_PER_USER", 5))
+	// Order events are optional: without PUBSUB_TOPIC nothing is published.
+	if topic := os.Getenv("PUBSUB_TOPIC"); topic != "" {
+		pub, err := pubsubpub.New(ctx, mustEnv("PUBSUB_PROJECT"), topic)
+		if err != nil {
+			slog.Error("pubsub", "err", err)
+			os.Exit(1)
+		}
+		defer func() { _ = pub.Close() }()
+		svc.Events = pub
+		slog.Info("publishing order events", "topic", topic)
+	}
 	go svc.RunSyncer(ctx, 5*time.Second, 12) // COMPLETE orders are checked every minute
 
 	mux := http.NewServeMux()

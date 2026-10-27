@@ -33,6 +33,7 @@ type Service struct {
 	CapPerUser     int
 	PendingTimeout time.Duration // a PENDING order whose resource never appears fails after this
 	Now            func() time.Time
+	Events         Publisher // optional: nil disables event publishing
 
 	// placeMu makes "count active orders, then insert" atomic for this process. The portal runs a
 	// single replica; with more replicas the reservation would have to move into the database.
@@ -172,9 +173,13 @@ func (s *Service) refresh(ctx context.Context, o *Order) *Order {
 }
 
 func (s *Service) transition(ctx context.Context, o *Order, from, to Status, msg string) *Order {
-	if err := s.Store.UpdateStatus(ctx, o.ID, from, to, msg); err != nil && !errors.Is(err, ErrNotFound) {
+	err := s.Store.UpdateStatus(ctx, o.ID, from, to, msg)
+	if err != nil && !errors.Is(err, ErrNotFound) {
 		slog.Error("update order status", "order", o.ID, "err", err)
 		return o
+	}
+	if err == nil { // ErrNotFound means another updater won; it publishes, not us
+		s.emit(ctx, o, to, msg)
 	}
 	if fresh, err := s.Store.Get(ctx, o.ID); err == nil {
 		return fresh
@@ -231,4 +236,8 @@ func (s *Service) RunSyncer(ctx context.Context, interval time.Duration, complet
 			s.SyncOnce(ctx, completeEvery > 0 && tick%completeEvery == 0)
 		}
 	}
+}
+
+func logPublishFailure(order, typ string, err error) {
+	slog.Error("publish order event", "order", order, "type", typ, "err", err)
 }
