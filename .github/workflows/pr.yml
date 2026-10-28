@@ -32,7 +32,7 @@ jobs:
         with:
           go-version-file: api/go.mod
           cache-dependency-path: api/go.sum
-      - name: runner kernel (MongoDB needs the rseq workaround on 6.19+)
+      - name: runner kernel (for diagnosing MongoDB start failures, SERVER-121912)
         run: uname -r
       - name: gofmt
         run: test -z "$(gofmt -l api)" || { gofmt -l api; exit 1; }
