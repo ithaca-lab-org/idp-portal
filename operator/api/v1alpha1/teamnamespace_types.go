@@ -20,7 +20,16 @@ const (
 	PhaseFailed  Phase = "Failed"
 )
 
-const ConditionReady = "Ready"
+const (
+	ConditionReady = "Ready"
+	// ConditionVaultReady reports the per-namespace Vault access objects
+	// (ServiceAccount vault-reader, VaultAuth vault-reader). Only set when the
+	// operator runs with VAULT_ENABLED=true.
+	ConditionVaultReady = "VaultReady"
+	// ConditionVaultPurgePending is True while a deleted TeamNamespace waits for
+	// its Vault KV data (kv/<name>/) to be purged.
+	ConditionVaultPurgePending = "VaultPurgePending"
+)
 
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.orderId) || (has(self.orderId) && self.orderId == oldSelf.orderId)",message="orderId is immutable once set"
 type TeamNamespaceSpec struct {
@@ -65,6 +74,12 @@ type TeamNamespaceStatus struct {
 }
 
 // TeamNamespace requests a guarded namespace whose name equals metadata.name.
+// With VAULT_ENABLED=true the operator also adds the finalizer
+// idp.ithaca-idp.com/vault-purge, which deletes all Vault KV data under
+// kv/<name>/ before the resource goes away. If Vault is unreachable it retries
+// (condition VaultPurgePending) and gives up after VAULT_PURGE_GIVE_UP_AFTER
+// (default 30m). An admin can skip the purge at once by removing that finalizer
+// with a JSON patch on metadata.finalizers (see the operator README).
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster,shortName=tns

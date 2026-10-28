@@ -35,8 +35,14 @@ spec:
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: TeamNamespace requests a guarded namespace whose name equals
-          metadata.name.
+        description: |-
+          TeamNamespace requests a guarded namespace whose name equals metadata.name.
+          With VAULT_ENABLED=true the operator also adds the finalizer
+          idp.ithaca-idp.com/vault-purge, which deletes all Vault KV data under
+          kv/<name>/ before the resource goes away. If Vault is unreachable it retries
+          (condition VaultPurgePending) and gives up after VAULT_PURGE_GIVE_UP_AFTER
+          (default 30m). An admin can skip the purge at once by removing that finalizer
+          with a JSON patch on metadata.finalizers (see the operator README).
         properties:
           apiVersion:
             description: |-

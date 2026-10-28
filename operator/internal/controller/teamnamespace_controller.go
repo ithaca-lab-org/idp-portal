@@ -36,6 +36,8 @@ const (
 type TeamNamespaceReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	// Vault is nil unless VAULT_ENABLED=true.
+	Vault *VaultOptions
 }
 
 // The child objects live in namespaces created at runtime, so their rules must be
@@ -55,6 +57,10 @@ type TeamNamespaceReconciler struct {
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=update;delete,resourceNames=idp-namespace-admin
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,verbs=bind,resourceNames=admin
+// +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;create
+// +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=update;delete,resourceNames=vault-reader
+// +kubebuilder:rbac:groups=secrets.hashicorp.com,resources=vaultauths,verbs=get;list;watch;create
+// +kubebuilder:rbac:groups=secrets.hashicorp.com,resources=vaultauths,verbs=update;delete,resourceNames=vault-reader
 
 func (r *TeamNamespaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -65,7 +71,7 @@ func (r *TeamNamespaceReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	if !tn.DeletionTimestamp.IsZero() {
-		return ctrl.Result{}, r.finalize(ctx, tn)
+		return r.finalize(ctx, tn)
 	}
 
 	if IsReserved(tn.Name) {
@@ -91,7 +97,11 @@ func (r *TeamNamespaceReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			ReasonNamespaceTerminating, "previous namespace is still terminating", "")
 	}
 
-	if controllerutil.AddFinalizer(tn, FinalizerName) {
+	added := controllerutil.AddFinalizer(tn, FinalizerName)
+	if r.Vault != nil && controllerutil.AddFinalizer(tn, VaultFinalizerName) {
+		added = true
+	}
+	if added {
 		if err := r.Update(ctx, tn); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -102,11 +112,21 @@ func (r *TeamNamespaceReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		_ = r.setStatus(ctx, tn, idpv1alpha1.PhasePending, metav1.ConditionFalse, ReasonReconcileError, err.Error(), tn.Status.Namespace)
 		return ctrl.Result{}, err
 	}
+	var extra []metav1.Condition
+	if r.Vault != nil {
+		if err := r.ensureVaultAccess(ctx, tn); err != nil {
+			_ = r.setStatus(ctx, tn, idpv1alpha1.PhasePending, metav1.ConditionFalse, ReasonReconcileError, err.Error(), tn.Status.Namespace,
+				vaultCondition(metav1.ConditionFalse, ReasonVaultAccessError, err.Error(), tn))
+			return ctrl.Result{}, err
+		}
+		extra = append(extra, vaultCondition(metav1.ConditionTrue, ReasonVaultAccessReady,
+			"ServiceAccount vault-reader and VaultAuth vault-reader are in place", tn))
+	}
 	if requeue {
 		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 	return ctrl.Result{}, r.setStatus(ctx, tn, idpv1alpha1.PhaseReady, metav1.ConditionTrue, ReasonReconciled,
-		"namespace and guardrails are in place", tn.Name)
+		"namespace and guardrails are in place", tn.Name, extra...)
 }
 
 func managedBy(ns *corev1.Namespace, tn *idpv1alpha1.TeamNamespace) bool {
@@ -228,32 +248,40 @@ func (r *TeamNamespaceReconciler) ensureRoleBinding(ctx context.Context, tn *idp
 	return false, nil
 }
 
-func (r *TeamNamespaceReconciler) finalize(ctx context.Context, tn *idpv1alpha1.TeamNamespace) error {
-	if !controllerutil.ContainsFinalizer(tn, FinalizerName) {
-		return nil
-	}
-	if !IsReserved(tn.Name) {
-		ns := &corev1.Namespace{}
-		err := r.Get(ctx, types.NamespacedName{Name: tn.Name}, ns)
-		switch {
-		case apierrors.IsNotFound(err):
-		case err != nil:
-			return err
-		case managedBy(ns, tn) && ns.DeletionTimestamp.IsZero():
-			// Preconditions pin the exact object whose labels were checked.
-			uid, rv := ns.UID, ns.ResourceVersion
-			if err := r.Delete(ctx, ns, client.Preconditions{UID: &uid, ResourceVersion: &rv}); client.IgnoreNotFound(err) != nil {
-				return err
+// finalize deletes the managed namespace (finalizer FinalizerName), then purges
+// the namespace's Vault KV data (finalizer VaultFinalizerName). The namespace
+// step does not wait for Vault, so a Vault outage never keeps workloads running.
+func (r *TeamNamespaceReconciler) finalize(ctx context.Context, tn *idpv1alpha1.TeamNamespace) (ctrl.Result, error) {
+	if controllerutil.ContainsFinalizer(tn, FinalizerName) {
+		if !IsReserved(tn.Name) {
+			ns := &corev1.Namespace{}
+			err := r.Get(ctx, types.NamespacedName{Name: tn.Name}, ns)
+			switch {
+			case apierrors.IsNotFound(err):
+			case err != nil:
+				return ctrl.Result{}, err
+			case managedBy(ns, tn) && ns.DeletionTimestamp.IsZero():
+				// Preconditions pin the exact object whose labels were checked.
+				uid, rv := ns.UID, ns.ResourceVersion
+				if err := r.Delete(ctx, ns, client.Preconditions{UID: &uid, ResourceVersion: &rv}); client.IgnoreNotFound(err) != nil {
+					return ctrl.Result{}, err
+				}
+				logf.FromContext(ctx).Info("deleted managed namespace")
 			}
-			logf.FromContext(ctx).Info("deleted managed namespace")
+		}
+		controllerutil.RemoveFinalizer(tn, FinalizerName)
+		if err := r.Update(ctx, tn); err != nil {
+			return ctrl.Result{}, err
 		}
 	}
-	controllerutil.RemoveFinalizer(tn, FinalizerName)
-	return r.Update(ctx, tn)
+	if controllerutil.ContainsFinalizer(tn, VaultFinalizerName) {
+		return r.finalizeVault(ctx, tn)
+	}
+	return ctrl.Result{}, nil
 }
 
 func (r *TeamNamespaceReconciler) setStatus(ctx context.Context, tn *idpv1alpha1.TeamNamespace, phase idpv1alpha1.Phase,
-	cond metav1.ConditionStatus, reason, msg, namespace string) error {
+	cond metav1.ConditionStatus, reason, msg, namespace string, extra ...metav1.Condition) error {
 	before := tn.Status.DeepCopy()
 	tn.Status.Phase = phase
 	tn.Status.ObservedGeneration = tn.Generation
@@ -265,6 +293,9 @@ func (r *TeamNamespaceReconciler) setStatus(ctx context.Context, tn *idpv1alpha1
 		Message:            msg,
 		ObservedGeneration: tn.Generation,
 	})
+	for _, c := range extra {
+		meta.SetStatusCondition(&tn.Status.Conditions, c)
+	}
 	if equality.Semantic.DeepEqual(before, &tn.Status) {
 		return nil
 	}
@@ -272,12 +303,17 @@ func (r *TeamNamespaceReconciler) setStatus(ctx context.Context, tn *idpv1alpha1
 }
 
 func (r *TeamNamespaceReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		For(&idpv1alpha1.TeamNamespace{}).
 		Owns(&corev1.ResourceQuota{}).
 		Owns(&corev1.LimitRange{}).
 		Owns(&networkingv1.NetworkPolicy{}).
-		Owns(&rbacv1.RoleBinding{}).
+		Owns(&rbacv1.RoleBinding{})
+	if r.Vault != nil {
+		// Watching VaultAuth needs the VSO CRD; only done when Vault is enabled.
+		b = b.Owns(&corev1.ServiceAccount{}).Owns(newVaultAuth(""))
+	}
+	return b.
 		// Namespace events map by name so a conflict clears once the foreign
 		// namespace is gone, and a managed namespace is re-converged on drift.
 		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(

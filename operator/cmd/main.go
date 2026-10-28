@@ -69,9 +69,22 @@ func main() {
 		os.Exit(1)
 	}
 
+	// VAULT_ENABLED=false (default) keeps the operator free of any Vault objects,
+	// finalizer or calls.
+	vaultOpts, err := controller.VaultOptionsFromEnv(os.Getenv)
+	if err != nil {
+		log.Error(err, "invalid Vault configuration")
+		os.Exit(1)
+	}
+	if vaultOpts != nil {
+		log.Info("Vault integration enabled", "addr", vaultOpts.Addr.String(), "purgeRole", vaultOpts.PurgeRole,
+			"authMount", vaultOpts.AuthMount, "kvMount", vaultOpts.KVMount, "giveUpAfter", vaultOpts.GiveUpAfter.String())
+	}
+
 	if err := (&controller.TeamNamespaceReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
+		Vault:  vaultOpts,
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to set up controller", "controller", "TeamNamespace")
 		os.Exit(1)
