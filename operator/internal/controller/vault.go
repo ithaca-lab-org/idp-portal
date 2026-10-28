@@ -29,6 +29,9 @@ const (
 	// templated policy allows reading kv/data/<own namespace>/* only.
 	VaultReaderRole = "ns-reader"
 	VaultAudience   = "vault"
+	// VaultReaderAuthMount is the auth mount VSO uses; fixed by the contract and
+	// pinned by the admission policy (VAULT_AUTH_MOUNT only affects the purge login).
+	VaultReaderAuthMount = "kubernetes"
 	// VaultConnectionRef is the shared VaultConnection, "<namespace>/<name>",
 	// in the namespace VSO runs in.
 	VaultConnectionRef = "vault-secrets-operator/idp-vault"
@@ -36,6 +39,7 @@ const (
 	ReasonVaultAccessReady  = "VaultAccessReady"
 	ReasonVaultAccessError  = "VaultAccessError"
 	ReasonVaultPurgeRetry   = "VaultPurgeRetrying"
+	ReasonVaultPurgePending = "PurgePending"
 	vaultTokenExpirationSec = 600
 )
 
@@ -145,10 +149,10 @@ func newVaultAuth(namespace string) *unstructured.Unstructured {
 
 // desiredVaultAuthSpec is the full spec the operator owns; VSO reads it to log
 // in to Vault as vault-reader with role ns-reader.
-func desiredVaultAuthSpec(authMount string) map[string]any {
+func desiredVaultAuthSpec() map[string]any {
 	return map[string]any{
 		"method":             "kubernetes",
-		"mount":              authMount,
+		"mount":              VaultReaderAuthMount,
 		"vaultConnectionRef": VaultConnectionRef,
 		"kubernetes": map[string]any{
 			"role":                   VaultReaderRole,

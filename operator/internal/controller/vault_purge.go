@@ -22,13 +22,14 @@ const (
 	vaultMaxBody        = 1 << 20
 	vaultMaxJWT         = 64 << 10
 	// A namespace holds kv/<ns>/<workload>/<secret>; depth and key caps bound a
-	// hostile or corrupt tree. Each pass deletes what it reaches, so a tree above
-	// the cap still shrinks on every retry.
-	vaultMaxDepth = 8
+	// hostile or corrupt tree. Subtrees past the depth cap are skipped (and
+	// reported), siblings are still purged. Each pass deletes what it reaches, so
+	// a tree above the key cap still shrinks on every retry.
+	vaultMaxDepth = 32
 	vaultMaxKeys  = 5000
 )
 
-var ErrInvalidNamespace = errors.New("namespace name is not a DNS-1123 label")
+var ErrInvalidNamespace = errors.New("namespace name is not a DNS-1123 label or is reserved for the platform")
 
 // httpPurger talks to the Vault HTTP API with net/http. Errors carry method,
 // path and status only: never tokens, the JWT or response bodies.
@@ -48,7 +49,9 @@ func newHTTPPurger(o *VaultOptions) *httpPurger {
 // Purge deletes kv/metadata/<namespace>/... recursively (all versions of every
 // key). A namespace with no data (404) is a success.
 func (p *httpPurger) Purge(ctx context.Context, namespace string) error {
-	if len(validation.IsDNS1123Label(namespace)) != 0 {
+	// Reserved names are platform namespaces (kv/vault/, kv/idp-system/...):
+	// never purge them, whatever the caller checked.
+	if len(validation.IsDNS1123Label(namespace)) != 0 || IsReserved(namespace) {
 		return ErrInvalidNamespace
 	}
 	ctx, cancel := context.WithTimeout(ctx, vaultPurgeTimeout)
@@ -60,8 +63,20 @@ func (p *httpPurger) Purge(ctx context.Context, namespace string) error {
 	}
 	defer p.revokeSelf(token)
 
-	keys := 0
-	return p.purgeDir(ctx, token, []string{namespace}, 1, &keys)
+	w := &purgeWalk{token: token}
+	if err := p.purgeDir(ctx, w, []string{namespace}, 1); err != nil {
+		return err
+	}
+	return errors.Join(w.skipped...)
+}
+
+// purgeWalk carries one pass: the token, the key count and the errors for
+// keys or subtrees that were skipped (the pass continues with their siblings
+// and fails at the end, so the caller retries).
+type purgeWalk struct {
+	token   string
+	keys    int
+	skipped []error
 }
 
 func (p *httpPurger) login(ctx context.Context) (string, error) {
@@ -114,16 +129,19 @@ func (p *httpPurger) revokeSelf(token string) {
 	_, _ = p.do(ctx, http.MethodPost, []string{"auth", "token", "revoke-self"}, nil, token, nil, nil)
 }
 
-func (p *httpPurger) purgeDir(ctx context.Context, token string, dir []string, depth int, keys *int) error {
+// purgeDir returns an error only for conditions that stop the whole pass
+// (Vault errors, key cap); bad keys and too-deep subtrees go to w.skipped.
+func (p *httpPurger) purgeDir(ctx context.Context, w *purgeWalk, dir []string, depth int) error {
 	if depth > vaultMaxDepth {
-		return fmt.Errorf("vault purge: %s is nested deeper than %d levels", strings.Join(dir, "/"), vaultMaxDepth)
+		w.skipped = append(w.skipped, fmt.Errorf("vault purge: skipped %s, nested deeper than %d levels", strings.Join(dir, "/"), vaultMaxDepth))
+		return nil
 	}
 	var out struct {
 		Data struct {
 			Keys []string `json:"keys"`
 		} `json:"data"`
 	}
-	status, err := p.do(ctx, http.MethodGet, p.metadataPath(dir), url.Values{"list": {"true"}}, token, nil, &out)
+	status, err := p.do(ctx, http.MethodGet, p.metadataPath(dir), url.Values{"list": {"true"}}, w.token, nil, &out)
 	if err != nil {
 		return err
 	}
@@ -137,20 +155,21 @@ func (p *httpPurger) purgeDir(ctx context.Context, token string, dir []string, d
 	for _, k := range out.Data.Keys {
 		name, isDir := strings.CutSuffix(k, "/")
 		if !validKeySegment(name) {
-			return fmt.Errorf("vault purge: refusing unexpected key %q under %s", k, strings.Join(dir, "/"))
+			w.skipped = append(w.skipped, fmt.Errorf("vault purge: skipped unexpected key %q under %s", k, strings.Join(dir, "/")))
+			continue
 		}
 		child := append(append([]string{}, dir...), name)
 		if isDir {
-			if err := p.purgeDir(ctx, token, child, depth+1, keys); err != nil {
+			if err := p.purgeDir(ctx, w, child, depth+1); err != nil {
 				return err
 			}
 			continue
 		}
-		if *keys >= vaultMaxKeys {
+		if w.keys >= vaultMaxKeys {
 			return fmt.Errorf("vault purge: more than %d keys under %s, continuing on the next pass", vaultMaxKeys, dir[0])
 		}
-		*keys++
-		status, err := p.do(ctx, http.MethodDelete, p.metadataPath(child), nil, token, nil, nil)
+		w.keys++
+		status, err := p.do(ctx, http.MethodDelete, p.metadataPath(child), nil, w.token, nil, nil)
 		if err != nil {
 			return err
 		}
@@ -161,18 +180,11 @@ func (p *httpPurger) purgeDir(ctx context.Context, token string, dir []string, d
 	return nil
 }
 
-// validKeySegment rejects anything that could change the path once joined:
-// empty, dot segments, separators, and control or escape characters.
+// validKeySegment rejects only what would change the path structure once
+// joined: empty, dot segments and a separator inside the segment. Everything
+// else (%, ?, #, backslash, control characters) is escaped by url.PathEscape.
 func validKeySegment(s string) bool {
-	if s == "" || s == "." || s == ".." || len(s) > 512 {
-		return false
-	}
-	for _, r := range s {
-		if r < 0x20 || r == 0x7f || r == '/' || r == '\\' || r == '%' || r == '?' || r == '#' {
-			return false
-		}
-	}
-	return true
+	return s != "" && s != "." && s != ".." && !strings.Contains(s, "/")
 }
 
 func (p *httpPurger) metadataPath(segs []string) []string {

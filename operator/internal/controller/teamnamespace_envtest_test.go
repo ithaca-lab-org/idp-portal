@@ -386,6 +386,8 @@ func TestCELValidation(t *testing.T) {
 		{"default", nil, "reserved"},
 		{"idp-system", nil, "reserved"},
 		{"echo", nil, "reserved"},
+		{"vault", nil, "reserved"},
+		{"vault-secrets-operator", nil, "reserved"},
 		{"bad-bu", func(tn *idpv1alpha1.TeamNamespace) { tn.Spec.BusinessUnit = "Payments_Team" }, "businessUnit"},
 		{"bad-size", func(tn *idpv1alpha1.TeamNamespace) { tn.Spec.Size = "xl" }, "size"},
 	}

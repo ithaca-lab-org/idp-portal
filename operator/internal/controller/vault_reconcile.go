@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -26,7 +29,7 @@ func (r *TeamNamespaceReconciler) ensureVaultAccess(ctx context.Context, tn *idp
 		return fmt.Errorf("serviceaccount %s: %w", VaultReaderServiceAccount, err)
 	}
 	va := newVaultAuth(tn.Name)
-	want := desiredVaultAuthSpec(r.Vault.AuthMount)
+	want := desiredVaultAuthSpec()
 	if err := r.ensureChild(ctx, tn, va, func() {
 		if cur, ok := va.Object["spec"].(map[string]any); !ok || !equality.Semantic.DeepEqual(cur, want) {
 			va.Object["spec"] = want
@@ -35,6 +38,35 @@ func (r *TeamNamespaceReconciler) ensureVaultAccess(ctx context.Context, tn *idp
 		return fmt.Errorf("vaultauth %s: %w", VaultAuthName, err)
 	}
 	return nil
+}
+
+// initialPurge removes leftover KV data under kv/<ns>/ (for example from an
+// earlier namespace of the same name whose purge gave up) before any access
+// object exists. It runs once per TeamNamespace: success is recorded in
+// status.vaultPurgedAt before the access objects are created, so later
+// reconciles (or a tenant deleting its VaultAuth) never purge live data.
+// It reports done=false when the caller must stop and requeue.
+func (r *TeamNamespaceReconciler) initialPurge(ctx context.Context, tn *idpv1alpha1.TeamNamespace) (ctrl.Result, bool, error) {
+	if tn.Status.VaultPurgedAt != nil {
+		return ctrl.Result{}, true, nil
+	}
+	log := logf.FromContext(ctx)
+	if err := r.Vault.purger().Purge(ctx, tn.Name); err != nil {
+		log.Info("Vault purge before granting access failed, will retry", "error", err.Error())
+		serr := r.setStatus(ctx, tn, idpv1alpha1.PhaseReady, metav1.ConditionTrue, ReasonReconciled,
+			"namespace and guardrails are in place", tn.Name,
+			vaultCondition(metav1.ConditionFalse, ReasonVaultPurgePending,
+				fmt.Sprintf("purging leftover kv/%s/ before granting access failed, retrying: %v", tn.Name, err), tn))
+		elapsed := r.Vault.now().Sub(tn.CreationTimestamp.Time)
+		return ctrl.Result{RequeueAfter: purgeBackoff(elapsed, 24*time.Hour)}, false, serr
+	}
+	now := metav1.NewTime(r.Vault.now())
+	tn.Status.VaultPurgedAt = &now
+	if err := r.Status().Update(ctx, tn); err != nil {
+		return ctrl.Result{}, false, err
+	}
+	log.Info("purged leftover Vault KV data before granting access")
+	return ctrl.Result{}, true, nil
 }
 
 // finalizeVault purges kv/<ns>/ and then drops VaultFinalizerName. While Vault
@@ -49,6 +81,15 @@ func (r *TeamNamespaceReconciler) finalizeVault(ctx context.Context, tn *idpv1al
 	case IsReserved(tn.Name):
 		log.Info("reserved name; not purging Vault")
 	default:
+		// The KV prefix belongs to whoever holds the namespace now: skip the purge
+		// when a namespace of that name exists and is not managed by this resource.
+		ns := &corev1.Namespace{}
+		if err := r.Get(ctx, types.NamespacedName{Name: tn.Name}, ns); err == nil && !managedBy(ns, tn) {
+			log.Info("namespace is not managed by this TeamNamespace; not purging Vault")
+			break
+		} else if err != nil && !apierrors.IsNotFound(err) {
+			return ctrl.Result{}, err
+		}
 		err := r.Vault.purger().Purge(ctx, tn.Name)
 		if errors.Is(err, ErrInvalidNamespace) {
 			log.Error(err, "not purging Vault for an invalid namespace name")

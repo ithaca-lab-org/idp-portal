@@ -157,8 +157,113 @@ func TestVaultAccessObjectsAreCreated(t *testing.T) {
 		t.Errorf("VaultAuth role drift not reverted: %q", role)
 	}
 
-	if calls, _ := fv.snapshot(); len(calls) != 0 {
-		t.Errorf("creating access objects must not call Vault: %v", calls)
+	// Only the one-time purge before the first grant talks to Vault.
+	calls, _ := fv.snapshot()
+	want := []string{"POST /v1/auth/kubernetes/login", "GET /v1/kv/metadata/" + name + "?list=true", "POST /v1/auth/token/revoke-self"}
+	if !slices.Equal(calls, want) {
+		t.Errorf("Vault calls = %v, want only the initial purge %v", calls, want)
+	}
+	if getTN(t, name).Status.VaultPurgedAt == nil {
+		t.Error("status.vaultPurgedAt not set")
+	}
+}
+
+// Access is granted only after leftover data under kv/<ns>/ is purged, and the
+// purge never runs again once access exists.
+func TestVaultAccessWaitsForPurge(t *testing.T) {
+	requireEnvtest(t)
+	name := "team-gate"
+	fv := newFakeVault(t, name+"/old/secret", "team-other/keep")
+	o := fv.options(t)
+	logs := &syncBuffer{}
+	fv.mu.Lock()
+	fv.failStatus = http.StatusServiceUnavailable
+	fv.mu.Unlock()
+	if err := k8s.Create(ctx, newTN(name)); err != nil {
+		t.Fatal(err)
+	}
+	if res := reconcileVault(t, k8s, o, name, logs); res.RequeueAfter < 10*time.Second {
+		t.Errorf("want a backoff requeue while Vault is down, got %+v", res)
+	}
+	tn := getTN(t, name)
+	assertStatus(t, tn, idpv1alpha1.PhaseReady, ReasonReconciled)
+	c := meta.FindStatusCondition(tn.Status.Conditions, idpv1alpha1.ConditionVaultReady)
+	if c == nil || c.Status != metav1.ConditionFalse || c.Reason != ReasonVaultPurgePending {
+		t.Fatalf("VaultReady = %+v", c)
+	}
+	noSecrets(t, "condition message", c.Message)
+	if tn.Status.VaultPurgedAt != nil {
+		t.Error("vaultPurgedAt set although the purge failed")
+	}
+	if err := k8s.Get(ctx, types.NamespacedName{Namespace: name, Name: VaultReaderServiceAccount}, &corev1.ServiceAccount{}); !apierrors.IsNotFound(err) {
+		t.Errorf("ServiceAccount created before the purge: %v", err)
+	}
+	if err := k8s.Get(ctx, types.NamespacedName{Namespace: name, Name: VaultAuthName}, newVaultAuth("")); !apierrors.IsNotFound(err) {
+		t.Errorf("VaultAuth created before the purge: %v", err)
+	}
+
+	fv.mu.Lock()
+	fv.failStatus = 0
+	fv.mu.Unlock()
+	reconcileVault(t, k8s, o, name, logs)
+	if _, remaining := fv.snapshot(); !slices.Equal(remaining, []string{"team-other/keep"}) {
+		t.Errorf("leftover data not purged: %v", remaining)
+	}
+	get(t, &corev1.ServiceAccount{}, name, VaultReaderServiceAccount)
+	getVaultAuth(t, name)
+	tn = getTN(t, name)
+	if c := meta.FindStatusCondition(tn.Status.Conditions, idpv1alpha1.ConditionVaultReady); c == nil || c.Status != metav1.ConditionTrue {
+		t.Errorf("VaultReady = %+v", c)
+	}
+
+	// The tenant writes a secret and deletes its VaultAuth: it is recreated and
+	// the live secret is not purged.
+	fv.mu.Lock()
+	fv.data[name+"/app/live"] = true
+	before := len(fv.calls)
+	fv.mu.Unlock()
+	if err := k8s.Delete(ctx, getVaultAuth(t, name)); err != nil {
+		t.Fatal(err)
+	}
+	reconcileVault(t, k8s, o, name, logs)
+	getVaultAuth(t, name)
+	calls, remaining := fv.snapshot()
+	if len(calls) != before || !slices.Contains(remaining, name+"/app/live") {
+		t.Errorf("live data touched after access existed: calls=%v remaining=%v", calls[before:], remaining)
+	}
+	noSecrets(t, "logs", logs.String())
+}
+
+// A namespace that is no longer managed by the TeamNamespace keeps its KV data.
+func TestVaultPurgeSkipsUnmanagedNamespace(t *testing.T) {
+	requireEnvtest(t)
+	name := "team-vault-unlabelled"
+	fv := newFakeVault(t)
+	o := fv.options(t)
+	if err := k8s.Create(ctx, newTN(name)); err != nil {
+		t.Fatal(err)
+	}
+	reconcileVault(t, k8s, o, name, &syncBuffer{})
+	fv.mu.Lock()
+	fv.data[name+"/app/db"] = true
+	before := len(fv.calls)
+	fv.mu.Unlock()
+
+	ns := get(t, &corev1.Namespace{}, "", name)
+	delete(ns.Labels, LabelManagedBy)
+	if err := k8s.Update(ctx, ns); err != nil {
+		t.Fatal(err)
+	}
+	if err := k8s.Delete(ctx, getTN(t, name)); err != nil {
+		t.Fatal(err)
+	}
+	reconcileVault(t, k8s, o, name, &syncBuffer{})
+	if err := k8s.Get(ctx, types.NamespacedName{Name: name}, &idpv1alpha1.TeamNamespace{}); !apierrors.IsNotFound(err) {
+		t.Errorf("TeamNamespace still present: %v", err)
+	}
+	calls, remaining := fv.snapshot()
+	if len(calls) != before || len(remaining) != 1 {
+		t.Errorf("unmanaged namespace was purged: calls=%v remaining=%v", calls[before:], remaining)
 	}
 }
 

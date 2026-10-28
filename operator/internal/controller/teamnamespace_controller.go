@@ -114,6 +114,10 @@ func (r *TeamNamespaceReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 	var extra []metav1.Condition
 	if r.Vault != nil {
+		// Nothing that grants Vault access exists until leftover data is purged.
+		if res, done, err := r.initialPurge(ctx, tn); !done {
+			return res, err
+		}
 		if err := r.ensureVaultAccess(ctx, tn); err != nil {
 			_ = r.setStatus(ctx, tn, idpv1alpha1.PhasePending, metav1.ConditionFalse, ReasonReconcileError, err.Error(), tn.Status.Namespace,
 				vaultCondition(metav1.ConditionFalse, ReasonVaultAccessError, err.Error(), tn))

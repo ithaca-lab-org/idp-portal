@@ -169,6 +169,13 @@ spec:
                 type: integer
               phase:
                 type: string
+              vaultPurgedAt:
+                description: |-
+                  vaultPurgedAt is when the operator purged leftover Vault KV data under
+                  kv/<name>/ before creating the Vault access objects (VAULT_ENABLED only).
+                  It is set once per TeamNamespace; later reconciles never purge again.
+                format: date-time
+                type: string
             type: object
         required:
         - spec
@@ -180,8 +187,8 @@ spec:
           rule: self.metadata.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
         - message: name is reserved for the platform
           rule: '!(self.metadata.name in [''default'', ''argocd'', ''cert-manager'',
-            ''tailscale'', ''identity'', ''idp-system'', ''echo'']) && ![''kube-'',
-            ''istio-'', ''gke-''].exists(p, self.metadata.name.startsWith(p))'
+            ''tailscale'', ''identity'', ''idp-system'', ''echo'', ''vault'']) &&
+            ![''kube-'', ''istio-'', ''gke-'', ''vault-''].exists(p, self.metadata.name.startsWith(p))'
     served: true
     storage: true
     subresources:

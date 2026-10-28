@@ -265,7 +265,7 @@ func TestPolicyDeniesOperatorOutsideManagedNamespaces(t *testing.T) {
 			LabelManagedBy: ManagedByValue, LabelTeamNamespace: "team-y", "pod-security.kubernetes.io/enforce": "baseline",
 		}}}
 		wantPolicyDenial(t, "create with mismatched team label", op.Create(ctx, wrong, dry))
-		reserved := []string{"kube-evil", "istio-evil", "gke-evil"}
+		reserved := []string{"kube-evil", "istio-evil", "gke-evil", "vault-evil"}
 		for n := range reservedNames {
 			reserved = append(reserved, n)
 		}
@@ -415,7 +415,7 @@ func (f purgerFunc) Purge(ctx context.Context, ns string) error { return f(ctx, 
 func vaultAuthFor(ns, name string) *unstructured.Unstructured {
 	va := newVaultAuth(ns)
 	va.SetName(name)
-	va.Object["spec"] = desiredVaultAuthSpec(defaultVaultAuthMount)
+	va.Object["spec"] = desiredVaultAuthSpec()
 	return va
 }
 
@@ -476,6 +476,36 @@ func TestOperatorVaultAccessUnderRBACAndPolicy(t *testing.T) {
 			"jwt method":     func(u *unstructured.Unstructured) { _ = unstructured.SetNestedField(u.Object, "jwt", "spec", "method") },
 			"no kubernetes":  func(u *unstructured.Unstructured) { unstructured.RemoveNestedField(u.Object, "spec", "kubernetes") },
 			"no spec at all": func(u *unstructured.Unstructured) { delete(u.Object, "spec") },
+			"other connection": func(u *unstructured.Unstructured) {
+				_ = unstructured.SetNestedField(u.Object, "evil/conn", "spec", "vaultConnectionRef")
+			},
+			"other mount": func(u *unstructured.Unstructured) {
+				_ = unstructured.SetNestedField(u.Object, "other", "spec", "mount")
+			},
+			"vault namespace": func(u *unstructured.Unstructured) {
+				_ = unstructured.SetNestedField(u.Object, "admin", "spec", "namespace")
+			},
+			"other audience": func(u *unstructured.Unstructured) {
+				_ = unstructured.SetNestedStringSlice(u.Object, []string{"vault", "https://kubernetes.default.svc"}, "spec", "kubernetes", "audiences")
+			},
+			"long tokens": func(u *unstructured.Unstructured) {
+				_ = unstructured.SetNestedField(u.Object, int64(86400), "spec", "kubernetes", "tokenExpirationSeconds")
+			},
+			"headers": func(u *unstructured.Unstructured) {
+				_ = unstructured.SetNestedStringMap(u.Object, map[string]string{"X-Vault-Namespace": "root"}, "spec", "headers")
+			},
+			"params": func(u *unstructured.Unstructured) {
+				_ = unstructured.SetNestedStringMap(u.Object, map[string]string{"role": "x"}, "spec", "params")
+			},
+			"allowedNamespaces": func(u *unstructured.Unstructured) {
+				_ = unstructured.SetNestedStringSlice(u.Object, []string{"*"}, "spec", "allowedNamespaces")
+			},
+			"vaultAuthGlobalRef": func(u *unstructured.Unstructured) {
+				_ = unstructured.SetNestedField(u.Object, map[string]any{"name": "g"}, "spec", "vaultAuthGlobalRef")
+			},
+			"jwt block": func(u *unstructured.Unstructured) {
+				_ = unstructured.SetNestedField(u.Object, map[string]any{"role": "x"}, "spec", "jwt")
+			},
 		} {
 			va := getVaultAuth(t, managed)
 			mutate(va)
@@ -491,7 +521,8 @@ func TestOperatorVaultAccessUnderRBACAndPolicy(t *testing.T) {
 	if err := k8s.Get(ctx, types.NamespacedName{Name: managed}, &idpv1alpha1.TeamNamespace{}); !apierrors.IsNotFound(err) {
 		t.Errorf("TeamNamespace still present: %v", err)
 	}
-	if !slices.Equal(purged, []string{managed}) {
+	// Once before access was granted, once on deletion.
+	if !slices.Equal(purged, []string{managed, managed}) {
 		t.Errorf("purged = %v", purged)
 	}
 }

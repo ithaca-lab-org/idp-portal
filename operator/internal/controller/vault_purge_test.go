@@ -36,8 +36,9 @@ type fakeVault struct {
 	// failStatus, when set, answers every request with that status and a body
 	// that echoes the token, to prove bodies never reach errors or logs.
 	failStatus int
-	// listOverride returns these keys for every list (hostile-key tests).
-	listOverride []string
+	// listOverride returns these keys when listing the given directory
+	// (hostile-key tests; such keys cannot exist in data).
+	listOverride map[string][]string
 }
 
 func newFakeVault(t *testing.T, keys ...string) *fakeVault {
@@ -85,9 +86,10 @@ func (fv *fakeVault) serve(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, meta) && r.URL.Query().Get("list") == "true":
-		keys := fv.listOverride
-		if keys == nil {
-			keys = fv.children(strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, meta), "/"))
+		dir := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, meta), "/")
+		keys, ok := fv.listOverride[dir]
+		if !ok {
+			keys = fv.children(dir)
 		}
 		if len(keys) == 0 {
 			w.WriteHeader(http.StatusNotFound)
@@ -212,10 +214,12 @@ func TestPurgeTreatsMissingNamespaceAsSuccess(t *testing.T) {
 }
 
 func TestPurgeRejectsHostileNamespaceNames(t *testing.T) {
-	fv := newFakeVault(t, "sys/x")
+	fv := newFakeVault(t, "sys/x", "vault/x", "idp-system/x")
 	p := newHTTPPurger(fv.options(t))
 	for _, ns := range []string{"", "..", "../sys", "a/b", "team-a/../../sys", "%2e%2e", "Team", "a.b",
-		"team?list=true", "-lead", strings.Repeat("a", 64), "a\x00b"} {
+		"team?list=true", "-lead", strings.Repeat("a", 64), "a\x00b",
+		// reserved platform namespaces: the purge role could delete under them
+		"vault", "vault-demo", "vault-secrets-operator", "idp-system", "kube-system", "default"} {
 		if err := p.Purge(context.Background(), ns); !errors.Is(err, ErrInvalidNamespace) {
 			t.Errorf("Purge(%q) = %v, want ErrInvalidNamespace", ns, err)
 		}
@@ -225,28 +229,61 @@ func TestPurgeRejectsHostileNamespaceNames(t *testing.T) {
 	}
 }
 
-func TestPurgeRefusesHostileKeysFromVault(t *testing.T) {
-	for _, key := range []string{"../", "..", "a/b", "./", "x%2f..", "q?x", ""} {
-		fv := newFakeVault(t)
-		fv.listOverride = []string{key}
-		err := newHTTPPurger(fv.options(t)).Purge(context.Background(), "team-a")
-		if err == nil || !strings.Contains(err.Error(), "refusing unexpected key") {
-			t.Errorf("key %q: err = %v", key, err)
-		}
-		calls, _ := fv.snapshot()
-		for _, c := range calls {
-			if strings.HasPrefix(c, "DELETE") {
-				t.Errorf("key %q: issued %s", key, c)
-			}
+func TestPurgeSkipsBadKeysAndContinuesWithSiblings(t *testing.T) {
+	fv := newFakeVault(t, "team-a/good", "team-a/sub/x", "team-a/zz")
+	fv.listOverride = map[string][]string{"team-a": {"../", "..", "", "./", ".", "a/b", "a/b/", "good", "sub/", "zz"}}
+	err := newHTTPPurger(fv.options(t)).Purge(context.Background(), "team-a")
+	if err == nil || !strings.Contains(err.Error(), "skipped unexpected key") {
+		t.Fatalf("want an aggregate error for the skipped keys, got %v", err)
+	}
+	if n := strings.Count(err.Error(), "skipped unexpected key"); n != 7 {
+		t.Errorf("skipped %d keys, want 7: %v", n, err)
+	}
+	calls, remaining := fv.snapshot()
+	if len(remaining) != 0 {
+		t.Errorf("siblings of bad keys not purged: %v", remaining)
+	}
+	wantOnlyNamespaceCalls(t, "team-a", calls)
+	for _, c := range calls {
+		if strings.HasPrefix(c, "DELETE") && !slices.Contains([]string{
+			"DELETE /v1/kv/metadata/team-a/good", "DELETE /v1/kv/metadata/team-a/sub/x", "DELETE /v1/kv/metadata/team-a/zz",
+		}, c) {
+			t.Errorf("unexpected %s", c)
 		}
 	}
 }
 
-func TestPurgeBoundsDepth(t *testing.T) {
-	fv := newFakeVault(t, "team-a/"+strings.Repeat("d/", vaultMaxDepth+2)+"leaf")
+func TestPurgeEscapesOddKeys(t *testing.T) {
+	odd := []string{"q?x", "p%2e%2e", "back\\slash", "ctl\x01", "hash#x", "sp ace", "..x"}
+	keys := []string{}
+	for _, k := range odd {
+		keys = append(keys, "team-a/"+k)
+	}
+	fv := newFakeVault(t, keys...)
+	if err := newHTTPPurger(fv.options(t)).Purge(context.Background(), "team-a"); err != nil {
+		t.Fatal(err)
+	}
+	calls, remaining := fv.snapshot()
+	if len(remaining) != 0 {
+		t.Errorf("odd keys not purged: %v", remaining)
+	}
+	wantOnlyNamespaceCalls(t, "team-a", calls)
+	for _, want := range []string{"/team-a/q%3Fx", "/team-a/p%252e%252e", "/team-a/back%5Cslash", "/team-a/ctl%01", "/team-a/hash%23x"} {
+		if !slices.Contains(calls, "DELETE /v1/kv/metadata"+want) {
+			t.Errorf("missing escaped DELETE %s in %v", want, calls)
+		}
+	}
+}
+
+func TestPurgeBoundsDepthButContinues(t *testing.T) {
+	fv := newFakeVault(t, "team-a/"+strings.Repeat("d/", vaultMaxDepth+2)+"leaf", "team-a/shallow", "team-a/z/k")
 	err := newHTTPPurger(fv.options(t)).Purge(context.Background(), "team-a")
 	if err == nil || !strings.Contains(err.Error(), "deeper than") {
 		t.Fatalf("err = %v", err)
+	}
+	_, remaining := fv.snapshot()
+	if len(remaining) != 1 || !strings.HasSuffix(remaining[0], "/leaf") {
+		t.Errorf("remaining = %v, want only the too-deep key", remaining)
 	}
 }
 
