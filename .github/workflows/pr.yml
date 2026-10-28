@@ -18,12 +18,10 @@ jobs:
       contents: read
     services:
       mongo:
-        image: mongo:8.0.34@sha256:8e7d23aa641b0ec6c86418866d5d18d74d5abf89061bc5db7bc4b80929021ef6
-        # SERVER-121912: MongoDB 8.x aborts at start on Linux 6.19+ runners (tcmalloc and glibc both
-        # register the kernel rseq area). This tunable stops glibc registering it. Remove once a fixed
-        # MongoDB image is out.
-        env:
-          GLIBC_TUNABLES: glibc.pthread.rseq=0
+        # MongoDB 8.x refuses to start on Linux 6.19+ runners (SERVER-121912, tcmalloc and the kernel's
+        # rseq area; the startup check cannot be bypassed). 7.0 is not affected. Production runs 8.0
+        # (idp-gitops); move this back to 8.x once MongoDB ships a fixed image.
+        image: mongo:7.0@sha256:8bb4442761a63a8dda452744082cdac9644b429807eb977b42324a63cef59ca4
         ports:
           - 27017:27017
     steps:
