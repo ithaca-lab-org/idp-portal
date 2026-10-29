@@ -67,9 +67,6 @@ spec:
         namespaceObject.metadata.labels[?'idp.ithaca-idp.com/team-namespace'] == optional.of(namespaceObject.metadata.name)
     - name: isVSS
       expression: "request.resource.resource == 'vaultstaticsecrets'"
-    # The object being written, or for DELETE the stored one.
-    - name: vss
-      expression: "request.operation == 'DELETE' ? oldObject : object"
   validations:
     - expression: >-
         !variables.isNamespace ||
@@ -146,17 +143,21 @@ spec:
       message: "idp-operator VaultAuths must match the operator's fixed spec (kubernetes auth as vault-reader, role ns-reader, connection vault-secrets-operator/idp-vault, audience vault, 600s tokens, no other fields)"
     # VaultStaticSecret names follow the ManagedSecrets, so they cannot be listed
     # here. Instead the object must be controlled by a ManagedSecret of the same
-    # name (one ownerReference, controller=true). The policy cannot look the
-    # ManagedSecret up; a made-up owner is caught by the garbage collector, which
+    # name (one ownerReference, controller=true), and on UPDATE the stored object
+    # must already be, so a VaultStaticSecret made by hand or by another
+    # controller can never be adopted (the controller also leaves those alone and
+    # reports NameConflict). The policy cannot look the ManagedSecret up: an
+    # ownerReference with a made-up UID passes here, but the garbage collector
     # deletes dependents whose owner UID does not exist.
     - expression: >-
         !variables.isVSS ||
-        (has(variables.vss.metadata.ownerReferences) && size(variables.vss.metadata.ownerReferences) == 1 &&
-         variables.vss.metadata.ownerReferences.all(o,
-           o.apiVersion == 'idp.ithaca-idp.com/v1alpha1' && o.kind == 'ManagedSecret' &&
-           o.name == variables.vss.metadata.name && o.?controller.orValue(false) == true))
+        (request.operation == 'DELETE' ? [oldObject] : request.operation == 'UPDATE' ? [object, oldObject] : [object]).all(v,
+          has(v.metadata.ownerReferences) && size(v.metadata.ownerReferences) == 1 &&
+          v.metadata.ownerReferences.all(o,
+            o.apiVersion == 'idp.ithaca-idp.com/v1alpha1' && o.kind == 'ManagedSecret' &&
+            o.name == v.metadata.name && o.?controller.orValue(false) == true))
       reason: Forbidden
-      messageExpression: "'idp-operator VaultStaticSecrets must be controlled by the ManagedSecret of the same name (' + request.name + ')'"
+      messageExpression: "'idp-operator VaultStaticSecrets must be (and, on update, already be) controlled by the ManagedSecret of the same name (' + request.name + ')'"
     # The spec is exactly desiredVaultStaticSecretSpec: read kv/<namespace>/<name>
     # with the namespace's own vault-reader VaultAuth into a Secret of the same
     # name that VSO creates and never takes over (overwrite false). None of the

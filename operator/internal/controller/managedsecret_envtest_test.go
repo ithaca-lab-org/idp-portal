@@ -65,7 +65,7 @@ func getVSS(ns, name string) (*unstructured.Unstructured, error) {
 	return u, k8s.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, u)
 }
 
-func syncedCondition(t *testing.T, ns, name string) *metav1.Condition {
+func getSynced(t *testing.T, ns, name string) *metav1.Condition {
 	t.Helper()
 	return meta.FindStatusCondition(get(t, &idpv1alpha1.ManagedSecret{}, ns, name).Status.Conditions, idpv1alpha1.ConditionSynced)
 }
@@ -114,11 +114,14 @@ func TestManagedSecretCreatesPinnedVaultStaticSecret(t *testing.T) {
 	if l := vss.GetLabels(); l[LabelManagedBy] != ManagedByValue || l[LabelManagedSecret] != name {
 		t.Errorf("labels = %v", l)
 	}
-	if c := syncedCondition(t, ns, name); c == nil || c.Status != metav1.ConditionTrue || c.Reason != ReasonSynced {
+	if c := getSynced(t, ns, name); c == nil || c.Status != metav1.ConditionTrue || c.Reason != ReasonSynced {
 		t.Errorf("Synced = %+v", c)
 	}
 	if ms.Status.ObservedGeneration != ms.Generation {
 		t.Errorf("observedGeneration = %d, want %d", ms.Status.ObservedGeneration, ms.Generation)
+	}
+	if c := getCond(t, ns, name, idpv1alpha1.ConditionDelivered); c == nil || c.Status != metav1.ConditionUnknown || c.Reason != ReasonDeliveryPending {
+		t.Errorf("Delivered before VSO reported = %+v", c)
 	}
 
 	// A second pass changes nothing.
@@ -140,6 +143,133 @@ func TestManagedSecretCreatesPinnedVaultStaticSecret(t *testing.T) {
 	vss, _ = getVSS(ns, name)
 	if got := vss.Object["spec"]; !equality.Semantic.DeepEqual(got, wantSpec) {
 		t.Errorf("drift not reverted: %#v", got)
+	}
+
+	// Delivered follows VSO's SecretSynced condition for the current generation.
+	for _, tc := range []struct {
+		status, reason string
+		gen            int64
+		want           metav1.ConditionStatus
+	}{
+		{"True", ReasonDelivered, vss.GetGeneration(), metav1.ConditionTrue},
+		{"False", ReasonDeliveryFailed, vss.GetGeneration(), metav1.ConditionFalse},
+		{"True", ReasonDeliveryPending, vss.GetGeneration() - 1, metav1.ConditionUnknown},
+	} {
+		setVSOStatus(t, ns, name, tc.status, tc.gen)
+		reconcileMS(t, k8s, testVaultOptions(), ns, name)
+		if c := getCond(t, ns, name, idpv1alpha1.ConditionDelivered); c == nil || c.Status != tc.want || c.Reason != tc.reason {
+			t.Errorf("VSO SecretSynced=%s gen %d: Delivered = %+v", tc.status, tc.gen, c)
+		}
+	}
+}
+
+// setVSOStatus writes the status VSO 1.6.2 would write.
+func setVSOStatus(t *testing.T, ns, name, status string, gen int64) {
+	t.Helper()
+	vss, err := getVSS(ns, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vss.Object["status"] = map[string]any{"conditions": []any{
+		map[string]any{"type": "SecretSynced", "status": status, "reason": "Synced", "message": "Secret synced, horizon=1m",
+			"observedGeneration": gen, "lastTransitionTime": "2026-01-01T00:00:00Z"},
+		map[string]any{"type": "Healthy", "status": status, "reason": "Healthy", "message": "x",
+			"observedGeneration": gen, "lastTransitionTime": "2026-01-01T00:00:00Z"},
+	}}
+	if err := k8s.Status().Update(ctx, vss); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func getCond(t *testing.T, ns, name, typ string) *metav1.Condition {
+	t.Helper()
+	return meta.FindStatusCondition(get(t, &idpv1alpha1.ManagedSecret{}, ns, name).Status.Conditions, typ)
+}
+
+// A VaultStaticSecret of the same name that the ManagedSecret does not own
+// (made by hand here) is never adopted or changed.
+func TestManagedSecretNameConflict(t *testing.T) {
+	requireEnvtest(t)
+	ns, name := "team-ms-conflict", "stripe"
+	vaultNamespace(t, k8s, ns)
+	hand := vssFor(ns, name)
+	hand.SetOwnerReferences(nil)
+	_ = unstructured.SetNestedField(hand.Object, "platform/stripe", "spec", "path")
+	if err := k8s.Create(ctx, hand); err != nil {
+		t.Fatal(err)
+	}
+	if err := k8s.Create(ctx, newMS(ns, name)); err != nil {
+		t.Fatal(err)
+	}
+	res := reconcileMS(t, k8s, testVaultOptions(), ns, name)
+	if res.RequeueAfter < time.Minute {
+		t.Errorf("RequeueAfter = %v, want a slow requeue", res.RequeueAfter)
+	}
+	if c := getSynced(t, ns, name); c == nil || c.Status != metav1.ConditionFalse || c.Reason != ReasonNameConflict {
+		t.Errorf("Synced = %+v", c)
+	}
+	if c := getCond(t, ns, name, idpv1alpha1.ConditionDelivered); c == nil || c.Status != metav1.ConditionUnknown {
+		t.Errorf("Delivered = %+v", c)
+	}
+	got, _ := getVSS(ns, name)
+	if got.GetResourceVersion() != hand.GetResourceVersion() || len(got.GetOwnerReferences()) != 0 {
+		t.Errorf("hand-made VaultStaticSecret was modified: owners %+v", got.GetOwnerReferences())
+	}
+}
+
+// After a delete and re-create of a ManagedSecret, the old VaultStaticSecret
+// (still controlled by the old UID, or terminating behind VSO's finalizer) is
+// waited for with a requeue, not an error.
+func TestManagedSecretWaitsForPreviousVaultStaticSecret(t *testing.T) {
+	requireEnvtest(t)
+	ns := "team-ms-prev"
+	vaultNamespace(t, k8s, ns)
+
+	old := vssFor(ns, "stripe")
+	old.SetLabels(map[string]string{LabelManagedBy: ManagedByValue, LabelManagedSecret: "stripe"})
+	if err := k8s.Create(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := k8s.Create(ctx, newMS(ns, "stripe")); err != nil {
+		t.Fatal(err)
+	}
+	r := &ManagedSecretReconciler{Client: k8s, Scheme: testScheme, Vault: testVaultOptions()}
+	res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "stripe"}})
+	if err != nil || res.RequeueAfter == 0 || res.RequeueAfter > time.Minute {
+		t.Errorf("old owner: res=%+v err=%v, want a short requeue and no error", res, err)
+	}
+	if c := getSynced(t, ns, "stripe"); c == nil || c.Reason != ReasonPreviousTerminating {
+		t.Errorf("Synced = %+v", c)
+	}
+	if got, _ := getVSS(ns, "stripe"); got.GetResourceVersion() != old.GetResourceVersion() {
+		t.Error("old VaultStaticSecret was modified")
+	}
+
+	// Terminating (VSO's finalizer still on it), even if it is ours.
+	if err := k8s.Create(ctx, newMS(ns, "card")); err != nil {
+		t.Fatal(err)
+	}
+	reconcileMS(t, k8s, testVaultOptions(), ns, "card")
+	vss, _ := getVSS(ns, "card")
+	vss.SetFinalizers([]string{"vaultstaticsecret.secrets.hashicorp.com/finalizer"})
+	if err := k8s.Update(ctx, vss); err != nil {
+		t.Fatal(err)
+	}
+	if err := k8s.Delete(ctx, vss); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if v, err := getVSS(ns, "card"); err == nil {
+			v.SetFinalizers(nil)
+			_ = k8s.Update(ctx, v)
+		}
+	})
+	res, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "card"}})
+	if err != nil || res.RequeueAfter == 0 {
+		t.Errorf("terminating: res=%+v err=%v, want a requeue and no error", res, err)
+	}
+	if c := getSynced(t, ns, "card"); c == nil || c.Reason != ReasonPreviousTerminating {
+		t.Errorf("Synced = %+v", c)
 	}
 }
 
@@ -163,7 +293,7 @@ func TestManagedSecretIgnoredOutsideManagedNamespaces(t *testing.T) {
 		if _, err := getVSS(ns, "stripe"); !apierrors.IsNotFound(err) {
 			t.Errorf("%s: VaultStaticSecret created outside a managed namespace: %v", ns, err)
 		}
-		if c := syncedCondition(t, ns, "stripe"); c == nil || c.Status != metav1.ConditionFalse || c.Reason != ReasonNamespaceNotManaged {
+		if c := getSynced(t, ns, "stripe"); c == nil || c.Status != metav1.ConditionFalse || c.Reason != ReasonNamespaceNotManaged {
 			t.Errorf("%s: Synced = %+v", ns, c)
 		}
 	}
@@ -183,7 +313,7 @@ func TestManagedSecretWaitsForVaultAuth(t *testing.T) {
 	if _, err := getVSS(ns, "stripe"); !apierrors.IsNotFound(err) {
 		t.Errorf("VaultStaticSecret created without VaultAuth: %v", err)
 	}
-	if c := syncedCondition(t, ns, "stripe"); c == nil || c.Status != metav1.ConditionFalse || c.Reason != ReasonVaultAuthMissing {
+	if c := getSynced(t, ns, "stripe"); c == nil || c.Status != metav1.ConditionFalse || c.Reason != ReasonVaultAuthMissing {
 		t.Errorf("Synced = %+v", c)
 	}
 }
@@ -274,7 +404,7 @@ func TestOperatorManagedSecretUnderRBACAndPolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 	reconcileMS(t, op, testVaultOptions(), managed, name)
-	if c := syncedCondition(t, managed, name); c == nil || c.Status != metav1.ConditionTrue {
+	if c := getSynced(t, managed, name); c == nil || c.Status != metav1.ConditionTrue {
 		t.Fatalf("Synced = %+v", c)
 	}
 	plain := "plain-ns"
@@ -359,6 +489,22 @@ func TestOperatorManagedSecretUnderRBACAndPolicy(t *testing.T) {
 		mutate(vss)
 		wantPolicyDenial(t, "update VSS: "+what, op.Update(ctx, vss, dry))
 	}
+	// A hand-made VaultStaticSecret cannot be adopted, even with a valid result.
+	hand := vssFor(managed, "handmade")
+	hand.SetOwnerReferences(nil)
+	if err := k8s.Create(ctx, hand); err != nil {
+		t.Fatal(err)
+	}
+	// Adding the ownerReference is refused by OwnerReferencesPermissionEnforcement
+	// (no delete right) in envtest, and by the policy's oldObject check on
+	// clusters without that plugin; any other write is refused by the policy.
+	adopt, _ := getVSS(managed, "handmade")
+	adopt.SetOwnerReferences(vssFor(managed, "handmade").GetOwnerReferences())
+	wantForbidden(t, "adopt hand-made VSS", op.Update(ctx, adopt, dry))
+	touch, _ := getVSS(managed, "handmade")
+	touch.SetLabels(map[string]string{"x": "y"})
+	wantPolicyDenial(t, "update hand-made VSS", op.Update(ctx, touch, dry))
+
 	vss, _ := getVSS(managed, name)
 	wantForbidden(t, "delete VSS", op.Delete(ctx, vss, dry))
 	wantForbidden(t, "deletecollection VSS", op.DeleteAllOf(ctx, newVaultStaticSecret("", ""), client.InNamespace(managed), dry))

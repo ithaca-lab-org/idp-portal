@@ -36,8 +36,21 @@ const (
 	ReasonNamespaceNotManaged = "NamespaceNotManaged"
 	ReasonVaultAuthMissing    = "VaultAuthMissing"
 	ReasonSyncError           = "SyncError"
+	ReasonNameConflict        = "NameConflict"
+	ReasonPreviousTerminating = "PreviousTerminating"
+
+	ReasonDelivered       = "Delivered"
+	ReasonDeliveryFailed  = "DeliveryFailed"
+	ReasonDeliveryPending = "DeliveryPending"
+	ReasonNotSynced       = "NotSynced"
+
+	// vsoConditionSecretSynced is the VSO 1.6.2 condition type on
+	// VaultStaticSecret status (consts.TypeSecretSynced).
+	vsoConditionSecretSynced = "SecretSynced"
 
 	vaultAuthMissingRequeue = 15 * time.Second
+	previousRequeue         = 5 * time.Second
+	nameConflictRequeue     = 5 * time.Minute
 )
 
 var VaultStaticSecretGVK = schema.GroupVersionKind{Group: "secrets.hashicorp.com", Version: "v1beta1", Kind: "VaultStaticSecret"}
@@ -108,37 +121,127 @@ func (r *ManagedSecretReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 	if !managed {
 		log.Info("ignoring ManagedSecret outside an operator-managed namespace", "reason", why)
-		return ctrl.Result{}, r.setSynced(ctx, ms, metav1.ConditionFalse, ReasonNamespaceNotManaged, why)
+		return ctrl.Result{}, r.setNotSynced(ctx, ms, ReasonNamespaceNotManaged, why)
 	}
 
 	if err := r.Get(ctx, types.NamespacedName{Namespace: ms.Namespace, Name: VaultAuthName}, newVaultAuth("")); err != nil {
 		if !apierrors.IsNotFound(err) {
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{RequeueAfter: vaultAuthMissingRequeue}, r.setSynced(ctx, ms, metav1.ConditionFalse, ReasonVaultAuthMissing,
+		return ctrl.Result{RequeueAfter: vaultAuthMissingRequeue}, r.setNotSynced(ctx, ms, ReasonVaultAuthMissing,
 			fmt.Sprintf("VaultAuth %s does not exist yet in namespace %s", VaultAuthName, ms.Namespace))
 	}
 
-	vss := newVaultStaticSecret(ms.Namespace, ms.Name)
-	want := desiredVaultStaticSecretSpec(ms.Namespace, ms.Name)
-	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, vss, func() error {
-		labels := vss.GetLabels()
-		if labels == nil {
-			labels = map[string]string{}
+	vss := newVaultStaticSecret("", "")
+	err = r.Get(ctx, types.NamespacedName{Namespace: ms.Namespace, Name: ms.Name}, vss)
+	switch {
+	case apierrors.IsNotFound(err):
+		vss = newVaultStaticSecret(ms.Namespace, ms.Name)
+		if err := r.setVaultStaticSecret(ms, vss); err != nil {
+			return ctrl.Result{}, err
 		}
-		maps.Copy(labels, map[string]string{LabelManagedBy: ManagedByValue, LabelManagedSecret: ms.Name})
-		vss.SetLabels(labels)
-		if cur, ok := vss.Object["spec"].(map[string]any); !ok || !equality.Semantic.DeepEqual(cur, want) {
-			vss.Object["spec"] = want
+		if err := r.Create(ctx, vss); err != nil {
+			if apierrors.IsAlreadyExists(err) {
+				return ctrl.Result{RequeueAfter: time.Second}, nil
+			}
+			_ = r.setNotSynced(ctx, ms, ReasonSyncError, err.Error())
+			return ctrl.Result{}, fmt.Errorf("vaultstaticsecret %s: %w", ms.Name, err)
 		}
-		return controllerutil.SetControllerReference(ms, vss, r.Scheme)
-	})
-	if err != nil {
-		_ = r.setSynced(ctx, ms, metav1.ConditionFalse, ReasonSyncError, err.Error())
-		return ctrl.Result{}, fmt.Errorf("vaultstaticsecret %s: %w", ms.Name, err)
+	case err != nil:
+		return ctrl.Result{}, err
+	default:
+		if res, reason, msg := vssBlocked(ms, vss); reason != "" {
+			log.Info("not touching existing VaultStaticSecret", "reason", reason)
+			return res, r.setNotSynced(ctx, ms, reason, msg)
+		}
+		before := vss.DeepCopy()
+		if err := r.setVaultStaticSecret(ms, vss); err != nil {
+			return ctrl.Result{}, err
+		}
+		if !equality.Semantic.DeepEqual(before.Object, vss.Object) {
+			if err := r.Update(ctx, vss); err != nil {
+				_ = r.setNotSynced(ctx, ms, ReasonSyncError, err.Error())
+				return ctrl.Result{}, fmt.Errorf("vaultstaticsecret %s: %w", ms.Name, err)
+			}
+		}
 	}
-	return ctrl.Result{}, r.setSynced(ctx, ms, metav1.ConditionTrue, ReasonSynced,
-		fmt.Sprintf("VaultStaticSecret %s syncs kv/%s/%s into Secret %s", ms.Name, ms.Namespace, ms.Name, ms.Name))
+	return ctrl.Result{}, r.setConditions(ctx, ms,
+		syncedCondition(ms, metav1.ConditionTrue, ReasonSynced,
+			fmt.Sprintf("VaultStaticSecret %s for kv/%s/%s exists; see Delivered for the Secret", ms.Name, ms.Namespace, ms.Name)),
+		deliveredCondition(ms, vss))
+}
+
+// vssBlocked decides about an existing VaultStaticSecret with the
+// ManagedSecret's name. Only one controlled by this very ManagedSecret (same
+// UID) is updated. Anything else is left alone: one being deleted, or one
+// controlled by an earlier ManagedSecret of the same name (the garbage
+// collector removes it after a delete and re-create), is waited for; one made
+// by hand or by another controller is a name conflict and is never adopted
+// (the admission policy refuses that too).
+func vssBlocked(ms *idpv1alpha1.ManagedSecret, vss *unstructured.Unstructured) (ctrl.Result, string, string) {
+	ref := metav1.GetControllerOf(vss)
+	switch {
+	case !vss.GetDeletionTimestamp().IsZero():
+		return ctrl.Result{RequeueAfter: previousRequeue}, ReasonPreviousTerminating,
+			fmt.Sprintf("previous VaultStaticSecret %s is being deleted; waiting", ms.Name)
+	case ref != nil && ref.UID == ms.UID:
+		return ctrl.Result{}, "", ""
+	case ref != nil && ref.Kind == "ManagedSecret" && ref.Name == ms.Name &&
+		ref.APIVersion == idpv1alpha1.GroupVersion.String() && vss.GetLabels()[LabelManagedSecret] == ms.Name:
+		return ctrl.Result{RequeueAfter: previousRequeue}, ReasonPreviousTerminating,
+			fmt.Sprintf("VaultStaticSecret %s still belongs to a deleted ManagedSecret of the same name; waiting for garbage collection", ms.Name)
+	}
+	return ctrl.Result{RequeueAfter: nameConflictRequeue}, ReasonNameConflict,
+		fmt.Sprintf("a VaultStaticSecret named %s exists that this ManagedSecret does not own; it is left untouched", ms.Name)
+}
+
+// setVaultStaticSecret writes the operator's labels, spec and controller
+// reference into vss.
+func (r *ManagedSecretReconciler) setVaultStaticSecret(ms *idpv1alpha1.ManagedSecret, vss *unstructured.Unstructured) error {
+	labels := vss.GetLabels()
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	maps.Copy(labels, map[string]string{LabelManagedBy: ManagedByValue, LabelManagedSecret: ms.Name})
+	vss.SetLabels(labels)
+	if want := desiredVaultStaticSecretSpec(ms.Namespace, ms.Name); !equality.Semantic.DeepEqual(vss.Object["spec"], want) {
+		vss.Object["spec"] = want
+	}
+	return controllerutil.SetControllerReference(ms, vss, r.Scheme)
+}
+
+// deliveredCondition mirrors VSO's SecretSynced condition on the
+// VaultStaticSecret (current generation only). VSO messages are not copied.
+// VSO 1.6.2 does not write status when it fails to write the Secret itself
+// (for example a foreign Secret of that name with overwrite=false); it only
+// records an event, so that case stays Unknown.
+func deliveredCondition(ms *idpv1alpha1.ManagedSecret, vss *unstructured.Unstructured) metav1.Condition {
+	status, reason := metav1.ConditionUnknown, ReasonDeliveryPending
+	msg := fmt.Sprintf("VSO has not reported a sync of VaultStaticSecret %s yet (if this persists, check its events: e.g. a Secret %s that VSO did not create already exists, or kv/%s/%s is missing)",
+		ms.Name, ms.Name, ms.Namespace, ms.Name)
+	conds, _, _ := unstructured.NestedSlice(vss.Object, "status", "conditions")
+	for _, c := range conds {
+		m, ok := c.(map[string]any)
+		if !ok || m["type"] != vsoConditionSecretSynced {
+			continue
+		}
+		if g, _, _ := unstructured.NestedInt64(m, "observedGeneration"); g != vss.GetGeneration() {
+			break
+		}
+		switch m["status"] {
+		case string(metav1.ConditionTrue):
+			status, reason = metav1.ConditionTrue, ReasonDelivered
+			msg = fmt.Sprintf("VSO synced kv/%s/%s into Secret %s", ms.Namespace, ms.Name, ms.Name)
+		case string(metav1.ConditionFalse):
+			status, reason = metav1.ConditionFalse, ReasonDeliveryFailed
+			msg = fmt.Sprintf("VSO failed to sync kv/%s/%s; see VaultStaticSecret %s status and events", ms.Namespace, ms.Name, ms.Name)
+		}
+	}
+	return metav1.Condition{Type: idpv1alpha1.ConditionDelivered, Status: status, Reason: reason, Message: msg, ObservedGeneration: ms.Generation}
+}
+
+func syncedCondition(ms *idpv1alpha1.ManagedSecret, status metav1.ConditionStatus, reason, msg string) metav1.Condition {
+	return metav1.Condition{Type: idpv1alpha1.ConditionSynced, Status: status, Reason: reason, Message: msg, ObservedGeneration: ms.Generation}
 }
 
 // namespaceManaged reports whether ns is a live namespace created by this
@@ -170,16 +273,18 @@ func (r *ManagedSecretReconciler) namespaceManaged(ctx context.Context, name str
 	return true, "", nil
 }
 
-func (r *ManagedSecretReconciler) setSynced(ctx context.Context, ms *idpv1alpha1.ManagedSecret, status metav1.ConditionStatus, reason, msg string) error {
+func (r *ManagedSecretReconciler) setNotSynced(ctx context.Context, ms *idpv1alpha1.ManagedSecret, reason, msg string) error {
+	return r.setConditions(ctx, ms, syncedCondition(ms, metav1.ConditionFalse, reason, msg),
+		metav1.Condition{Type: idpv1alpha1.ConditionDelivered, Status: metav1.ConditionUnknown, Reason: ReasonNotSynced,
+			Message: "no VaultStaticSecret is in place for this ManagedSecret", ObservedGeneration: ms.Generation})
+}
+
+func (r *ManagedSecretReconciler) setConditions(ctx context.Context, ms *idpv1alpha1.ManagedSecret, conds ...metav1.Condition) error {
 	before := ms.Status.DeepCopy()
 	ms.Status.ObservedGeneration = ms.Generation
-	meta.SetStatusCondition(&ms.Status.Conditions, metav1.Condition{
-		Type:               idpv1alpha1.ConditionSynced,
-		Status:             status,
-		Reason:             reason,
-		Message:            msg,
-		ObservedGeneration: ms.Generation,
-	})
+	for _, c := range conds {
+		meta.SetStatusCondition(&ms.Status.Conditions, c)
+	}
 	if equality.Semantic.DeepEqual(before, &ms.Status) {
 		return nil
 	}
