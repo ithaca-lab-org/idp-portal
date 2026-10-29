@@ -21,6 +21,8 @@ import (
 var (
 	ErrNotFound = errors.New("not found")
 	ErrInvalid  = errors.New("invalid request")
+	// ErrExists is returned by a create-only Put when the secret already exists.
+	ErrExists = errors.New("a secret with this name already exists")
 	// ErrUpstream means Vault or the cluster failed. Its message is the only thing shown to the
 	// caller; the cause is logged without values.
 	ErrUpstream = errors.New("the secret backend request failed")
@@ -42,8 +44,11 @@ const (
 var (
 	dnsLabel = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
 	keyRe    = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
-	// ReservedSecretNames are taken by the platform inside every team namespace.
-	ReservedSecretNames = []string{"vault-reader"}
+	// ReservedSecretNames and ReservedSecretPrefixes must equal the ManagedSecret CRD's "name is
+	// reserved" rule (operator/api/v1alpha1/managedsecret_types.go); TestReservedNamesMatchTheCRD
+	// fails when they drift. The web page gets them from GET /api/namespaces.
+	ReservedSecretNames    = []string{"vault-reader", "default"}
+	ReservedSecretPrefixes = []string{"default-token", "vault-reader-token", "sh-helm", "kube-", "istio-", "idp-"}
 )
 
 // validPathSegment is the check every namespace and secret name passes before it is placed in a
@@ -58,6 +63,11 @@ func ValidateSecretName(name string) error {
 	for _, r := range ReservedSecretNames {
 		if name == r {
 			return invalid("name %q is reserved", name)
+		}
+	}
+	for _, p := range ReservedSecretPrefixes {
+		if strings.HasPrefix(name, p) {
+			return invalid("names starting with %q are reserved", p)
 		}
 	}
 	return nil
@@ -178,28 +188,35 @@ func (s *Service) ListNamespaces(ctx context.Context, who Requester) ([]Namespac
 
 // authorize returns ErrNotFound unless ns is a COMPLETE namespace order of one of the caller's
 // groups. A namespace that does not exist and one the caller may not touch look the same.
-func (s *Service) authorize(ctx context.Context, who Requester, ns string) error {
+// It returns the id of that order: metadata belongs to one order, so a namespace that is
+// released and ordered again (maybe by another business unit) starts with no secrets listed.
+func (s *Service) authorize(ctx context.Context, who Requester, ns string) (string, error) {
 	if who.Sub == "" || !validPathSegment(ns) || orders.ValidateName(ns) != nil {
-		return ErrNotFound
+		return "", ErrNotFound
 	}
 	o, err := s.Namespaces.CompleteNamespace(ctx, ns)
 	if errors.Is(err, orders.ErrNotFound) {
-		return ErrNotFound
+		return "", ErrNotFound
 	}
 	if err != nil {
-		return err
+		return "", err
 	}
-	if !contains(who.Groups, o.BusinessUnit) {
-		return ErrNotFound
+	if !contains(who.Groups, o.BusinessUnit) || o.ID == "" {
+		return "", ErrNotFound
 	}
-	return nil
+	return o.ID, nil
 }
 
 func (s *Service) List(ctx context.Context, who Requester, ns string) ([]Metadata, error) {
-	if err := s.authorize(ctx, who, ns); err != nil {
+	orderID, err := s.authorize(ctx, who, ns)
+	if err != nil {
 		return nil, err
 	}
-	list, err := s.Store.List(ctx, ns, maxSecrets)
+	// metadata left by an earlier owner of this namespace name is never shown; drop it
+	if err := s.Store.PurgeStale(ctx, ns, orderID); err != nil {
+		return nil, err
+	}
+	list, err := s.Store.List(ctx, ns, orderID, maxSecrets)
 	if err != nil {
 		return nil, err
 	}
@@ -220,12 +237,15 @@ func sortedKeys(data map[string]string) []string {
 
 func actor(who Requester) string { return strings.ToLower(strings.TrimSpace(who.Email)) }
 
-// Put replaces the whole secret with data (a new KV version). Order: Vault first, then the
-// ManagedSecret resource, then the metadata, so the metadata never claims a version Vault does
-// not have. If the resource cannot be created the Vault version stands and ErrUpstream is
-// returned; repeating the request writes one more version and creates the resource.
-func (s *Service) Put(ctx context.Context, who Requester, ns, name string, data map[string]string) (*Result, error) {
-	if err := s.authorize(ctx, who, ns); err != nil {
+// Put replaces the whole secret with data (a new KV version); with create set it refuses
+// (ErrExists) to replace a secret that already exists. Order: the ManagedSecret resource first,
+// so a name the CRD rejects never reaches Vault; then Vault; then the metadata, so the metadata
+// never claims a version Vault does not have. A resource without a value only shows a sync
+// error in the operator/VSO until the write lands. If the Vault write fails the answer is
+// ErrUpstream and a retry is idempotent (the resource already exists).
+func (s *Service) Put(ctx context.Context, who Requester, ns, name string, data map[string]string, create bool) (*Result, error) {
+	orderID, err := s.authorize(ctx, who, ns)
+	if err != nil {
 		return nil, err
 	}
 	if err := ValidateSecretName(name); err != nil {
@@ -237,18 +257,31 @@ func (s *Service) Put(ctx context.Context, who Requester, ns, name string, data 
 	unlock := s.lock(ns, name)
 	defer unlock()
 
+	if err := s.Store.PurgeStale(ctx, ns, orderID); err != nil {
+		return nil, err
+	}
+	if create {
+		if old, err := s.Store.Get(ctx, ns, name, orderID); err != nil {
+			return nil, err
+		} else if old != nil {
+			return nil, ErrExists
+		}
+	}
+	if err := s.Cluster.EnsureManagedSecret(ctx, ns, name); err != nil {
+		if errors.Is(err, ErrInvalid) {
+			return nil, err
+		}
+		slog.Error("create managedsecret", "namespace", ns, "name", name, "err", err)
+		return nil, ErrUpstream
+	}
 	version, err := s.Vault.Write(ctx, ns, name, data)
 	if err != nil {
 		slog.Error("vault write", "namespace", ns, "name", name, "err", err)
 		return nil, ErrUpstream
 	}
-	if err := s.Cluster.EnsureManagedSecret(ctx, ns, name); err != nil {
-		slog.Error("create managedsecret (the Vault version was written)", "namespace", ns, "name", name, "version", version, "err", err)
-		return nil, ErrUpstream
-	}
 	keys := sortedKeys(data)
 	now := s.Now().UTC().Truncate(time.Millisecond)
-	m := Metadata{Namespace: ns, Name: name, Keys: keys, Version: version, UpdatedBy: actor(who), UpdatedAt: now}
+	m := Metadata{Namespace: ns, Name: name, OrderID: orderID, Keys: keys, Version: version, UpdatedBy: actor(who), UpdatedAt: now}
 	if err := s.Store.Upsert(ctx, m); err != nil {
 		return nil, err
 	}
@@ -259,7 +292,8 @@ func (s *Service) Put(ctx context.Context, who Requester, ns, name string, data 
 // Delete removes the ManagedSecret resource, every Vault version and the metadata. Each step
 // tolerates "already gone", so a retry after a partial failure finishes the job.
 func (s *Service) Delete(ctx context.Context, who Requester, ns, name string) error {
-	if err := s.authorize(ctx, who, ns); err != nil {
+	orderID, err := s.authorize(ctx, who, ns)
+	if err != nil {
 		return err
 	}
 	if err := ValidateSecretName(name); err != nil {
@@ -280,8 +314,8 @@ func (s *Service) Delete(ctx context.Context, who Requester, ns, name string) er
 	if err != nil {
 		return err
 	}
-	m := Metadata{Namespace: ns, Name: name, UpdatedBy: actor(who), UpdatedAt: s.Now().UTC()}
-	if old != nil {
+	m := Metadata{Namespace: ns, Name: name, OrderID: orderID, UpdatedBy: actor(who), UpdatedAt: s.Now().UTC()}
+	if old != nil && old.OrderID == orderID { // never put a previous owner's key names in the event
 		m.Keys, m.Version = old.Keys, old.Version
 	}
 	s.emit(ctx, EventDeleted, m)

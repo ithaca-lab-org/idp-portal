@@ -56,7 +56,7 @@ func newFakeVault(t *testing.T) *fakeVault {
 			_, _ = io.WriteString(w, `{"auth":{"client_token":"`+vaultTok+`","lease_duration":3600}}`)
 		case r.Header.Get("X-Vault-Token") != vaultTok:
 			w.WriteHeader(http.StatusForbidden)
-		case r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/v1/kv/data/"):
+		case r.Method == "PUT" && strings.HasPrefix(r.URL.Path, "/v1/kv/data/"):
 			if f.writeCode != 0 {
 				w.WriteHeader(f.writeCode)
 				return
@@ -86,6 +86,12 @@ type fakeSecretCluster struct {
 	items   map[string]bool
 	calls   []string
 	failErr error
+}
+
+func (c *fakeSecretCluster) callList() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return strings.Join(c.calls, ",")
 }
 
 func (c *fakeSecretCluster) EnsureManagedSecret(_ context.Context, ns, name string) error {
@@ -134,6 +140,14 @@ type secretEnv struct {
 	store   *secrets.MemStore
 	pub     *fakePub
 	logs    *syncBuf
+	orders  *orders.MemStore
+	orderA  string // the COMPLETE order of team-a
+}
+
+// meta lists the stored metadata of team-a's current order.
+func (s *secretEnv) meta() []secrets.Metadata {
+	l, _ := s.store.List(context.Background(), "team-a", s.orderA, 0)
+	return l
 }
 
 // setupSecrets builds the API with the Secrets page on: namespaces team-a (payment-bu,
@@ -148,6 +162,7 @@ func setupSecrets(t *testing.T) *secretEnv {
 	e := setup(t)
 	ostore := orders.NewMemStore()
 	ctx := context.Background()
+	orderA := ""
 	for _, n := range []struct {
 		name, bu string
 		st       orders.Status
@@ -155,6 +170,9 @@ func setupSecrets(t *testing.T) *secretEnv {
 		o := &orders.Order{Kind: orders.KindNamespace, Name: n.name, BusinessUnit: n.bu, OwnerSub: "x", Status: orders.StatusPending}
 		if err := ostore.Create(ctx, o); err != nil {
 			t.Fatal(err)
+		}
+		if n.name == "team-a" {
+			orderA = o.ID
 		}
 		if n.st != orders.StatusPending {
 			if err := ostore.UpdateStatus(ctx, o.ID, orders.StatusPending, n.st, ""); err != nil {
@@ -179,7 +197,7 @@ func setupSecrets(t *testing.T) *secretEnv {
 	svc := secrets.NewService(vc, cl, st, ostore)
 	svc.Events = pub
 	e.api.Secrets = svc
-	return &secretEnv{env: e, vault: fv, cluster: cl, store: st, pub: pub, logs: logs}
+	return &secretEnv{env: e, vault: fv, cluster: cl, store: st, pub: pub, logs: logs, orders: ostore, orderA: orderA}
 }
 
 func secretReq(method, path, body string) *http.Request {
@@ -205,8 +223,7 @@ func (s *secretEnv) assertNoLeak(t *testing.T, extra ...string) {
 		}
 	}
 	ev, _ := json.Marshal(s.pub.events)
-	list, _ := s.store.List(context.Background(), "team-a", 0)
-	mdl, _ := json.Marshal(list)
+	mdl, _ := json.Marshal(s.meta())
 	for _, hay := range append([]string{string(ev), string(mdl)}, extra...) {
 		if strings.Contains(hay, secretValue) {
 			t.Errorf("value leaked into %s", hay)
@@ -248,7 +265,9 @@ func TestSecretRoutesNeedASession(t *testing.T) {
 func TestNamespacesListsCompleteOrdersOfMyGroups(t *testing.T) {
 	s := setupSecrets(t)
 	w := s.do(secretReq("GET", "/api/namespaces", ""), &alice, t)
-	if w.Code != 200 || strings.TrimSpace(w.Body.String()) != `{"namespaces":[{"name":"team-a","businessUnit":"payment-bu"}]}` {
+	want := `{"namespaces":[{"name":"team-a","businessUnit":"payment-bu"}],"reservedNames":["vault-reader","default"],` +
+		`"reservedPrefixes":["default-token","vault-reader-token","sh-helm","kube-","istio-","idp-"]}`
+	if w.Code != 200 || strings.TrimSpace(w.Body.String()) != want {
 		t.Fatalf("%d %s", w.Code, w.Body.String())
 	}
 	none := auth.User{Sub: "u9", Email: "n@example.com"}
@@ -307,7 +326,7 @@ func TestPutSecretExactVaultRequestsAndMetadata(t *testing.T) {
 	}
 	wr := reqs[1]
 	data, _ := wr.Body["data"].(map[string]any)
-	if wr.Method != "POST" || wr.Path != "/v1/kv/data/team-a/db-creds" || wr.Token != vaultTok || len(wr.Body) != 1 ||
+	if wr.Method != "PUT" || wr.Path != "/v1/kv/data/team-a/db-creds" || wr.Token != vaultTok || len(wr.Body) != 1 ||
 		data["DB_PASSWORD"] != secretValue || data["DB_USER"] != "app" || len(data) != 2 {
 		t.Fatalf("write: %+v", wr)
 	}
@@ -351,6 +370,15 @@ func TestPutSecretValidation(t *testing.T) {
 		"upper-case name":   {"DB", goodSecret, "", 400},
 		"name too long":     {strings.Repeat("a", 41), goodSecret, "", 400},
 		"reserved name":     {"vault-reader", goodSecret, "", 400},
+		"default":           {"default", goodSecret, "", 400},
+		"default-token-x":   {"default-token-abc", goodSecret, "", 400},
+		"vault-reader-tok":  {"vault-reader-token-x", goodSecret, "", 400},
+		"sh-helm":           {"sh-helm-release-v1", goodSecret, "", 400},
+		"kube-":             {"kube-x", goodSecret, "", 400},
+		"istio-":            {"istio-x", goodSecret, "", 400},
+		"idp-":              {"idp-x", goodSecret, "", 400},
+		"bad query":         {"db?create=yes", goodSecret, "", 400},
+		"extra query":       {"db?create=true&x=1", goodSecret, "", 400},
 		"no keys":           {"db", `{"data":{}}`, "", 400},
 		"no data":           {"db", `{}`, "", 400},
 		"21 keys":           {"db", string(manyJSON), "", 400},
@@ -382,6 +410,9 @@ func TestPutSecretValidation(t *testing.T) {
 			}
 			if n := len(s.vault.requests()); n != 0 {
 				t.Fatalf("invalid request reached Vault")
+			}
+			if s.cluster.callList() != "" {
+				t.Fatalf("invalid request reached the cluster")
 			}
 		})
 	}
@@ -446,11 +477,11 @@ func TestVaultFailureGives502AndNoMetadata(t *testing.T) {
 		if w.Code != http.StatusBadGateway || strings.TrimSpace(w.Body.String()) != `{"error":"the secret backend is unavailable, try again"}` {
 			t.Fatalf("%d: %d %s", code, w.Code, w.Body.String())
 		}
-		if l, _ := s.store.List(context.Background(), "team-a", 0); len(l) != 0 {
+		if l := s.meta(); len(l) != 0 {
 			t.Fatalf("metadata written after a failed Vault write: %+v", l)
 		}
-		if len(s.cluster.calls) != 0 || len(s.pub.events) != 0 {
-			t.Fatal("cluster or event touched after a failed Vault write")
+		if s.cluster.callList() != "create team-a/db" || len(s.pub.events) != 0 {
+			t.Fatalf("want only the resource created, got %q and %d events", s.cluster.callList(), len(s.pub.events))
 		}
 		s.assertNoLeak(t, w.Body.String())
 	}
@@ -459,31 +490,101 @@ func TestVaultFailureGives502AndNoMetadata(t *testing.T) {
 	if w := s.do(secretReq("PUT", "/api/namespaces/team-a/secrets/db", goodSecret), &alice, t); w.Code != http.StatusBadGateway {
 		t.Fatalf("%d", w.Code)
 	}
-	if l, _ := s.store.List(context.Background(), "team-a", 0); len(l) != 0 {
+	if l := s.meta(); len(l) != 0 {
 		t.Fatal("metadata written while Vault was down")
 	}
 	s.assertNoLeak(t)
 }
 
-func TestManagedSecretFailureKeepsVaultVersionAndRetryHeals(t *testing.T) {
+func TestManagedSecretFailureStopsBeforeVault(t *testing.T) {
 	s := setupSecrets(t)
 	s.cluster.failErr = errors.New("apiserver says no")
 	w := s.do(secretReq("PUT", "/api/namespaces/team-a/secrets/db", goodSecret), &alice, t)
 	if w.Code != http.StatusBadGateway || strings.Contains(w.Body.String(), "apiserver") {
 		t.Fatalf("%d %s", w.Code, w.Body.String())
 	}
-	if s.vault.versions["team-a/db"] != 1 {
-		t.Fatal("the Vault write should stand")
+	// the CRD rejecting the name is the caller's problem, not a backend failure
+	s.cluster.failErr = fmt.Errorf("%w: invalid name", secrets.ErrInvalid)
+	w = s.do(secretReq("PUT", "/api/namespaces/team-a/secrets/db", goodSecret), &alice, t)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "invalid name") {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
 	}
-	if l, _ := s.store.List(context.Background(), "team-a", 0); len(l) != 0 {
-		t.Fatal("metadata must not be written when the resource could not be created")
+	if len(s.vault.requests()) != 0 || len(s.meta()) != 0 {
+		t.Fatal("nothing may reach Vault or the metadata when the resource cannot be created")
 	}
 	s.cluster.failErr = nil
 	w = s.do(secretReq("PUT", "/api/namespaces/team-a/secrets/db", goodSecret), &alice, t)
-	if w.Code != 200 || !strings.Contains(w.Body.String(), `"version":2`) || !s.cluster.items["team-a/db"] {
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"version":1`) || !s.cluster.items["team-a/db"] {
 		t.Fatalf("retry: %d %s", w.Code, w.Body.String())
 	}
 	s.assertNoLeak(t)
+}
+
+func TestVaultFailureAfterResourceRetriesIdempotently(t *testing.T) {
+	s := setupSecrets(t)
+	s.vault.writeCode = 500
+	if w := s.do(secretReq("PUT", "/api/namespaces/team-a/secrets/db", goodSecret), &alice, t); w.Code != http.StatusBadGateway {
+		t.Fatalf("%d", w.Code)
+	}
+	s.vault.writeCode = 0
+	w := s.do(secretReq("PUT", "/api/namespaces/team-a/secrets/db?create=true", goodSecret), &alice, t)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"version":1`) {
+		t.Fatalf("retry: %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCreateOnlyPutRefusesAnExistingSecret(t *testing.T) {
+	s := setupSecrets(t)
+	if w := s.do(secretReq("PUT", "/api/namespaces/team-a/secrets/db?create=true", goodSecret), &alice, t); w.Code != 200 {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+	before := len(s.vault.requests())
+	w := s.do(secretReq("PUT", "/api/namespaces/team-a/secrets/db?create=true", goodSecret), &alice, t)
+	if w.Code != http.StatusConflict || len(s.vault.requests()) != before {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+	if w := s.do(secretReq("PUT", "/api/namespaces/team-a/secrets/db", goodSecret), &alice, t); w.Code != 200 || !strings.Contains(w.Body.String(), `"version":2`) {
+		t.Fatalf("a plain PUT replaces: %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestRecreatedNamespaceDoesNotSeeThePreviousTeamsSecrets(t *testing.T) {
+	s := setupSecrets(t)
+	ctx := context.Background()
+	if w := s.do(secretReq("PUT", "/api/namespaces/team-a/secrets/db", goodSecret), &alice, t); w.Code != 200 {
+		t.Fatal(w.Code)
+	}
+	// team-a is removed and ordered again by another business unit
+	if err := s.orders.UpdateStatus(ctx, s.orderA, orders.StatusComplete, orders.StatusReleased, ""); err != nil {
+		t.Fatal(err)
+	}
+	o := &orders.Order{Kind: orders.KindNamespace, Name: "team-a", BusinessUnit: "other-bu", OwnerSub: "u2", Status: orders.StatusPending}
+	if err := s.orders.Create(ctx, o); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.orders.UpdateStatus(ctx, o.ID, orders.StatusPending, orders.StatusComplete, ""); err != nil {
+		t.Fatal(err)
+	}
+	bob := auth.User{Sub: "u2", Email: "bob@example.com", Groups: []string{"other-bu"}}
+	if w := s.do(secretReq("GET", "/api/namespaces/team-a/secrets", ""), &alice, t); w.Code != http.StatusNotFound {
+		t.Fatalf("the previous team still has access: %d", w.Code)
+	}
+	w := s.do(secretReq("GET", "/api/namespaces/team-a/secrets", ""), &bob, t)
+	if w.Code != 200 || strings.TrimSpace(w.Body.String()) != `{"secrets":[]}` {
+		t.Fatalf("the new owner sees old metadata: %s", w.Body.String())
+	}
+	if l, _ := s.store.List(ctx, "team-a", s.orderA, 0); len(l) != 0 {
+		t.Fatal("stale metadata was not removed")
+	}
+	// the old name is free for a create-only PUT, and the new document is the new team's
+	w = s.do(secretReq("PUT", "/api/namespaces/team-a/secrets/db?create=true", `{"data":{"NEW":"v"}}`), &bob, t)
+	if w.Code != 200 {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+	l, _ := s.store.List(ctx, "team-a", o.ID, 0)
+	if len(l) != 1 || l[0].UpdatedBy != "bob@example.com" || l[0].OrderID != o.ID || fmt.Sprint(l[0].Keys) != "[NEW]" {
+		t.Fatalf("%+v", l)
+	}
 }
 
 func TestDeleteSecretFlow(t *testing.T) {
@@ -501,7 +602,7 @@ func TestDeleteSecretFlow(t *testing.T) {
 	if got := strings.Join(s.cluster.calls, ","); got != "create team-a/db,delete team-a/db" {
 		t.Fatalf("cluster calls: %s", got)
 	}
-	if l, _ := s.store.List(context.Background(), "team-a", 0); len(l) != 0 {
+	if l := s.meta(); len(l) != 0 {
 		t.Fatal("metadata not deleted")
 	}
 	last := s.pub.events[len(s.pub.events)-1]

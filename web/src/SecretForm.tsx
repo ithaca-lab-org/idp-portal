@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { ApiError, putSecret, type SecretResult } from "./api";
+import { ApiError, putSecret, type NameRules, type SecretResult } from "./api";
 
 const NAME_RE = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/;
 const KEY_RE = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
@@ -13,9 +13,11 @@ let nextId = 1;
 const row = (key = ""): Row => ({ id: nextId++, key, value: "" });
 const bytes = (s: string) => new TextEncoder().encode(s).length;
 
-function check(name: string, rows: Row[]): string {
+function check(name: string, rows: Row[], rules: NameRules): string {
   if (name.length > 40 || !NAME_RE.test(name)) return "Name must be a lowercase DNS label of at most 40 characters (a-z, 0-9, -).";
-  if (name === "vault-reader") return "The name vault-reader is reserved.";
+  if (rules.reservedNames.includes(name)) return `The name ${name} is reserved.`;
+  const prefix = rules.reservedPrefixes.find((p) => name.startsWith(p));
+  if (prefix) return `Names starting with ${prefix} are reserved.`;
   if (rows.length < 1 || rows.length > MAX_KEYS) return `A secret needs 1 to ${MAX_KEYS} keys.`;
   const seen = new Set<string>();
   let total = 0;
@@ -37,11 +39,13 @@ function check(name: string, rows: Row[]): string {
  */
 export function SecretForm({
   namespace,
+  rules,
   existing,
   onSaved,
   onCancel,
 }: {
   namespace: string;
+  rules: NameRules;
   existing?: { name: string; keys: string[] };
   onSaved: (r: SecretResult) => void;
   onCancel: () => void;
@@ -55,12 +59,12 @@ export function SecretForm({
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
-    const problem = check(name, rows);
+    const problem = check(name, rows, rules);
     if (problem) return setError(problem);
     setError("");
     setBusy(true);
     try {
-      const res = await putSecret(namespace, name, Object.fromEntries(rows.map((r) => [r.key, r.value])));
+      const res = await putSecret(namespace, name, Object.fromEntries(rows.map((r) => [r.key, r.value])), !existing);
       setRows((rs) => rs.map((r) => ({ ...r, value: "" })));
       onSaved(res);
     } catch (err) {

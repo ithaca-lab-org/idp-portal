@@ -9,8 +9,11 @@ import (
 
 // Metadata is everything stored about a secret outside Vault. There is no field for a value.
 type Metadata struct {
-	Namespace string    `bson:"namespace" json:"-"`
-	Name      string    `bson:"name" json:"name"`
+	Namespace string `bson:"namespace" json:"-"`
+	Name      string `bson:"name" json:"name"`
+	// OrderID is the COMPLETE namespace order the secret was written under. Documents of an
+	// earlier order (the namespace was released and ordered again) are treated as absent.
+	OrderID   string    `bson:"orderId" json:"-"`
 	Keys      []string  `bson:"keys" json:"keys"`
 	Version   int       `bson:"version" json:"version"`
 	UpdatedBy string    `bson:"updatedBy" json:"updatedBy"`
@@ -20,10 +23,15 @@ type Metadata struct {
 
 // Store keeps secret metadata, one document per namespace and name.
 type Store interface {
-	// Upsert replaces keys, version, updatedBy and updatedAt; createdAt is set on insert only.
+	// Upsert replaces orderId, keys, version, updatedBy and updatedAt; createdAt is set on insert
+	// only (callers PurgeStale first, so a document of another order is never updated in place).
 	Upsert(ctx context.Context, m Metadata) error
-	// List returns the namespace's secrets ordered by name.
-	List(ctx context.Context, ns string, limit int) ([]Metadata, error)
+	// Get returns the secret's metadata for orderID, or nil.
+	Get(ctx context.Context, ns, name, orderID string) (*Metadata, error)
+	// List returns the namespace's secrets of orderID ordered by name.
+	List(ctx context.Context, ns, orderID string, limit int) ([]Metadata, error)
+	// PurgeStale deletes the namespace's documents that belong to another order.
+	PurgeStale(ctx context.Context, ns, orderID string) error
 	// Delete removes the document and returns what was there (nil if nothing).
 	Delete(ctx context.Context, ns, name string) (*Metadata, error)
 }
@@ -50,12 +58,32 @@ func (m *MemStore) Upsert(_ context.Context, md Metadata) error {
 	return nil
 }
 
-func (m *MemStore) List(_ context.Context, ns string, limit int) ([]Metadata, error) {
+func (m *MemStore) Get(_ context.Context, ns, name, orderID string) (*Metadata, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if md, ok := m.items[ns+"/"+name]; ok && md.OrderID == orderID {
+		return &md, nil
+	}
+	return nil, nil
+}
+
+func (m *MemStore) PurgeStale(_ context.Context, ns, orderID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for k, md := range m.items {
+		if md.Namespace == ns && md.OrderID != orderID {
+			delete(m.items, k)
+		}
+	}
+	return nil
+}
+
+func (m *MemStore) List(_ context.Context, ns, orderID string, limit int) ([]Metadata, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var out []Metadata
 	for _, md := range m.items {
-		if md.Namespace == ns {
+		if md.Namespace == ns && md.OrderID == orderID {
 			out = append(out, md)
 		}
 	}

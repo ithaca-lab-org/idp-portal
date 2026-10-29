@@ -184,7 +184,7 @@ func TestMemStoreKeepsCreatedAt(t *testing.T) {
 	t1, t2 := time.Unix(1, 0), time.Unix(2, 0)
 	_ = s.Upsert(ctx, Metadata{Namespace: "a", Name: "x", Version: 1, UpdatedAt: t1})
 	_ = s.Upsert(ctx, Metadata{Namespace: "a", Name: "x", Version: 2, UpdatedAt: t2})
-	l, _ := s.List(ctx, "a", 0)
+	l, _ := s.List(ctx, "a", "", 0)
 	if len(l) != 1 || l[0].Version != 2 || !l[0].CreatedAt.Equal(t1) || !l[0].UpdatedAt.Equal(t2) {
 		t.Fatalf("%+v", l)
 	}

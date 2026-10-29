@@ -19,6 +19,14 @@ import (
 // Vault is everything the portal does in Vault: write a new version of a secret and remove a
 // secret with all its versions. There is deliberately no read: the portal's Vault policy has no
 // read on kv/data, so a secret value can never come back through the portal.
+//
+// The complete list of Vault calls VaultClient makes (keep the portal-secrets policy to these):
+//
+//	POST   /v1/auth/<auth mount>/login          Kubernetes login (no policy needed)
+//	PUT    /v1/<kv mount>/data/<ns>/<name>      new version: capabilities create, update on <kv>/data/*
+//	DELETE /v1/<kv mount>/metadata/<ns>/<name>  all versions: capability delete on <kv>/metadata/*
+//
+// Nothing reads or lists kv/data or kv/metadata.
 type Vault interface {
 	// Write stores data as a new version of kv/data/<ns>/<name> and returns that version.
 	Write(ctx context.Context, ns, name string, data map[string]string) (int, error)
@@ -235,7 +243,7 @@ func (c *VaultClient) Write(ctx context.Context, ns, name string, data map[strin
 	}
 	// No CAS: check-and-set needs the current version, which only a read of the metadata could
 	// give; a whole-secret replace is what the caller asked for anyway.
-	st, err := c.call(ctx, http.MethodPost, c.endpoint(c.cfg.KVMount, "data", ns, name), map[string]any{"data": data}, &reply)
+	st, err := c.call(ctx, http.MethodPut, c.endpoint(c.cfg.KVMount, "data", ns, name), map[string]any{"data": data}, &reply)
 	if err != nil {
 		return 0, err
 	}

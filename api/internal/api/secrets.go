@@ -46,7 +46,9 @@ func (a *API) listNamespaces(w http.ResponseWriter, r *http.Request, who orders.
 		a.failSecret(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"namespaces": list})
+	// the naming rules travel with the list so the page validates exactly like the API
+	writeJSON(w, http.StatusOK, map[string]any{"namespaces": list,
+		"reservedNames": secrets.ReservedSecretNames, "reservedPrefixes": secrets.ReservedSecretPrefixes})
 }
 
 func (a *API) listSecrets(w http.ResponseWriter, r *http.Request, who orders.Requester) {
@@ -75,6 +77,16 @@ func (a *API) putSecret(w http.ResponseWriter, r *http.Request, who orders.Reque
 		tooMany(w)
 		return
 	}
+	// ?create=true makes the request create-only: 409 if the secret exists ("New secret")
+	create := false
+	switch q := r.URL.Query(); {
+	case len(q) == 0:
+	case len(q) == 1 && len(q["create"]) == 1 && (q.Get("create") == "true" || q.Get("create") == "false"):
+		create = q.Get("create") == "true"
+	default:
+		writeError(w, http.StatusBadRequest, "the only query parameter is create=true")
+		return
+	}
 	if mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mt != "application/json" {
 		writeError(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json")
 		return
@@ -96,7 +108,7 @@ func (a *API) putSecret(w http.ResponseWriter, r *http.Request, who orders.Reque
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	res, err := a.Secrets.Put(r.Context(), who, r.PathValue("ns"), r.PathValue("name"), body.Data)
+	res, err := a.Secrets.Put(r.Context(), who, r.PathValue("ns"), r.PathValue("name"), body.Data, create)
 	if err != nil {
 		a.failSecret(w, err)
 		return
@@ -130,6 +142,8 @@ func (a *API) failSecret(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, secrets.ErrNotFound):
 		writeError(w, http.StatusNotFound, "not found")
+	case errors.Is(err, secrets.ErrExists):
+		writeError(w, http.StatusConflict, "a secret with this name already exists; use Replace values")
 	case errors.Is(err, secrets.ErrInvalid):
 		writeError(w, http.StatusBadRequest, err.Error()) // validation messages never contain a value
 	case errors.Is(err, secrets.ErrUpstream):

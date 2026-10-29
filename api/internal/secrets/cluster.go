@@ -16,7 +16,8 @@ var managedSecretGVR = schema.GroupVersionResource{Group: "idp.ithaca-idp.com", 
 // tells the operator that kv/<ns>/<name> should be synced into the namespace. The portal's
 // ServiceAccount needs create, get and delete on managedsecrets and nothing else.
 type Cluster interface {
-	// EnsureManagedSecret creates the resource; an existing one is fine.
+	// EnsureManagedSecret creates the resource; an existing one is fine. A name the CRD rejects
+	// gives an ErrInvalid error.
 	EnsureManagedSecret(ctx context.Context, ns, name string) error
 	// DeleteManagedSecret deletes the resource; a missing one is fine.
 	DeleteManagedSecret(ctx context.Context, ns, name string) error
@@ -32,8 +33,12 @@ func (c DynamicCluster) EnsureManagedSecret(ctx context.Context, ns, name string
 		"spec":       map[string]any{},
 	}}
 	_, err := c.Client.Resource(managedSecretGVR).Namespace(ns).Create(ctx, obj, metav1.CreateOptions{})
-	if apierrors.IsAlreadyExists(err) {
+	switch {
+	case apierrors.IsAlreadyExists(err):
 		return nil
+	case apierrors.IsInvalid(err):
+		// the CRD's validation rejected the name; the API's own check should have caught it
+		return invalid("invalid name")
 	}
 	return err
 }

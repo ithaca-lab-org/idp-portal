@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { businessUnits, listNamespaces, logout, me, type Namespace, type Order, type User } from "./api";
+import { businessUnits, listNamespaces, logout, me, type Order, type SecretsInfo, type User } from "./api";
 import { OrderForm } from "./OrderForm";
 import { OrderHistory } from "./OrderHistory";
 import { SecretsPage } from "./SecretsPage";
@@ -8,11 +8,11 @@ type Session =
   | { state: "loading" }
   | { state: "anonymous" }
   | { state: "error" }
-  // namespaces is null when the Secrets page is turned off on the server
-  | { state: "in"; user: User; units: string[]; namespaces: Namespace[] | null };
+  // secrets is null when the Secrets page is turned off on the server
+  | { state: "in"; user: User; units: string[]; secrets: SecretsInfo | null };
 
 /** The Secrets page is optional: any failure to list namespaces just hides it. */
-async function secretNamespaces(): Promise<Namespace[] | null> {
+async function secretNamespaces(): Promise<SecretsInfo | null> {
   try {
     return await listNamespaces();
   } catch {
@@ -31,8 +31,8 @@ export function App() {
       try {
         const user = await me();
         if (!user) return setSession({ state: "anonymous" });
-        const [units, namespaces] = await Promise.all([businessUnits(), secretNamespaces()]);
-        setSession({ state: "in", user, units, namespaces });
+        const [units, secrets] = await Promise.all([businessUnits(), secretNamespaces()]);
+        setSession({ state: "in", user, units, secrets });
       } catch {
         setSession({ state: "error" });
       }
@@ -68,7 +68,7 @@ export function App() {
         </span>
         <button onClick={signOut}>Sign out</button>
       </header>
-      {session.namespaces !== null && (
+      {session.secrets !== null && (
         <nav aria-label="Pages">
           <button aria-current={page === "orders" ? "page" : undefined} onClick={() => setPage("orders")}>
             Orders
@@ -79,8 +79,8 @@ export function App() {
         </nav>
       )}
       {signOutError && <p role="alert">Sign out failed. You are still signed in; try again.</p>}
-      {page === "secrets" && session.namespaces !== null ? (
-        <SecretsPage namespaces={session.namespaces} />
+      {page === "secrets" && session.secrets !== null ? (
+        <SecretsPage namespaces={session.secrets.namespaces} rules={session.secrets} />
       ) : (
         <>
           <OrderForm units={session.units} onPlaced={setFresh} />

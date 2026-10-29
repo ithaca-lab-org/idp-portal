@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
-import { ApiError, deleteSecret, listSecrets, type Namespace, type SecretMeta } from "./api";
+import { ApiError, deleteSecret, listSecrets, type NameRules, type Namespace, type SecretMeta } from "./api";
 import { SecretForm } from "./SecretForm";
 
 type Mode = { kind: "none" } | { kind: "new" } | { kind: "replace"; secret: SecretMeta } | { kind: "delete"; secret: SecretMeta };
 
-export function SecretsPage({ namespaces }: { namespaces: Namespace[] }) {
+export function SecretsPage({ namespaces, rules }: { namespaces: Namespace[]; rules: NameRules }) {
   const [ns, setNs] = useState(namespaces[0]?.name ?? "");
   const [secrets, setSecrets] = useState<SecretMeta[] | null>(null);
   const [mode, setMode] = useState<Mode>({ kind: "none" });
@@ -123,6 +123,7 @@ export function SecretsPage({ namespaces }: { namespaces: Namespace[] }) {
         <SecretForm
           key={mode.kind === "replace" ? `r-${mode.secret.name}` : "new"}
           namespace={ns}
+          rules={rules}
           existing={mode.kind === "replace" ? { name: mode.secret.name, keys: mode.secret.keys } : undefined}
           onCancel={() => setMode({ kind: "none" })}
           onSaved={(r) => {

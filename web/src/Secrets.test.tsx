@@ -28,7 +28,13 @@ function base(extra: Record<string, Route> = {}, secrets: () => object[] = () =>
     "GET /auth/me": () => ({ body: user }),
     "GET /api/business-units": () => ({ body: { businessUnits: user.groups } }),
     "GET /api/orders": () => ({ body: { orders: [] } }),
-    "GET /api/namespaces": () => ({ body: { namespaces: [{ name: "team-a", businessUnit: "payment-bu" }] } }),
+    "GET /api/namespaces": () => ({
+      body: {
+        namespaces: [{ name: "team-a", businessUnit: "payment-bu" }],
+        reservedNames: ["vault-reader", "default"],
+        reservedPrefixes: ["default-token", "kube-", "idp-"],
+      },
+    }),
     "GET /api/namespaces/team-a/secrets": () => ({ body: { secrets: secrets() } }),
     ...extra,
   });
@@ -64,7 +70,7 @@ test("a new secret is sent once, inputs are masked, and the value is never shown
   let list: object[] = [];
   const f = base(
     {
-      "PUT /api/namespaces/team-a/secrets/db": () => {
+      "PUT /api/namespaces/team-a/secrets/db?create=true": () => {
         list = [meta({ keys: ["DB_PASSWORD", "DB_USER"] })];
         return { body: { name: "db", keys: ["DB_PASSWORD", "DB_USER"], version: 1 } };
       },
@@ -127,10 +133,23 @@ test("replace values pre-fills key names only, delete asks first", async () => {
 
 test("server errors are shown and bad input is rejected before sending", async () => {
   const f = base({
-    "PUT /api/namespaces/team-a/secrets/db": () => ({ status: 502, body: { error: "the secret backend is unavailable, try again" } }),
+    "PUT /api/namespaces/team-a/secrets/db?create=true": () => ({ status: 502, body: { error: "the secret backend is unavailable, try again" } }),
   });
   await openSecrets();
   await userEvent.click(await screen.findByRole("button", { name: "New secret" }));
+  // the reserved names come from the API
+  await userEvent.type(screen.getByLabelText("Secret name"), "idp-x");
+  await userEvent.type(screen.getByLabelText("Key 1"), "K");
+  await userEvent.type(screen.getByLabelText("Value 1"), "v");
+  await userEvent.click(screen.getByRole("button", { name: "Save secret" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("Names starting with idp- are reserved");
+  await userEvent.clear(screen.getByLabelText("Secret name"));
+  await userEvent.type(screen.getByLabelText("Secret name"), "default");
+  await userEvent.click(screen.getByRole("button", { name: "Save secret" }));
+  await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("The name default is reserved"));
+  await userEvent.clear(screen.getByLabelText("Key 1"));
+  await userEvent.clear(screen.getByLabelText("Value 1"));
+  await userEvent.clear(screen.getByLabelText("Secret name"));
   await userEvent.type(screen.getByLabelText("Secret name"), "db");
   await userEvent.type(screen.getByLabelText("Key 1"), "1BAD");
   await userEvent.type(screen.getByLabelText("Value 1"), VALUE);
@@ -143,4 +162,21 @@ test("server errors are shown and bad input is rejected before sending", async (
   await userEvent.click(screen.getByRole("button", { name: "Save secret" }));
   await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("secret backend is unavailable"));
   expect(screen.getByRole("alert")).not.toHaveTextContent(VALUE);
+});
+
+test("New secret is create-only: an existing name gives a conflict and nothing is replaced", async () => {
+  const f = base({
+    "PUT /api/namespaces/team-a/secrets/db?create=true": () => ({
+      status: 409,
+      body: { error: "a secret with this name already exists; use Replace values" },
+    }),
+  });
+  await openSecrets();
+  await userEvent.click(await screen.findByRole("button", { name: "New secret" }));
+  await userEvent.type(screen.getByLabelText("Secret name"), "db");
+  await userEvent.type(screen.getByLabelText("Key 1"), "K");
+  await userEvent.type(screen.getByLabelText("Value 1"), VALUE);
+  await userEvent.click(screen.getByRole("button", { name: "Save secret" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("already exists");
+  expect(f.mock.calls.filter(([p]) => p === "/api/namespaces/team-a/secrets/db")).toHaveLength(0);
 });

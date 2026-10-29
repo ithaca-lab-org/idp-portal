@@ -92,10 +92,20 @@ export interface SecretResult {
   version: number;
 }
 
+/** The secret naming rules, served by the API so the page checks exactly what the API checks. */
+export interface NameRules {
+  reservedNames: string[];
+  reservedPrefixes: string[];
+}
+
+export interface SecretsInfo extends NameRules {
+  namespaces: Namespace[];
+}
+
 /** The namespaces the user may manage secrets in; null when the Secrets page is turned off (404). */
-export async function listNamespaces(): Promise<Namespace[] | null> {
+export async function listNamespaces(): Promise<SecretsInfo | null> {
   try {
-    return (await call<{ namespaces: Namespace[] }>("/api/namespaces")).namespaces;
+    return await call<SecretsInfo>("/api/namespaces");
   } catch (e) {
     if (e instanceof ApiError && e.status === 404) return null;
     throw e;
@@ -107,9 +117,12 @@ const seg = encodeURIComponent;
 export const listSecrets = async (ns: string) =>
   (await call<{ secrets: SecretMeta[] }>(`/api/namespaces/${seg(ns)}/secrets`)).secrets;
 
-/** Replaces the whole secret. The response never contains values. */
-export const putSecret = (ns: string, name: string, data: Record<string, string>) =>
-  call<SecretResult>(`/api/namespaces/${seg(ns)}/secrets/${seg(name)}`, {
+/**
+ * Replaces the whole secret. With create, the server answers 409 if the secret already exists.
+ * The response never contains values.
+ */
+export const putSecret = (ns: string, name: string, data: Record<string, string>, create = false) =>
+  call<SecretResult>(`/api/namespaces/${seg(ns)}/secrets/${seg(name)}${create ? "?create=true" : ""}`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ data }),
