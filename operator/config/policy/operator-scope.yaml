@@ -31,6 +31,11 @@ spec:
         apiVersions: ["*"]
         operations: ["CREATE", "UPDATE", "DELETE"]
         resources: ["vaultauths", "vaultauths/*"]
+      # VSO VaultStaticSecret for ManagedSecrets (VAULT_ENABLED=true).
+      - apiGroups: ["secrets.hashicorp.com"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["vaultstaticsecrets", "vaultstaticsecrets/*"]
   matchConditions:
     - name: is-idp-operator
       expression: "request.userInfo.username == 'system:serviceaccount:idp-system:idp-operator'"
@@ -60,6 +65,8 @@ spec:
         namespaceObject != null && has(namespaceObject.metadata.labels) &&
         namespaceObject.metadata.labels[?'app.kubernetes.io/managed-by'] == optional.of('idp-operator') &&
         namespaceObject.metadata.labels[?'idp.ithaca-idp.com/team-namespace'] == optional.of(namespaceObject.metadata.name)
+    - name: isVSS
+      expression: "request.resource.resource == 'vaultstaticsecrets'"
   validations:
     - expression: >-
         !variables.isNamespace ||
@@ -91,7 +98,7 @@ spec:
     # Child names are fixed in the controller; pinning them stops extra objects
     # (e.g. an allow-all NetworkPolicy) from being added next to the managed ones.
     - expression: >-
-        variables.isNamespace ||
+        variables.isNamespace || variables.isVSS ||
         request.name in {
           'resourcequotas': ['idp-quota'],
           'limitranges': ['idp-limits'],
@@ -134,6 +141,47 @@ spec:
          !has(object.spec.vaultAuthGlobalRef))
       reason: Forbidden
       message: "idp-operator VaultAuths must match the operator's fixed spec (kubernetes auth as vault-reader, role ns-reader, connection vault-secrets-operator/idp-vault, audience vault, 600s tokens, no other fields)"
+    # VaultStaticSecret names follow the ManagedSecrets, so they cannot be listed
+    # here. Instead the object must be controlled by a ManagedSecret of the same
+    # name (one ownerReference, controller=true), and on UPDATE the stored object
+    # must already be, so a VaultStaticSecret made by hand or by another
+    # controller can never be adopted (the controller also leaves those alone and
+    # reports NameConflict). The policy cannot look the ManagedSecret up: an
+    # ownerReference with a made-up UID passes here, but the garbage collector
+    # deletes dependents whose owner UID does not exist.
+    - expression: >-
+        !variables.isVSS ||
+        (request.operation == 'DELETE' ? [oldObject] : request.operation == 'UPDATE' ? [object, oldObject] : [object]).all(v,
+          has(v.metadata.ownerReferences) && size(v.metadata.ownerReferences) == 1 &&
+          v.metadata.ownerReferences.all(o,
+            o.apiVersion == 'idp.ithaca-idp.com/v1alpha1' && o.kind == 'ManagedSecret' &&
+            o.name == v.metadata.name && o.?controller.orValue(false) == true))
+      reason: Forbidden
+      messageExpression: "'idp-operator VaultStaticSecrets must be (and, on update, already be) controlled by the ManagedSecret of the same name (' + request.name + ')'"
+    # The spec is exactly desiredVaultStaticSecretSpec: read kv/<namespace>/<name>
+    # with the namespace's own vault-reader VaultAuth into a Secret of the same
+    # name that VSO creates and never takes over (overwrite false). None of the
+    # other VSO 1.6.2 fields: no rollout restarts (they would let a secret
+    # restart arbitrary workloads), Vault namespace, version pin, transformation,
+    # extra labels or annotations, Secret type or event sync.
+    - expression: >-
+        !variables.isVSS || request.operation == 'DELETE' ||
+        (has(object.spec) && has(object.spec.destination) &&
+         object.spec.?vaultAuthRef.orValue('') == 'vault-reader' &&
+         object.spec.?mount.orValue('') == 'kv' &&
+         object.spec.?type.orValue('') == 'kv-v2' &&
+         object.spec.?path.orValue('') == request.namespace + '/' + object.metadata.name &&
+         object.spec.?refreshAfter.orValue('') == '60s' &&
+         object.spec.?hmacSecretData.orValue(true) == true &&
+         object.spec.destination.?name.orValue('') == object.metadata.name &&
+         object.spec.destination.?create.orValue(false) == true &&
+         object.spec.destination.?overwrite.orValue(false) == false &&
+         !has(object.spec.destination.type) && !has(object.spec.destination.annotations) &&
+         !has(object.spec.destination.labels) && !has(object.spec.destination.transformation) &&
+         !has(object.spec.namespace) && !has(object.spec.version) &&
+         !has(object.spec.rolloutRestartTargets) && !has(object.spec.syncConfig))
+      reason: Forbidden
+      message: "idp-operator VaultStaticSecrets must match the operator's fixed spec (vaultAuthRef vault-reader, kv-v2 mount kv, path <namespace>/<name>, refreshAfter 60s, destination <name> with create true and overwrite false, no other fields)"
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding

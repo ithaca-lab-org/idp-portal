@@ -66,25 +66,35 @@ rules:
 - apiGroups:
   - idp.ithaca-idp.com
   resources:
-  - teamnamespaces
+  - managedsecrets
   verbs:
   - get
   - list
-  - update
   - watch
 - apiGroups:
   - idp.ithaca-idp.com
   resources:
+  - managedsecrets/finalizers
   - teamnamespaces/finalizers
   verbs:
   - update
 - apiGroups:
   - idp.ithaca-idp.com
   resources:
+  - managedsecrets/status
   - teamnamespaces/status
   verbs:
   - get
   - update
+- apiGroups:
+  - idp.ithaca-idp.com
+  resources:
+  - teamnamespaces
+  verbs:
+  - get
+  - list
+  - update
+  - watch
 - apiGroups:
   - networking.k8s.io
   resources:
@@ -147,6 +157,16 @@ rules:
   verbs:
   - delete
   - update
+- apiGroups:
+  - secrets.hashicorp.com
+  resources:
+  - vaultstaticsecrets
+  verbs:
+  - create
+  - get
+  - list
+  - update
+  - watch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
