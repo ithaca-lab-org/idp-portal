@@ -20,7 +20,16 @@ const (
 	PhaseFailed  Phase = "Failed"
 )
 
-const ConditionReady = "Ready"
+const (
+	ConditionReady = "Ready"
+	// ConditionVaultReady reports the per-namespace Vault access objects
+	// (ServiceAccount vault-reader, VaultAuth vault-reader). Only set when the
+	// operator runs with VAULT_ENABLED=true.
+	ConditionVaultReady = "VaultReady"
+	// ConditionVaultPurgePending is True while a deleted TeamNamespace waits for
+	// its Vault KV data (kv/<name>/) to be purged.
+	ConditionVaultPurgePending = "VaultPurgePending"
+)
 
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.orderId) || (has(self.orderId) && self.orderId == oldSelf.orderId)",message="orderId is immutable once set"
 type TeamNamespaceSpec struct {
@@ -58,6 +67,11 @@ type TeamNamespaceStatus struct {
 	// namespace managed by this resource, set once it exists.
 	// +optional
 	Namespace string `json:"namespace,omitempty"`
+	// vaultPurgedAt is when the operator purged leftover Vault KV data under
+	// kv/<name>/ before creating the Vault access objects (VAULT_ENABLED only).
+	// It is set once per TeamNamespace; later reconciles never purge again.
+	// +optional
+	VaultPurgedAt *metav1.Time `json:"vaultPurgedAt,omitempty"`
 	// +optional
 	// +listType=map
 	// +listMapKey=type
@@ -65,6 +79,12 @@ type TeamNamespaceStatus struct {
 }
 
 // TeamNamespace requests a guarded namespace whose name equals metadata.name.
+// With VAULT_ENABLED=true the operator also adds the finalizer
+// idp.ithaca-idp.com/vault-purge, which deletes all Vault KV data under
+// kv/<name>/ before the resource goes away. If Vault is unreachable it retries
+// (condition VaultPurgePending) and gives up after VAULT_PURGE_GIVE_UP_AFTER
+// (default 30m). An admin can skip the purge at once by removing that finalizer
+// with a JSON patch on metadata.finalizers (see the operator README).
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster,shortName=tns
@@ -75,7 +95,7 @@ type TeamNamespaceStatus struct {
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 // +kubebuilder:validation:XValidation:rule="self.metadata.name.size() <= 40",message="name must be at most 40 characters"
 // +kubebuilder:validation:XValidation:rule="self.metadata.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')",message="name must be a DNS-1123 label"
-// +kubebuilder:validation:XValidation:rule="!(self.metadata.name in ['default', 'argocd', 'cert-manager', 'tailscale', 'identity', 'idp-system', 'echo']) && !['kube-', 'istio-', 'gke-'].exists(p, self.metadata.name.startsWith(p))",message="name is reserved for the platform"
+// +kubebuilder:validation:XValidation:rule="!(self.metadata.name in ['default', 'argocd', 'cert-manager', 'tailscale', 'identity', 'idp-system', 'echo', 'vault']) && !['kube-', 'istio-', 'gke-', 'vault-'].exists(p, self.metadata.name.startsWith(p))",message="name is reserved for the platform"
 type TeamNamespace struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

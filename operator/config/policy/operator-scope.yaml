@@ -16,7 +16,8 @@ spec:
       - apiGroups: [""]
         apiVersions: ["*"]
         operations: ["CREATE", "UPDATE", "DELETE"]
-        resources: ["namespaces", "namespaces/*", "resourcequotas", "resourcequotas/*", "limitranges", "limitranges/*"]
+        resources: ["namespaces", "namespaces/*", "resourcequotas", "resourcequotas/*", "limitranges", "limitranges/*",
+                    "serviceaccounts", "serviceaccounts/*"]
       - apiGroups: ["networking.k8s.io"]
         apiVersions: ["*"]
         operations: ["CREATE", "UPDATE", "DELETE"]
@@ -25,6 +26,11 @@ spec:
         apiVersions: ["*"]
         operations: ["CREATE", "UPDATE", "DELETE"]
         resources: ["rolebindings", "rolebindings/*"]
+      # VSO VaultAuth (VAULT_ENABLED=true). Harmless while the CRD is absent.
+      - apiGroups: ["secrets.hashicorp.com"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["vaultauths", "vaultauths/*"]
   matchConditions:
     - name: is-idp-operator
       expression: "request.userInfo.username == 'system:serviceaccount:idp-system:idp-operator'"
@@ -68,8 +74,8 @@ spec:
     # will later deploy into.
     - expression: >-
         !variables.isNamespace || request.operation != 'CREATE' ||
-        (!(request.name in ['default', 'argocd', 'cert-manager', 'tailscale', 'identity', 'idp-system', 'echo']) &&
-         !['kube-', 'istio-', 'gke-'].exists(p, request.name.startsWith(p)))
+        (!(request.name in ['default', 'argocd', 'cert-manager', 'tailscale', 'identity', 'idp-system', 'echo', 'vault']) &&
+         !['kube-', 'istio-', 'gke-', 'vault-'].exists(p, request.name.startsWith(p)))
       reason: Forbidden
       messageExpression: "'idp-operator may not create reserved namespace ' + request.name"
     # Without this, the operator could relax Pod Security on a namespace it owns.
@@ -90,7 +96,9 @@ spec:
           'resourcequotas': ['idp-quota'],
           'limitranges': ['idp-limits'],
           'networkpolicies': ['idp-default-deny-ingress', 'idp-allow-same-namespace'],
-          'rolebindings': ['idp-namespace-admin']
+          'rolebindings': ['idp-namespace-admin'],
+          'serviceaccounts': ['vault-reader'],
+          'vaultauths': ['vault-reader']
         }[request.resource.resource]
       reason: Forbidden
       messageExpression: "'idp-operator may not write ' + request.resource.resource + ' named ' + request.name"
@@ -105,6 +113,27 @@ spec:
          object.subjects.all(s, s.kind == 'User' && !s.name.startsWith('system:') && s.name.contains('@')))
       reason: Forbidden
       message: "idp-operator RoleBindings must bind ClusterRole admin to exactly one User subject (no groups, service accounts or system: users)"
+    # The VaultAuth is pinned to exactly the spec the controller writes
+    # (desiredVaultAuthSpec): it can only log in as the namespace's own
+    # vault-reader with role ns-reader through the shared connection, never as
+    # another ServiceAccount, role, method, Vault namespace or with extra
+    # headers/params. Field names follow the VSO 1.6.2 VaultAuth CRD.
+    - expression: >-
+        request.resource.resource != 'vaultauths' || request.operation == 'DELETE' ||
+        (has(object.spec) && has(object.spec.kubernetes) &&
+         object.spec.?method.orValue('') == 'kubernetes' &&
+         object.spec.?mount.orValue('') == 'kubernetes' &&
+         object.spec.?vaultConnectionRef.orValue('') == 'vault-secrets-operator/idp-vault' &&
+         object.spec.kubernetes.?role.orValue('') == 'ns-reader' &&
+         object.spec.kubernetes.?serviceAccount.orValue('') == 'vault-reader' &&
+         object.spec.kubernetes.?audiences.orValue([]) == ['vault'] &&
+         object.spec.kubernetes.?tokenExpirationSeconds.orValue(0) == 600 &&
+         !has(object.spec.allowedNamespaces) && !has(object.spec.headers) && !has(object.spec.params) &&
+         !has(object.spec.namespace) && !has(object.spec.appRole) && !has(object.spec.aws) &&
+         !has(object.spec.gcp) && !has(object.spec.jwt) && !has(object.spec.storageEncryption) &&
+         !has(object.spec.vaultAuthGlobalRef))
+      reason: Forbidden
+      message: "idp-operator VaultAuths must match the operator's fixed spec (kubernetes auth as vault-reader, role ns-reader, connection vault-secrets-operator/idp-vault, audience vault, 600s tokens, no other fields)"
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding

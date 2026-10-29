@@ -14,20 +14,56 @@ For a cluster-scoped `TeamNamespace` named `<name>`:
 | NetworkPolicy | `idp-default-deny-ingress`, `idp-allow-same-namespace` | deny all ingress, then allow from pods in the same namespace |
 | RoleBinding | `idp-namespace-admin` | ClusterRole `admin` for `User: <spec.owner>` |
 
+With `VAULT_ENABLED=true` (see [Vault access](#vault-access)) two more objects are created in the namespace:
+
+| Object | Name | Notes |
+|---|---|---|
+| ServiceAccount | `vault-reader` | `automountServiceAccountToken: false`; VSO requests its tokens (audience `vault`) through the TokenRequest API |
+| VaultAuth (`secrets.hashicorp.com/v1beta1`) | `vault-reader` | `method: kubernetes`, `mount: kubernetes`, `kubernetes: {role: ns-reader, serviceAccount: vault-reader, audiences: [vault], tokenExpirationSeconds: 600}`, `vaultConnectionRef: vault-secrets-operator/idp-vault`, no `allowedNamespaces` |
+
 Child specs are overwritten on every reconcile, so manual edits are reverted. Extra labels on the namespace are kept. Deleting the CR deletes the namespace only if it still carries this CR's labels.
 
 ## CRD fields (`idp.ithaca-idp.com/v1alpha1`)
 
 | Field | Rules |
 |---|---|
-| `metadata.name` | DNS-1123 label, at most 40 chars, not reserved (`default`, `kube-*`, `istio-*`, `gke-*`, `argocd`, `cert-manager`, `tailscale`, `identity`, `idp-system`, `echo`) |
+| `metadata.name` | DNS-1123 label, at most 40 chars, not reserved (`default`, `kube-*`, `istio-*`, `gke-*`, `argocd`, `cert-manager`, `tailscale`, `identity`, `idp-system`, `echo`, `vault`, `vault-*`) |
 | `spec.businessUnit` | required DNS label, immutable |
 | `spec.owner` | required email (CEL), mutable (ownership transfer) |
 | `spec.size` | `small` (default) or `medium` |
 | `spec.orderId` | optional, immutable once set |
-| `status` | `phase` (Pending, Ready, Failed), `observedGeneration`, `namespace`, `conditions[type=Ready]` |
+| `status` | `phase` (Pending, Ready, Failed), `observedGeneration`, `namespace`, `conditions[type=Ready]`; with Vault enabled also `vaultPurgedAt`, `VaultReady` and, while a deletion waits for Vault, `VaultPurgePending` |
 
 Failure reasons on the `Ready` condition: `ReservedName`, `NamespaceConflict` (a namespace with that name exists and is not managed by this CR), `NamespaceTerminating`, `ReconcileError`.
+
+## Vault access
+
+Off by default. With `VAULT_ENABLED=false` the operator creates no Vault objects, adds no Vault finalizer and never calls Vault. The Vault side (policies `ns-reader`/`ns-purge`, roles `ns-reader`/`idp-operator-purge`, the shared VaultConnection) is configured by idp-gitops (`workloads/vault/README.md`, "Per-namespace access"); the operator gets no Vault write access for tenant access.
+
+| Env | Default | Meaning |
+|---|---|---|
+| `VAULT_ENABLED` | `false` | turn the integration on |
+| `VAULT_ADDR` | `http://vault.vault.svc.cluster.local:8200` | Vault API (purge only) |
+| `VAULT_PURGE_ROLE` | `idp-operator-purge` | Kubernetes-auth role for the purge login |
+| `VAULT_AUTH_MOUNT` | `kubernetes` | auth mount for the purge login (the VaultAuth `mount` is fixed to `kubernetes` by the contract and the admission policy) |
+| `VAULT_KV_MOUNT` | `kv` | KV v2 mount holding `<ns>/...` |
+| `VAULT_TOKEN_PATH` | `/var/run/secrets/vault/token` | projected ServiceAccount token with audience `vault` |
+| `VAULT_PURGE_GIVE_UP_AFTER` | `30m` | stop retrying a failing purge this long after deletion |
+
+**Purge before access.** Before the ServiceAccount and VaultAuth exist, the operator runs the same purge of `kv/<ns>/` once, so a namespace never inherits secrets left by an earlier namespace of the same name (for example after a give-up below). Until it succeeds nothing granting Vault access is created: `VaultReady=False` (reason `PurgePending`) and a backoff requeue; the namespace itself is already usable (`Ready=True`). Success is recorded in `status.vaultPurgedAt`, so later reconciles, or a tenant deleting its VaultAuth, never purge live data.
+
+**Purge on deletion.** A TeamNamespace then carries a second finalizer, `idp.ithaca-idp.com/vault-purge`. On deletion the operator first deletes the namespace (as before, it does not wait for Vault), then logs in (`POST /v1/auth/<mount>/login`, role `VAULT_PURGE_ROLE`, JWT read fresh from `VAULT_TOKEN_PATH` each time), walks `GET /v1/kv/metadata/<ns>?list=true` recursively and sends `DELETE /v1/kv/metadata/<ns>/<key>` per key (all versions and metadata), then revokes its token. A 404 (no data) is success. This stops a re-created namespace with the same name from inheriting old secrets: the old TeamNamespace, and so the name, is held until the purge is done.
+
+- Guards: the namespace name must be a DNS-1123 label and not reserved before it goes into a path (checked inside the purger too); on deletion the purge is skipped when a namespace of that name exists but is not managed by the TeamNamespace. Keys returned by Vault that are empty, `.`, `..` or contain `/` are skipped and reported; everything else is escaped per segment (`url.PathEscape`). Subtrees deeper than 32 levels are skipped and reported; siblings are still purged and the pass then fails so it retries. Keys are capped at 5000 per pass (later passes continue); 10 s per request, 2 min per pass; redirects are not followed; tokens, the JWT and response bodies are never logged or put into status.
+- Vault down or failing: the finalizer stays, condition `VaultPurgePending=True` (reason `VaultPurgeRetrying`) shows the error and deadline, and the operator retries with backoff (10 s growing to 5 min).
+- Reserved names include `vault` and `vault-*` (the platform's Vault namespaces), because the purge role may delete anywhere under `kv/metadata/`.
+- Give-up: once `VAULT_PURGE_GIVE_UP_AFTER` has passed since the deletion timestamp, the operator logs an error and removes the finalizer anyway, so a destroyed Vault cannot block deletion forever. Data left in that Vault is orphaned (in this lab, Vault is rebuilt empty on `make up`). A same-name namespace created after a give-up is still protected by the purge before access.
+- Force removal now (admin, e.g. Vault is gone for good). The `test` op makes the patch fail unless index 0 is the Vault finalizer (the namespace finalizer is normally gone by then; if not, check `.metadata.finalizers` and adjust the index):
+  `kubectl patch tns <name> --type=json -p '[{"op":"test","path":"/metadata/finalizers/0","value":"idp.ithaca-idp.com/vault-purge"},{"op":"remove","path":"/metadata/finalizers/0"}]'`.
+  Purge `kv/<name>/` by hand later if Vault returns.
+- If the integration is turned off while a TeamNamespace with the Vault finalizer is deleting, the finalizer is dropped without a purge.
+
+**Deployment needs** (idp-gitops `workloads/idp-operator`): the `VAULT_*` env above (at least `VAULT_ENABLED=true`), a projected `serviceAccountToken` volume (`audience: vault`, `path: token`, `expirationSeconds: 600`) mounted read-only at `/var/run/secrets/vault`, and egress to Vault on 8200. No extra RBAC: the projected token avoids `serviceaccounts/token` rights.
 
 ## Develop
 
@@ -42,6 +78,7 @@ Tool versions are pinned in the `Makefile` and run with `go run`. Generated file
 
 - The child objects live in namespaces created at runtime, so `create` on resourcequotas, limitranges, networkpolicies and rolebindings is cluster-wide. `update` (and `delete` on rolebindings) is limited by `resourceNames` to the operator's fixed child names.
 - Creating a RoleBinding to `admin` requires holding every permission in `admin` or `bind` on it. The operator gets `bind` on `clusterroles` with `resourceNames: [admin]` only; no `escalate`, no wildcards.
+- ServiceAccounts and VaultAuths (`secrets.hashicorp.com`): `create` cluster-wide, `update`/`delete` pinned to `vault-reader`. No `serviceaccounts/token`. The rules exist even with Vault off; the admission policy confines them.
 - Namespaces need `create`, `update` and `delete` cluster-wide; RBAC cannot scope them by label, so the label check in code is the guard.
 - `tokenreviews`/`subjectaccessreviews` `create` protect the HTTPS metrics endpoint; leases and events are a namespaced Role in `idp-system` for leader election.
 
@@ -50,7 +87,8 @@ Tool versions are pinned in the `Makefile` and run with `go run`. Generated file
 `config/policy/operator-scope.yaml` holds a `ValidatingAdmissionPolicy` and its binding (`idp-operator-scope`, `failurePolicy: Fail`, action `Deny`). `matchConditions` limit it to `system:serviceaccount:idp-system:idp-operator`, so other users are not evaluated. Deploy it before (or with) the operator. For that user it enforces:
 
 - Namespaces: `CREATE` only with `managed-by=idp-operator` and `team-namespace=<name>`, and not for a reserved name; `UPDATE`/`DELETE` only if the stored object (`oldObject`) already carries both labels, and an `UPDATE` cannot change or drop them. PSS `enforce` must stay `baseline` or `restricted`. Subresources are included.
-- ResourceQuotas, LimitRanges, NetworkPolicies, RoleBindings: only in namespaces carrying both labels, and only under the fixed child names.
+- ResourceQuotas, LimitRanges, NetworkPolicies, RoleBindings, ServiceAccounts, VaultAuths: only in namespaces carrying both labels, and only under the fixed child names (ServiceAccount and VaultAuth: `vault-reader`). Subresources such as `serviceaccounts/token` fall under the same rule.
+- VaultAuths: the spec must be exactly what the controller writes (`method`/`mount` kubernetes, `vaultConnectionRef: vault-secrets-operator/idp-vault`, role `ns-reader`, ServiceAccount `vault-reader`, audiences `[vault]`, `tokenExpirationSeconds: 600`) and none of `allowedNamespaces`, `headers`, `params`, `namespace`, `appRole`, `aws`, `gcp`, `jwt`, `storageEncryption`, `vaultAuthGlobalRef` (the VSO 1.6.2 field set), so the operator cannot point a VaultAuth at the purge role, another ServiceAccount, connection or Vault namespace.
 - RoleBindings: roleRef `ClusterRole admin`, exactly one `User` subject that contains `@` and does not start with `system:` (no groups, ServiceAccounts or `system:serviceaccount:...` users).
 
 What it does not protect:
@@ -61,7 +99,7 @@ What it does not protect:
 - `namespaceObject` comes from the apiserver's informer cache, so for a short window after an admin removes the labels the operator may still write children in that namespace.
 - Writes to other kinds are left to RBAC (the policy is not an allowlist of everything the operator can touch).
 
-`internal/controller/policy_envtest_test.go` installs `config/rbac` and `config/policy` in envtest (RBAC on), impersonates the ServiceAccount, runs the reconciler end to end, checks the denials with server-side dry-run, and removes the binding to show those denials come from the policy and not RBAC.
+envtest installs a test-only stub of the VSO VaultAuth CRD (`test/crds/`, typed fields only, so misspelt fields are pruned and fail the tests); the real CRD comes from the VSO chart. `internal/controller/policy_envtest_test.go` installs `config/rbac` and `config/policy` in envtest (RBAC on), impersonates the ServiceAccount, runs the reconciler end to end, checks the denials with server-side dry-run, and removes the binding to show those denials come from the policy and not RBAC.
 
 ## Known limits
 
@@ -70,4 +108,4 @@ What it does not protect:
 - The informer cache watches all namespaces, quotas, limit ranges, network policies and role bindings cluster-wide.
 - The finalizer is removed once the namespace delete is accepted, not when it has finished terminating; a CR recreated meanwhile waits in `Pending`.
 - In ambient mode, traffic from the Istio ingress gateway or waypoints is blocked by the default-deny policy until a later order adds an allow rule.
-- Grafana folder and Vault path/policy/group from the design are not implemented yet.
+- Grafana folder is not implemented yet. Vault per-namespace access is behind `VAULT_ENABLED` (above); with it on, the cache also watches ServiceAccounts and VaultAuths cluster-wide, and the VSO CRD must exist before the operator starts.

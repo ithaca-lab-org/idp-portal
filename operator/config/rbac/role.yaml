@@ -17,6 +17,7 @@ rules:
   resources:
   - limitranges
   - resourcequotas
+  - serviceaccounts
   verbs:
   - create
   - get
@@ -40,6 +41,15 @@ rules:
   resources:
   - resourcequotas
   verbs:
+  - update
+- apiGroups:
+  - ""
+  resourceNames:
+  - vault-reader
+  resources:
+  - serviceaccounts
+  verbs:
+  - delete
   - update
 - apiGroups:
   - authentication.k8s.io
@@ -116,6 +126,24 @@ rules:
   - idp-namespace-admin
   resources:
   - rolebindings
+  verbs:
+  - delete
+  - update
+- apiGroups:
+  - secrets.hashicorp.com
+  resources:
+  - vaultauths
+  verbs:
+  - create
+  - get
+  - list
+  - watch
+- apiGroups:
+  - secrets.hashicorp.com
+  resourceNames:
+  - vault-reader
+  resources:
+  - vaultauths
   verbs:
   - delete
   - update

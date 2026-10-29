@@ -1,16 +1,20 @@
 package controller
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
+	authenticationv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -20,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/rest"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	idpv1alpha1 "github.com/ithaca-lab-org/idp-portal/operator/api/v1alpha1"
@@ -260,7 +265,7 @@ func TestPolicyDeniesOperatorOutsideManagedNamespaces(t *testing.T) {
 			LabelManagedBy: ManagedByValue, LabelTeamNamespace: "team-y", "pod-security.kubernetes.io/enforce": "baseline",
 		}}}
 		wantPolicyDenial(t, "create with mismatched team label", op.Create(ctx, wrong, dry))
-		reserved := []string{"kube-evil", "istio-evil", "gke-evil"}
+		reserved := []string{"kube-evil", "istio-evil", "gke-evil", "vault-evil"}
 		for n := range reservedNames {
 			reserved = append(reserved, n)
 		}
@@ -391,8 +396,133 @@ func TestPolicyIsWhatDenies(t *testing.T) {
 	if err := op.Update(ctx, adopt, dry); err != nil {
 		t.Errorf("without the policy, RBAC should allow labelling a foreign namespace (dry-run): %v", err)
 	}
+	if err := op.Create(ctx, &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: VaultReaderServiceAccount, Namespace: "kube-system"}}, dry); err != nil {
+		t.Errorf("without the policy, RBAC should allow ServiceAccount vault-reader in kube-system (dry-run): %v", err)
+	}
+	if err := op.Create(ctx, vaultAuthFor(plain, "anything"), dry); err != nil {
+		t.Errorf("without the policy, RBAC should allow any VaultAuth in an unlabelled namespace (dry-run): %v", err)
+	}
 	err := op.Create(ctx, clusterAdminRB(plain), dry)
 	if !apierrors.IsForbidden(err) || isPolicyDenial(err) {
 		t.Errorf("cluster-admin binding must still be refused by RBAC alone, got %v", err)
+	}
+}
+
+type purgerFunc func(ctx context.Context, ns string) error
+
+func (f purgerFunc) Purge(ctx context.Context, ns string) error { return f(ctx, ns) }
+
+func vaultAuthFor(ns, name string) *unstructured.Unstructured {
+	va := newVaultAuth(ns)
+	va.SetName(name)
+	va.Object["spec"] = desiredVaultAuthSpec()
+	return va
+}
+
+// TestOperatorVaultAccessUnderRBACAndPolicy runs the reconciler with Vault
+// enabled as the ServiceAccount, then checks that the policy confines the
+// ServiceAccount and VaultAuth writes to the fixed names in managed namespaces.
+func TestOperatorVaultAccessUnderRBACAndPolicy(t *testing.T) {
+	op := operatorClient(t)
+	var purged []string
+	o := &VaultOptions{AuthMount: defaultVaultAuthMount, GiveUpAfter: time.Minute,
+		Purger: purgerFunc(func(_ context.Context, ns string) error { purged = append(purged, ns); return nil })}
+	managed := "team-vault-rbac"
+	if err := k8s.Create(ctx, newTN(managed)); err != nil {
+		t.Fatal(err)
+	}
+	reconcileVault(t, op, o, managed, &syncBuffer{})
+	assertStatus(t, getTN(t, managed), idpv1alpha1.PhaseReady, ReasonReconciled)
+	get(t, &corev1.ServiceAccount{}, managed, VaultReaderServiceAccount)
+	getVaultAuth(t, managed)
+
+	plain := "plain-ns"
+	ensurePlainNamespace(t, plain)
+	dry := client.DryRunAll
+	sa := func(ns, name string) *corev1.ServiceAccount {
+		return &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}
+	}
+
+	t.Run("serviceaccounts", func(t *testing.T) {
+		wantPolicyDenial(t, "vault-reader in kube-system", op.Create(ctx, sa("kube-system", VaultReaderServiceAccount), dry))
+		wantPolicyDenial(t, "vault-reader in unlabelled ns", op.Create(ctx, sa(plain, VaultReaderServiceAccount), dry))
+		wantPolicyDenial(t, "other SA in managed ns", op.Create(ctx, sa(managed, "builder"), dry))
+		// envtest runs no ServiceAccount controller, so create "default" as admin.
+		// RBAC pins update to vault-reader, so this one is refused before admission.
+		if err := k8s.Create(ctx, sa(managed, "default")); err != nil && !apierrors.IsAlreadyExists(err) {
+			t.Fatal(err)
+		}
+		d := get(t, &corev1.ServiceAccount{}, managed, "default")
+		d.AutomountServiceAccountToken = ptr.To(true)
+		wantForbidden(t, "update default SA in managed ns", op.Update(ctx, d, dry))
+		wantForbidden(t, "TokenRequest for vault-reader", op.SubResource("token").Create(ctx,
+			sa(managed, VaultReaderServiceAccount), &authenticationv1.TokenRequest{
+				Spec: authenticationv1.TokenRequestSpec{Audiences: []string{"vault"}},
+			}))
+		wantForbidden(t, "deletecollection serviceaccounts", op.DeleteAllOf(ctx, &corev1.ServiceAccount{}, client.InNamespace(managed), dry))
+	})
+
+	t.Run("vaultauths", func(t *testing.T) {
+		wantPolicyDenial(t, "VaultAuth in kube-system", op.Create(ctx, vaultAuthFor("kube-system", VaultAuthName), dry))
+		wantPolicyDenial(t, "VaultAuth in unlabelled ns", op.Create(ctx, vaultAuthFor(plain, VaultAuthName), dry))
+		wantPolicyDenial(t, "VaultAuth with a foreign name", op.Create(ctx, vaultAuthFor(managed, "second"), dry))
+		for what, mutate := range map[string]func(*unstructured.Unstructured){
+			"purge role": func(u *unstructured.Unstructured) {
+				_ = unstructured.SetNestedField(u.Object, "idp-operator-purge", "spec", "kubernetes", "role")
+			},
+			"other SA": func(u *unstructured.Unstructured) {
+				_ = unstructured.SetNestedField(u.Object, "default", "spec", "kubernetes", "serviceAccount")
+			},
+			"jwt method":     func(u *unstructured.Unstructured) { _ = unstructured.SetNestedField(u.Object, "jwt", "spec", "method") },
+			"no kubernetes":  func(u *unstructured.Unstructured) { unstructured.RemoveNestedField(u.Object, "spec", "kubernetes") },
+			"no spec at all": func(u *unstructured.Unstructured) { delete(u.Object, "spec") },
+			"other connection": func(u *unstructured.Unstructured) {
+				_ = unstructured.SetNestedField(u.Object, "evil/conn", "spec", "vaultConnectionRef")
+			},
+			"other mount": func(u *unstructured.Unstructured) {
+				_ = unstructured.SetNestedField(u.Object, "other", "spec", "mount")
+			},
+			"vault namespace": func(u *unstructured.Unstructured) {
+				_ = unstructured.SetNestedField(u.Object, "admin", "spec", "namespace")
+			},
+			"other audience": func(u *unstructured.Unstructured) {
+				_ = unstructured.SetNestedStringSlice(u.Object, []string{"vault", "https://kubernetes.default.svc"}, "spec", "kubernetes", "audiences")
+			},
+			"long tokens": func(u *unstructured.Unstructured) {
+				_ = unstructured.SetNestedField(u.Object, int64(86400), "spec", "kubernetes", "tokenExpirationSeconds")
+			},
+			"headers": func(u *unstructured.Unstructured) {
+				_ = unstructured.SetNestedStringMap(u.Object, map[string]string{"X-Vault-Namespace": "root"}, "spec", "headers")
+			},
+			"params": func(u *unstructured.Unstructured) {
+				_ = unstructured.SetNestedStringMap(u.Object, map[string]string{"role": "x"}, "spec", "params")
+			},
+			"allowedNamespaces": func(u *unstructured.Unstructured) {
+				_ = unstructured.SetNestedStringSlice(u.Object, []string{"*"}, "spec", "allowedNamespaces")
+			},
+			"vaultAuthGlobalRef": func(u *unstructured.Unstructured) {
+				_ = unstructured.SetNestedField(u.Object, map[string]any{"name": "g"}, "spec", "vaultAuthGlobalRef")
+			},
+			"jwt block": func(u *unstructured.Unstructured) {
+				_ = unstructured.SetNestedField(u.Object, map[string]any{"role": "x"}, "spec", "jwt")
+			},
+		} {
+			va := getVaultAuth(t, managed)
+			mutate(va)
+			wantPolicyDenial(t, "update VaultAuth: "+what, op.Update(ctx, va, dry))
+		}
+		wantForbidden(t, "deletecollection vaultauths", op.DeleteAllOf(ctx, newVaultAuth(""), client.InNamespace(managed), dry))
+	})
+
+	if err := k8s.Delete(ctx, getTN(t, managed)); err != nil {
+		t.Fatal(err)
+	}
+	reconcileVault(t, op, o, managed, &syncBuffer{})
+	if err := k8s.Get(ctx, types.NamespacedName{Name: managed}, &idpv1alpha1.TeamNamespace{}); !apierrors.IsNotFound(err) {
+		t.Errorf("TeamNamespace still present: %v", err)
+	}
+	// Once before access was granted, once on deletion.
+	if !slices.Equal(purged, []string{managed, managed}) {
+		t.Errorf("purged = %v", purged)
 	}
 }
