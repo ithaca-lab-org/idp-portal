@@ -7,3 +7,12 @@ label { display: grid; gap: .25rem; }
 table { border-collapse: collapse; width: 100%; }
 th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid #ddd; }
 [role="alert"] { color: #b00020; }
+nav { display: flex; gap: .5rem; margin: 1rem 0; }
+nav button[aria-current="page"] { font-weight: bold; text-decoration: underline; }
+.secret-form { max-width: 40rem; }
+.kv-row { display: grid; grid-template-columns: 1fr 1fr auto; gap: .5rem; align-items: end; border: 0; padding: 0; margin: 0; }
+.actions { display: flex; gap: .5rem; }
+.hint { color: #555; margin: 0; }
+.confirm { border: 1px solid #b00020; padding: .75rem; margin: 1rem 0; }
+.howto { background: #f5f5f5; padding: .75rem; margin-top: 2rem; }
+.howto pre { background: #fff; padding: .5rem; overflow-x: auto; }

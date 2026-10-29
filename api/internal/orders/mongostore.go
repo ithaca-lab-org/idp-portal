@@ -150,3 +150,44 @@ func (s *MongoStore) CountActiveByBusinessUnit(ctx context.Context, bu string) (
 func (s *MongoStore) CountActiveByOwner(ctx context.Context, ownerSub string) (int, error) {
 	return s.countActive(ctx, "ownerSub", ownerSub)
 }
+
+// CompleteNamespace returns the COMPLETE namespace order for name, or ErrNotFound.
+func (s *MongoStore) CompleteNamespace(ctx context.Context, name string) (*Order, error) {
+	ctx, cancel := context.WithTimeout(ctx, opTimeout)
+	defer cancel()
+	var o Order
+	err := s.orders.FindOne(ctx, bson.D{{Key: "kind", Value: KindNamespace}, {Key: "name", Value: name},
+		{Key: "status", Value: string(StatusComplete)}}).Decode(&o)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &o, nil
+}
+
+// CompleteNamespacesFor lists COMPLETE namespace orders whose business unit is one of bus,
+// ordered by name. An empty bus gives an empty list without a query.
+func (s *MongoStore) CompleteNamespacesFor(ctx context.Context, bus []string, limit int) ([]Order, error) {
+	if len(bus) == 0 {
+		return nil, nil
+	}
+	in := bson.A{}
+	for _, b := range bus {
+		in = append(in, b)
+	}
+	ctx, cancel := context.WithTimeout(ctx, opTimeout)
+	defer cancel()
+	cur, err := s.orders.Find(ctx, bson.D{{Key: "kind", Value: KindNamespace}, {Key: "status", Value: string(StatusComplete)},
+		{Key: "businessUnit", Value: bson.D{{Key: "$in", Value: in}}}},
+		options.Find().SetSort(bson.D{{Key: "name", Value: 1}}).SetLimit(int64(limit)))
+	if err != nil {
+		return nil, err
+	}
+	var out []Order
+	if err := cur.All(ctx, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}

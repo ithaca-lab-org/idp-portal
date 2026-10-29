@@ -129,3 +129,35 @@ func (m *MemStore) CountActiveByOwner(_ context.Context, ownerSub string) (int, 
 	defer m.mu.Unlock()
 	return m.count(func(o *Order) bool { return o.OwnerSub == ownerSub }), nil
 }
+
+// CompleteNamespace returns the COMPLETE namespace order for name, or ErrNotFound. The unique
+// active-name index guarantees there is at most one.
+func (m *MemStore) CompleteNamespace(_ context.Context, name string) (*Order, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, o := range m.orders {
+		if o.Kind == KindNamespace && o.Name == name && o.Status == StatusComplete {
+			c := *o
+			return &c, nil
+		}
+	}
+	return nil, ErrNotFound
+}
+
+// CompleteNamespacesFor lists COMPLETE namespace orders whose business unit is one of bus,
+// ordered by name.
+func (m *MemStore) CompleteNamespacesFor(_ context.Context, bus []string, limit int) ([]Order, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []Order
+	for _, o := range m.orders {
+		if o.Kind == KindNamespace && o.Status == StatusComplete && contains(bus, o.BusinessUnit) {
+			out = append(out, *o)
+		}
+	}
+	sort.Slice(out, func(a, b int) bool { return out[a].Name < out[b].Name })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}

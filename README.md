@@ -42,3 +42,20 @@ Rules enforced on `POST`:
 Flow: the order is stored as `PENDING` (number `ORD-<year>-<counter>`, one active order per name), then a `TeamNamespace` is created with the order id. A poller (every 5 s, `PENDING` orders only) and reads move the order to `COMPLETE` or `FAILED` from the resource's status. A resource that belongs to a different order, or never appears within 10 minutes, fails the order. A `COMPLETE` order whose namespace resource is later removed becomes `RELEASED` (checked every minute), which frees the name and the caps.
 
 Environment: `MONGO_URI` (secret, required; the server refuses to start without it), `MONGO_DB` (default `idp`), `ORDER_CAP_PER_BU`, `ORDER_CAP_PER_USER`. The pod's ServiceAccount needs `get`, `list`, `watch` and `create` on `teamnamespaces.idp.ithaca-idp.com` and nothing else.
+
+### Secrets page (off unless `SECRETS_ENABLED=true`; off, the routes answer 404 and the page is hidden)
+
+The portal is a write-only Vault client: it writes new KV v2 versions and deletes secrets, it never reads a value back. A user may manage the secrets of namespace `<ns>` only if a `COMPLETE` namespace order for `<ns>` belongs to one of the user's `groups`; anything else is a 404, so existence does not leak.
+
+- `GET /api/namespaces` (also returns the reserved secret names and prefixes, so the page validates like the API), `GET /api/namespaces/{ns}/secrets` (metadata: name, key names, version, updatedBy, updatedAt);
+- `PUT /api/namespaces/{ns}/secrets/{name}` with `{"data":{"KEY":"value"}}` replaces the whole secret and answers `{"name","keys","version"}`; with `?create=true` (the page's "New secret") it answers 409 if the secret exists. Name: DNS label of at most 40, not `vault-reader` or `default`, not starting with `default-token`, `vault-reader-token`, `sh-helm`, `kube-`, `istio-` or `idp-` (identical to the ManagedSecret CRD; a test fails if they drift); 1 to 20 keys matching `^[A-Za-z_][A-Za-z0-9_]{0,63}$`; values 1 to 8192 bytes, 64 KB in total; JSON only, 128 KB body limit, unknown fields rejected, same-origin only;
+- `DELETE /api/namespaces/{ns}/secrets/{name}` (204, idempotent);
+- 20 writes and 120 reads per user per minute.
+
+PUT first creates the `ManagedSecret` `<name>` in `<ns>` (empty spec; an existing one is fine; a name the CRD rejects is a 400, so a bad name never reaches Vault), then writes `kv/data/<ns>/<name>`, then stores the metadata in the Mongo collection `secrets`. Until the write lands, a resource without a value only shows a sync error. If Vault fails the answer is 502 and the metadata is untouched; repeating the request is idempotent. Metadata carries the id of the namespace's `COMPLETE` order: when a namespace is released and ordered again (possibly by another business unit), the previous team's metadata is never listed and is purged on the next list or write. DELETE removes the resource, then `kv/metadata/<ns>/<name>` (all versions), then the metadata. Audit events `secret.changed` / `secret.deleted` (namespace, name, actor, key names, version) go to the order-events topic. Values never reach MongoDB, the resource, logs, errors or events.
+
+Vault calls (the `portal-secrets` policy needs exactly these, and no read or list anywhere): `POST auth/<mount>/login`, `PUT <kv>/data/<ns>/<name>` (create, update on `<kv>/data/*`), `DELETE <kv>/metadata/<ns>/<name>` (delete on `<kv>/metadata/*`).
+
+Known limits: group membership comes from the session, so a group change applies after the next login (sessions last 15 minutes); writes to one secret are serialized by an in-process lock, which is correct for the single portal replica only.
+
+Environment: `SECRETS_ENABLED`, `VAULT_ADDR` (default `http://vault.vault.svc.cluster.local:8200`), `VAULT_SECRETS_ROLE` (`portal-secrets`), `VAULT_AUTH_MOUNT` (`kubernetes`), `VAULT_KV_MOUNT` (`kv`), `VAULT_TOKEN_PATH` (`/var/run/secrets/vault/token`, a projected ServiceAccount token with audience `vault`, re-read at every login). The ServiceAccount additionally needs `create`, `get` and `delete` on `managedsecrets.idp.ithaca-idp.com`.
