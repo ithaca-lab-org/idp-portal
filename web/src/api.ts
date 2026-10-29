@@ -72,3 +72,61 @@ export const placeOrder = (o: NamespaceOrder) =>
 /** Ends the local session; returns the Keycloak end-session URL to visit next, if any. */
 export const logout = async () =>
   (await call<{ end_session_url?: string }>("/auth/logout", { method: "POST" })).end_session_url;
+
+export interface Namespace {
+  name: string;
+  businessUnit: string;
+}
+
+export interface SecretMeta {
+  name: string;
+  keys: string[];
+  version: number;
+  updatedBy: string;
+  updatedAt: string;
+}
+
+export interface SecretResult {
+  name: string;
+  keys: string[];
+  version: number;
+}
+
+/** The namespaces the user may manage secrets in; null when the Secrets page is turned off (404). */
+export async function listNamespaces(): Promise<Namespace[] | null> {
+  try {
+    return (await call<{ namespaces: Namespace[] }>("/api/namespaces")).namespaces;
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404) return null;
+    throw e;
+  }
+}
+
+const seg = encodeURIComponent;
+
+export const listSecrets = async (ns: string) =>
+  (await call<{ secrets: SecretMeta[] }>(`/api/namespaces/${seg(ns)}/secrets`)).secrets;
+
+/** Replaces the whole secret. The response never contains values. */
+export const putSecret = (ns: string, name: string, data: Record<string, string>) =>
+  call<SecretResult>(`/api/namespaces/${seg(ns)}/secrets/${seg(name)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ data }),
+  });
+
+export async function deleteSecret(ns: string, name: string): Promise<void> {
+  const res = await fetch(`/api/namespaces/${seg(ns)}/secrets/${seg(name)}`, {
+    method: "DELETE",
+    credentials: "same-origin",
+  });
+  if (!res.ok) {
+    let msg = `request failed (${res.status})`;
+    try {
+      msg = ((await res.json()) as { error?: string }).error ?? msg;
+    } catch {
+      /* keep the generic message */
+    }
+    throw new ApiError(res.status, msg);
+  }
+}

@@ -21,6 +21,7 @@ import (
 	"github.com/ithaca-lab-org/idp-portal/api/internal/auth"
 	"github.com/ithaca-lab-org/idp-portal/api/internal/orders"
 	"github.com/ithaca-lab-org/idp-portal/api/internal/pubsubpub"
+	"github.com/ithaca-lab-org/idp-portal/api/internal/secrets"
 	"github.com/ithaca-lab-org/idp-portal/api/internal/session"
 	"github.com/ithaca-lab-org/idp-portal/api/internal/webui"
 )
@@ -45,6 +46,25 @@ func intEnv(name string, def int) int {
 		os.Exit(1)
 	}
 	return n
+}
+
+func envOr(name, def string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	return def
+}
+
+// vaultConfigFromEnv reads the Secrets page settings; unset variables keep the defaults.
+func vaultConfigFromEnv() secrets.VaultConfig {
+	d := secrets.DefaultVaultConfig()
+	return secrets.VaultConfig{
+		Addr:      envOr("VAULT_ADDR", d.Addr),
+		Role:      envOr("VAULT_SECRETS_ROLE", d.Role),
+		AuthMount: envOr("VAULT_AUTH_MOUNT", d.AuthMount),
+		KVMount:   envOr("VAULT_KV_MOUNT", d.KVMount),
+		TokenPath: envOr("VAULT_TOKEN_PATH", d.TokenPath),
+	}
 }
 
 func main() {
@@ -106,6 +126,7 @@ func main() {
 		os.Exit(1)
 	}
 	svc := orders.NewService(store, orders.DynamicCluster{Client: dyn}, intEnv("ORDER_CAP_PER_BU", 10), intEnv("ORDER_CAP_PER_USER", 5))
+	var events *pubsubpub.Publisher
 	// Order events are optional: without PUBSUB_TOPIC nothing is published.
 	if topic := os.Getenv("PUBSUB_TOPIC"); topic != "" {
 		pub, err := pubsubpub.New(ctx, mustEnv("PUBSUB_PROJECT"), topic)
@@ -115,14 +136,37 @@ func main() {
 		}
 		defer func() { _ = pub.Close() }()
 		svc.Events = pub
+		events = pub
 		slog.Info("publishing order events", "topic", topic)
+	}
+
+	// The Secrets page is off unless SECRETS_ENABLED is exactly "true"; off, its routes answer 404.
+	var secretSvc *secrets.Service
+	if os.Getenv("SECRETS_ENABLED") == "true" {
+		vc, err := secrets.NewVaultClient(vaultConfigFromEnv())
+		if err != nil {
+			slog.Error("vault config", "err", err)
+			os.Exit(1)
+		}
+		sstore := secrets.NewMongoStore(mongoClient.Database(dbName))
+		if err := sstore.EnsureIndexes(ctx); err != nil {
+			slog.Error("mongo secrets indexes", "err", err)
+			os.Exit(1)
+		}
+		secretSvc = secrets.NewService(vc, secrets.DynamicCluster{Client: dyn}, sstore, store)
+		if events != nil {
+			secretSvc.Events = events
+		}
+		slog.Info("secrets page enabled")
 	}
 	go svc.RunSyncer(ctx, 5*time.Second, 12) // COMPLETE orders are checked every minute
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	h.Routes(mux)
-	api.New(h, svc).Routes(mux)
+	apiHandler := api.New(h, svc)
+	apiHandler.Secrets = secretSvc
+	apiHandler.Routes(mux)
 	mux.Handle("GET /", webui.Handler())
 
 	addr := os.Getenv("LISTEN_ADDR")

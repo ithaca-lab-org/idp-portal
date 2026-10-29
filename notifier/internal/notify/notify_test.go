@@ -48,7 +48,10 @@ func TestUnusableEventsAreDroppedWithoutRetry(t *testing.T) {
 		"garbage":      `not json`,
 		"version":      `{"version":2,"type":"order.complete","owner":"a@x.com"}`,
 		"unknown type": `{"version":1,"type":"order.other","owner":"a@x.com"}`,
-		"no recipient": `{"version":1,"type":"order.complete","owner":"nobody"}`,
+		// the portal's secret audit events share the topic and must be ignored
+		"secret changed": `{"version":1,"type":"secret.changed","namespace":"team-a","name":"db","actor":"a@x.com","keys":["A"],"secretVersion":2,"at":"2026-10-29T00:00:00Z"}`,
+		"secret deleted": `{"version":1,"type":"secret.deleted","namespace":"team-a","name":"db","actor":"a@x.com","keys":["A"],"at":"2026-10-29T00:00:00Z"}`,
+		"no recipient":   `{"version":1,"type":"order.complete","owner":"nobody"}`,
 	} {
 		r := &rec{}
 		if err := (&Handler{Sender: r}).Handle(context.Background(), []byte(ev)); err != nil || len(r.got) != 0 {

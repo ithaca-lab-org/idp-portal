@@ -173,3 +173,37 @@ func TestMongoReleasedOrdersFreeTheNameAndTheCap(t *testing.T) {
 		t.Fatalf("a released order must free the name: %v", err)
 	}
 }
+
+func TestMongoCompleteNamespaceLookups(t *testing.T) {
+	s := newMongoStore(t)
+	ctx := context.Background()
+	mk := func(name, bu string, to Status) {
+		o := newOrder(name, "a@example.com")
+		o.BusinessUnit = bu
+		if err := s.Create(ctx, o); err != nil {
+			t.Fatal(err)
+		}
+		if to != StatusPending {
+			if err := s.UpdateStatus(ctx, o.ID, StatusPending, to, ""); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	mk("team-b", "payment-bu", StatusComplete)
+	mk("team-a", "payment-bu", StatusComplete)
+	mk("team-p", "payment-bu", StatusPending)
+	mk("team-x", "other-bu", StatusComplete)
+	if o, err := s.CompleteNamespace(ctx, "team-a"); err != nil || o.BusinessUnit != "payment-bu" {
+		t.Fatalf("%v %v", o, err)
+	}
+	if _, err := s.CompleteNamespace(ctx, "team-p"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("a PENDING order must not count: %v", err)
+	}
+	list, err := s.CompleteNamespacesFor(ctx, []string{"payment-bu"}, 50)
+	if err != nil || len(list) != 2 || list[0].Name != "team-a" || list[1].Name != "team-b" {
+		t.Fatalf("%v %v", list, err)
+	}
+	if list, err := s.CompleteNamespacesFor(ctx, nil, 50); err != nil || len(list) != 0 {
+		t.Fatalf("no groups must list nothing: %v %v", list, err)
+	}
+}

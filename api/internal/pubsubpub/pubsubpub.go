@@ -12,6 +12,7 @@ import (
 	"cloud.google.com/go/pubsub/v2"
 
 	"github.com/ithaca-lab-org/idp-portal/api/internal/orders"
+	"github.com/ithaca-lab-org/idp-portal/api/internal/secrets"
 )
 
 const publishTimeout = 10 * time.Second
@@ -37,12 +38,23 @@ func (p *Publisher) Publish(ctx context.Context, e orders.Event) error {
 	if err != nil {
 		return err
 	}
+	return p.send(ctx, data, map[string]string{"type": e.Type, "orderId": e.OrderID})
+}
+
+// PublishSecretEvent sends a secret audit event (metadata only, the type carries no value field)
+// on the same topic. Consumers that only know order events ignore the type.
+func (p *Publisher) PublishSecretEvent(ctx context.Context, e secrets.Event) error {
+	data, err := json.Marshal(e)
+	if err != nil {
+		return err
+	}
+	return p.send(ctx, data, map[string]string{"type": e.Type, "namespace": e.Namespace})
+}
+
+func (p *Publisher) send(ctx context.Context, data []byte, attrs map[string]string) error {
 	ctx, cancel := context.WithTimeout(ctx, publishTimeout)
 	defer cancel()
-	_, err = p.topic.Publish(ctx, &pubsub.Message{
-		Data:       data,
-		Attributes: map[string]string{"type": e.Type, "orderId": e.OrderID},
-	}).Get(ctx)
+	_, err := p.topic.Publish(ctx, &pubsub.Message{Data: data, Attributes: attrs}).Get(ctx)
 	return err
 }
 

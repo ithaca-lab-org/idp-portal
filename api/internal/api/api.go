@@ -17,6 +17,7 @@ import (
 
 	"github.com/ithaca-lab-org/idp-portal/api/internal/auth"
 	"github.com/ithaca-lab-org/idp-portal/api/internal/orders"
+	"github.com/ithaca-lab-org/idp-portal/api/internal/secrets"
 )
 
 const (
@@ -33,12 +34,17 @@ type API struct {
 	Auth    *auth.Handler
 	Svc     *orders.Service
 	limiter *limiter
+	// Secrets is the Secrets page backend; nil (SECRETS_ENABLED not true) makes its routes 404.
+	Secrets      *secrets.Service
+	secretWrites *limiter
+	secretReads  *limiter
 }
 
 // New builds the API with a per-user limit on order placement: every attempt consumes an order
 // number and a database write, so it must not be unbounded.
 func New(a *auth.Handler, svc *orders.Service) *API {
-	return &API{Auth: a, Svc: svc, limiter: newLimiter(10, time.Minute)}
+	return &API{Auth: a, Svc: svc, limiter: newLimiter(10, time.Minute),
+		secretWrites: newLimiter(secretWritesPerMinute, time.Minute), secretReads: newLimiter(secretReadsPerMinute, time.Minute)}
 }
 
 // limiter allows at most max events per key within a sliding window.
@@ -85,6 +91,7 @@ func (a *API) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/orders/namespaces", a.user(a.placeNamespace))
 	mux.HandleFunc("GET /api/orders", a.user(a.listOrders))
 	mux.HandleFunc("GET /api/orders/{id}", a.user(a.getOrder))
+	a.secretRoutes(mux)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

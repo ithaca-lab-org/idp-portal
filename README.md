@@ -42,3 +42,16 @@ Rules enforced on `POST`:
 Flow: the order is stored as `PENDING` (number `ORD-<year>-<counter>`, one active order per name), then a `TeamNamespace` is created with the order id. A poller (every 5 s, `PENDING` orders only) and reads move the order to `COMPLETE` or `FAILED` from the resource's status. A resource that belongs to a different order, or never appears within 10 minutes, fails the order. A `COMPLETE` order whose namespace resource is later removed becomes `RELEASED` (checked every minute), which frees the name and the caps.
 
 Environment: `MONGO_URI` (secret, required; the server refuses to start without it), `MONGO_DB` (default `idp`), `ORDER_CAP_PER_BU`, `ORDER_CAP_PER_USER`. The pod's ServiceAccount needs `get`, `list`, `watch` and `create` on `teamnamespaces.idp.ithaca-idp.com` and nothing else.
+
+### Secrets page (off unless `SECRETS_ENABLED=true`; off, the routes answer 404 and the page is hidden)
+
+The portal is a write-only Vault client: it writes new KV v2 versions and deletes secrets, it never reads a value back. A user may manage the secrets of namespace `<ns>` only if a `COMPLETE` namespace order for `<ns>` belongs to one of the user's `groups`; anything else is a 404, so existence does not leak.
+
+- `GET /api/namespaces`, `GET /api/namespaces/{ns}/secrets` (metadata: name, key names, version, updatedBy, updatedAt);
+- `PUT /api/namespaces/{ns}/secrets/{name}` with `{"data":{"KEY":"value"}}` replaces the whole secret and answers `{"name","keys","version"}`; name: DNS label of at most 40, not `vault-reader`; 1 to 20 keys matching `^[A-Za-z_][A-Za-z0-9_]{0,63}$`; values 1 to 8192 bytes, 64 KB in total; JSON only, 128 KB body limit, unknown fields rejected, same-origin only;
+- `DELETE /api/namespaces/{ns}/secrets/{name}` (204, idempotent);
+- 20 writes and 120 reads per user per minute.
+
+PUT writes `kv/data/<ns>/<name>` first, then creates the `ManagedSecret` `<name>` in `<ns>` (empty spec; the operator syncs it), then stores the metadata in the Mongo collection `secrets`. If Vault fails nothing else happens (502). If the resource cannot be created the Vault version stands, the metadata is not updated and the answer is 502; repeating the request writes one more version and finishes. DELETE removes the resource, then `kv/metadata/<ns>/<name>` (all versions), then the metadata. Audit events `secret.changed` / `secret.deleted` (namespace, name, actor, key names, version) go to the order-events topic. Values never reach MongoDB, the resource, logs, errors or events.
+
+Environment: `SECRETS_ENABLED`, `VAULT_ADDR` (default `http://vault.vault.svc.cluster.local:8200`), `VAULT_SECRETS_ROLE` (`portal-secrets`), `VAULT_AUTH_MOUNT` (`kubernetes`), `VAULT_KV_MOUNT` (`kv`), `VAULT_TOKEN_PATH` (`/var/run/secrets/vault/token`, a projected ServiceAccount token with audience `vault`, re-read at every login). The Vault policy needs create/update on `kv/data/*` and delete on `kv/metadata/*`, and must not grant read on `kv/data`. The ServiceAccount additionally needs `create`, `get` and `delete` on `managedsecrets.idp.ithaca-idp.com`.
