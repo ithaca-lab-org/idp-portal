@@ -64,6 +64,7 @@ func setupOperatorIdentity() (client.Client, error) {
 	for _, f := range []string{
 		filepath.Join("..", "..", "config", "rbac", "role.yaml"),
 		filepath.Join("..", "..", "config", "policy", "operator-scope.yaml"),
+		filepath.Join("..", "..", "config", "policy", "portal-scope.yaml"),
 	} {
 		if err := applyFile(f); err != nil {
 			return nil, err
@@ -401,6 +402,13 @@ func TestPolicyIsWhatDenies(t *testing.T) {
 	}
 	if err := op.Create(ctx, vaultAuthFor(plain, "anything"), dry); err != nil {
 		t.Errorf("without the policy, RBAC should allow any VaultAuth in an unlabelled namespace (dry-run): %v", err)
+	}
+	evil := vssFor(plain, "anything")
+	unstructured.RemoveNestedField(evil.Object, "metadata", "ownerReferences")
+	_ = unstructured.SetNestedField(evil.Object, "kube-system/x", "spec", "path")
+	_ = unstructured.SetNestedField(evil.Object, true, "spec", "destination", "overwrite")
+	if err := op.Create(ctx, evil, dry); err != nil {
+		t.Errorf("without the policy, RBAC should allow any VaultStaticSecret in an unlabelled namespace (dry-run): %v", err)
 	}
 	err := op.Create(ctx, clusterAdminRB(plain), dry)
 	if !apierrors.IsForbidden(err) || isPolicyDenial(err) {
