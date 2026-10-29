@@ -1,0 +1,52 @@
+# Confines the portal's ServiceAccount (idp-system/portal-api) on ManagedSecrets.
+# Its RBAC (ClusterRole idp-portal-orders in idp-gitops workloads/portal) grants
+# get, create and delete on managedsecrets cluster-wide, because tenant
+# namespaces are created at runtime; this policy limits those writes to
+# namespaces the operator manages. Only the portal's requests are evaluated.
+# The ManagedSecret CRD prunes unknown spec fields (the spec has none), so the
+# portal cannot pass anything to the operator except a namespace and a name.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: idp-portal-scope
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["idp.ithaca-idp.com"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["managedsecrets", "managedsecrets/*"]
+  matchConditions:
+    - name: is-portal-api
+      expression: "request.userInfo.username == 'system:serviceaccount:idp-system:portal-api'"
+  variables:
+    - name: parentOwned
+      expression: >-
+        namespaceObject != null && has(namespaceObject.metadata.labels) &&
+        namespaceObject.metadata.labels[?'app.kubernetes.io/managed-by'] == optional.of('idp-operator') &&
+        namespaceObject.metadata.labels[?'idp.ithaca-idp.com/team-namespace'] == optional.of(namespaceObject.metadata.name)
+  validations:
+    - expression: "variables.parentOwned"
+      reason: Forbidden
+      messageExpression: >-
+        'portal-api may only ' + request.operation + ' managedsecrets in namespaces managed by idp-operator (namespace ' + request.namespace + ')'
+    # Create and delete only; never edit an existing object or its status.
+    - expression: "request.operation != 'UPDATE' && request.?subResource.orValue('') == ''"
+      reason: Forbidden
+      message: "portal-api may not update managedsecrets or their subresources"
+    # A finalizer could block deletion forever, an ownerReference could hand the
+    # object to the garbage collector; the portal needs neither.
+    - expression: >-
+        request.operation != 'CREATE' ||
+        (!has(object.metadata.finalizers) && !has(object.metadata.ownerReferences))
+      reason: Forbidden
+      message: "portal-api may not set finalizers or ownerReferences on managedsecrets"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: idp-portal-scope
+spec:
+  policyName: idp-portal-scope
+  validationActions: ["Deny"]

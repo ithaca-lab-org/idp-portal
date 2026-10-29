@@ -89,6 +89,18 @@ func main() {
 		log.Error(err, "unable to set up controller", "controller", "TeamNamespace")
 		os.Exit(1)
 	}
+	// ManagedSecret -> VaultStaticSecret needs the VSO CRD and Vault access
+	// objects, so it only runs with VAULT_ENABLED=true.
+	if vaultOpts != nil {
+		if err := (&controller.ManagedSecretReconciler{
+			Client: mgr.GetClient(),
+			Scheme: mgr.GetScheme(),
+			Vault:  vaultOpts,
+		}).SetupWithManager(mgr); err != nil {
+			log.Error(err, "unable to set up controller", "controller", "ManagedSecret")
+			os.Exit(1)
+		}
+	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		log.Error(err, "unable to set up health check")

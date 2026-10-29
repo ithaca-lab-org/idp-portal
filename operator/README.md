@@ -65,6 +65,35 @@ Off by default. With `VAULT_ENABLED=false` the operator creates no Vault objects
 
 **Deployment needs** (idp-gitops `workloads/idp-operator`): the `VAULT_*` env above (at least `VAULT_ENABLED=true`), a projected `serviceAccountToken` volume (`audience: vault`, `path: token`, `expirationSeconds: 600`) mounted read-only at `/var/run/secrets/vault`, and egress to Vault on 8200. No extra RBAC: the projected token avoids `serviceaccounts/token` rights.
 
+## ManagedSecret (portal Secrets page)
+
+Namespaced `ManagedSecret` (`idp.ithaca-idp.com/v1alpha1`, short name `msec`), written by portal-api only. `metadata.name` is the secret name: DNS-1123 label, at most 40 chars, not `vault-reader` or `default` and not starting with `default-token`, `vault-reader-token`, `sh-helm`, `kube-`, `istio-` or `idp-` (legacy token Secrets, Helm release Secrets, platform and operator names). `spec` has no fields (unknown fields are pruned); no secret value ever passes through it.
+
+Only with `VAULT_ENABLED=true` (otherwise the controller is not started and ManagedSecrets get no status). In a namespace that exists, carries the operator labels, has a live TeamNamespace of the same name and a VaultAuth `vault-reader`, the operator creates, controlled by the ManagedSecret:
+
+```yaml
+apiVersion: secrets.hashicorp.com/v1beta1
+kind: VaultStaticSecret
+metadata: {name: <name>, namespace: <ns>, labels: {app.kubernetes.io/managed-by: idp-operator, idp.ithaca-idp.com/managed-secret: <name>}}
+spec:
+  vaultAuthRef: vault-reader
+  mount: kv
+  type: kv-v2
+  path: <ns>/<name>
+  refreshAfter: 60s
+  hmacSecretData: true            # the CRD default, written so drift checks compare equal
+  destination: {name: <name>, create: true, overwrite: false}
+```
+
+The spec is overwritten on every reconcile, but only on a VaultStaticSecret controlled by this ManagedSecret (same UID). Conditions (`status.observedGeneration` too):
+
+- `Synced`: `True` means the VaultStaticSecret exists with this spec, **not** that the Secret was written. `False` reasons: `NamespaceNotManaged` (no requeue), `VaultAuthMissing` (15 s), `NameConflict` (a VaultStaticSecret of that name exists that this ManagedSecret does not control, e.g. made by hand; it is never adopted or changed; 5 min), `PreviousTerminating` (one from an earlier ManagedSecret of the same name, or a terminating one behind VSO's finalizer, is still there; 5 s), `SyncError`.
+- `Delivered`: mirrors VSO's `SecretSynced` condition on the VaultStaticSecret for its current generation (`True`/`Delivered`, `False`/`DeliveryFailed`), otherwise `Unknown`/`DeliveryPending`. VSO messages are not copied. VSO 1.6.2 does not write status when it refuses to write the Secret (a Secret `<name>` it did not create exists, `overwrite: false`); it only emits an event, so that case stays `Unknown`. The operator has no Secret read access to detect it.
+
+Limits: a ManagedSecret being deleted (deletionTimestamp set, waiting for garbage collection) still exists for a portal `GET`; the admission policy cannot look up the owning ManagedSecret, so an ownerReference with a made-up UID passes it and is only cleaned up by the garbage collector.
+
+**Delete.** The portal deletes the ManagedSecret (default background propagation; do not use `Foreground`, which would wait on VSO's finalizer). The garbage collector then deletes the VaultStaticSecret (VSO drops its finalizer `vaultstaticsecret.secrets.hashicorp.com/finalizer`), and then the Kubernetes Secret `<name>`, which VSO 1.6.2 creates with an ownerReference to the VaultStaticSecret (`helpers/secrets.go`, `create: true`). The KV data in Vault is **not** deleted: the portal removes `kv/<ns>/<name>` itself; the operator only purges `kv/<ns>/` when the TeamNamespace is deleted. With `overwrite: false`, VSO refuses to take over an existing Secret `<name>` it did not create (the VaultStaticSecret then reports an error), so a ManagedSecret cannot replace or later garbage-collect a foreign Secret.
+
 ## Develop
 
 ```sh
@@ -79,6 +108,7 @@ Tool versions are pinned in the `Makefile` and run with `go run`. Generated file
 - The child objects live in namespaces created at runtime, so `create` on resourcequotas, limitranges, networkpolicies and rolebindings is cluster-wide. `update` (and `delete` on rolebindings) is limited by `resourceNames` to the operator's fixed child names.
 - Creating a RoleBinding to `admin` requires holding every permission in `admin` or `bind` on it. The operator gets `bind` on `clusterroles` with `resourceNames: [admin]` only; no `escalate`, no wildcards.
 - ServiceAccounts and VaultAuths (`secrets.hashicorp.com`): `create` cluster-wide, `update`/`delete` pinned to `vault-reader`. No `serviceaccounts/token`. The rules exist even with Vault off; the admission policy confines them.
+- VaultStaticSecrets: `get`/`list`/`watch`/`create`/`update` cluster-wide (names follow the ManagedSecrets, so `resourceNames` cannot pin them), no `delete` (garbage collection removes them). ManagedSecrets: read, `status` update, and `finalizers` update for `blockOwnerDeletion`. A VaultStaticSecret that exists without the owner reference cannot be adopted on clusters with `OwnerReferencesPermissionEnforcement` (changing ownerReferences needs `delete`); it stays `SyncError`.
 - Namespaces need `create`, `update` and `delete` cluster-wide; RBAC cannot scope them by label, so the label check in code is the guard.
 - `tokenreviews`/`subjectaccessreviews` `create` protect the HTTPS metrics endpoint; leases and events are a namespaced Role in `idp-system` for leader election.
 
@@ -89,7 +119,10 @@ Tool versions are pinned in the `Makefile` and run with `go run`. Generated file
 - Namespaces: `CREATE` only with `managed-by=idp-operator` and `team-namespace=<name>`, and not for a reserved name; `UPDATE`/`DELETE` only if the stored object (`oldObject`) already carries both labels, and an `UPDATE` cannot change or drop them. PSS `enforce` must stay `baseline` or `restricted`. Subresources are included.
 - ResourceQuotas, LimitRanges, NetworkPolicies, RoleBindings, ServiceAccounts, VaultAuths: only in namespaces carrying both labels, and only under the fixed child names (ServiceAccount and VaultAuth: `vault-reader`). Subresources such as `serviceaccounts/token` fall under the same rule.
 - VaultAuths: the spec must be exactly what the controller writes (`method`/`mount` kubernetes, `vaultConnectionRef: vault-secrets-operator/idp-vault`, role `ns-reader`, ServiceAccount `vault-reader`, audiences `[vault]`, `tokenExpirationSeconds: 600`) and none of `allowedNamespaces`, `headers`, `params`, `namespace`, `appRole`, `aws`, `gcp`, `jwt`, `storageEncryption`, `vaultAuthGlobalRef` (the VSO 1.6.2 field set), so the operator cannot point a VaultAuth at the purge role, another ServiceAccount, connection or Vault namespace.
+- VaultStaticSecrets: only in managed namespaces, with exactly one ownerReference, `controller: true`, to a `ManagedSecret` of the same name, and on `UPDATE` the stored object must already have it, so a hand-made VaultStaticSecret cannot be adopted (the controller also leaves it alone with `NameConflict`; on clusters with `OwnerReferencesPermissionEnforcement` adding the ownerReference is refused earlier for lack of `delete`). The policy cannot look the ManagedSecret up; a made-up owner UID is removed by the garbage collector, and exactly the spec above: `vaultAuthRef: vault-reader`, `mount: kv`, `type: kv-v2`, `path: <request namespace>/<name>`, `refreshAfter: 60s`, `hmacSecretData` true, destination name `<name>` with `create: true` and `overwrite: false`, and none of `namespace`, `version`, `rolloutRestartTargets`, `syncConfig`, `destination.type/labels/annotations/transformation` (the VSO 1.6.2 field set).
 - RoleBindings: roleRef `ClusterRole admin`, exactly one `User` subject that contains `@` and does not start with `system:` (no groups, ServiceAccounts or `system:serviceaccount:...` users).
+
+`config/policy/portal-scope.yaml` (`idp-portal-scope`, same style) evaluates only `system:serviceaccount:idp-system:portal-api` on `managedsecrets` and its subresources: `CREATE`/`DELETE` only in namespaces carrying both operator labels, never `UPDATE` or a subresource write, and no `finalizers` or `ownerReferences` on create. Its RBAC (get, create, delete on `managedsecrets`, no list/watch/update/patch) lives in idp-gitops `workloads/portal/portal-rbac.yaml`.
 
 What it does not protect:
 
@@ -99,7 +132,7 @@ What it does not protect:
 - `namespaceObject` comes from the apiserver's informer cache, so for a short window after an admin removes the labels the operator may still write children in that namespace.
 - Writes to other kinds are left to RBAC (the policy is not an allowlist of everything the operator can touch).
 
-envtest installs a test-only stub of the VSO VaultAuth CRD (`test/crds/`, typed fields only, so misspelt fields are pruned and fail the tests); the real CRD comes from the VSO chart. `internal/controller/policy_envtest_test.go` installs `config/rbac` and `config/policy` in envtest (RBAC on), impersonates the ServiceAccount, runs the reconciler end to end, checks the denials with server-side dry-run, and removes the binding to show those denials come from the policy and not RBAC.
+envtest installs test-only stubs of the VSO VaultAuth and VaultStaticSecret CRDs (`test/crds/`, typed fields only, so misspelt fields are pruned and fail the tests); the real CRD comes from the VSO chart. `internal/controller/policy_envtest_test.go` installs `config/rbac` and `config/policy` in envtest (RBAC on), impersonates the ServiceAccount, runs the reconciler end to end, checks the denials with server-side dry-run, and removes the binding to show those denials come from the policy and not RBAC.
 
 ## Known limits
 
@@ -108,4 +141,4 @@ envtest installs a test-only stub of the VSO VaultAuth CRD (`test/crds/`, typed 
 - The informer cache watches all namespaces, quotas, limit ranges, network policies and role bindings cluster-wide.
 - The finalizer is removed once the namespace delete is accepted, not when it has finished terminating; a CR recreated meanwhile waits in `Pending`.
 - In ambient mode, traffic from the Istio ingress gateway or waypoints is blocked by the default-deny policy until a later order adds an allow rule.
-- Grafana folder is not implemented yet. Vault per-namespace access is behind `VAULT_ENABLED` (above); with it on, the cache also watches ServiceAccounts and VaultAuths cluster-wide, and the VSO CRD must exist before the operator starts.
+- Grafana folder is not implemented yet. Vault per-namespace access is behind `VAULT_ENABLED` (above); with it on, the cache also watches ServiceAccounts, VaultAuths, ManagedSecrets and VaultStaticSecrets cluster-wide, and the VSO CRDs (VaultAuth, VaultStaticSecret) and the ManagedSecret CRD must exist before the operator starts.
