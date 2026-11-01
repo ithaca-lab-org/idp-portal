@@ -3,6 +3,8 @@ package secrets
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -41,6 +43,10 @@ type VaultConfig struct {
 	AuthMount string // Kubernetes auth mount, e.g. kubernetes
 	KVMount   string // KV v2 mount, e.g. kv
 	TokenPath string // projected ServiceAccount token with audience vault
+	// CACertFile (VAULT_CACERT) is a PEM file with the CA that signs Vault's listener
+	// certificate. When set, it is the ONLY trusted root for Vault (no system roots) and Addr
+	// must be https. Empty: http, or https verified against the system roots.
+	CACertFile string
 }
 
 func DefaultVaultConfig() VaultConfig {
@@ -67,7 +73,7 @@ var ErrVault = errors.New("vault request failed")
 
 var mountRe = regexp.MustCompile(`^[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*$`)
 
-// VaultClient talks to Vault over plain HTTP(S). It logs in with the pod's projected
+// VaultClient talks to Vault over HTTPS (or plain HTTP). It logs in with the pod's projected
 // ServiceAccount token (re-read on every login, the kubelet rotates it), caches the Vault token
 // until shortly before it expires and logs in again once when Vault answers 403.
 type VaultClient struct {
@@ -90,16 +96,38 @@ func NewVaultClient(cfg VaultConfig) (*VaultClient, error) {
 	if cfg.Role == "" || !mountRe.MatchString(cfg.AuthMount) || !mountRe.MatchString(cfg.KVMount) || cfg.TokenPath == "" {
 		return nil, errors.New("invalid Vault role, auth mount, KV mount or token path")
 	}
-	return &VaultClient{
-		cfg:  cfg,
-		base: u,
-		now:  time.Now,
-		http: &http.Client{
-			Timeout: vaultTimeout,
-			// a redirect could send the token elsewhere: never follow one
-			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-		},
-	}, nil
+	hc := &http.Client{
+		Timeout: vaultTimeout,
+		// a redirect could send the token elsewhere: never follow one
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	if cfg.CACertFile != "" {
+		if u.Scheme != "https" {
+			return nil, errors.New("VAULT_CACERT is set but VAULT_ADDR is not https")
+		}
+		tr, err := caTransport(cfg.CACertFile)
+		if err != nil {
+			return nil, err
+		}
+		hc.Transport = tr
+	}
+	return &VaultClient{cfg: cfg, base: u, now: time.Now, http: hc}, nil
+}
+
+// caTransport trusts only the CA certificates in file. The file is read once: the in-cluster CA
+// lives as long as the cluster; a new CA needs a pod restart.
+func caTransport(file string) (*http.Transport, error) {
+	pem, err := os.ReadFile(file)
+	if err != nil {
+		return nil, fmt.Errorf("VAULT_CACERT: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, errors.New("VAULT_CACERT: no PEM certificate in " + file)
+	}
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+	return tr, nil
 }
 
 // endpoint builds base + /v1/ + the escaped segments. Mount names are split on "/" (they were

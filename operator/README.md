@@ -48,6 +48,7 @@ Off by default. With `VAULT_ENABLED=false` the operator creates no Vault objects
 | `VAULT_AUTH_MOUNT` | `kubernetes` | auth mount for the purge login (the VaultAuth `mount` is fixed to `kubernetes` by the contract and the admission policy) |
 | `VAULT_KV_MOUNT` | `kv` | KV v2 mount holding `<ns>/...` |
 | `VAULT_TOKEN_PATH` | `/var/run/secrets/vault/token` | projected ServiceAccount token with audience `vault` |
+| `VAULT_CACERT` | (none) | PEM file with the CA of Vault's TLS listener; when set it is the only trusted root for Vault and `VAULT_ADDR` must be `https` (read once at start; empty: system roots) |
 | `VAULT_PURGE_GIVE_UP_AFTER` | `30m` | stop retrying a failing purge this long after deletion |
 
 **Purge before access.** Before the ServiceAccount and VaultAuth exist, the operator runs the same purge of `kv/<ns>/` once, so a namespace never inherits secrets left by an earlier namespace of the same name (for example after a give-up below). Until it succeeds nothing granting Vault access is created: `VaultReady=False` (reason `PurgePending`) and a backoff requeue; the namespace itself is already usable (`Ready=True`). Success is recorded in `status.vaultPurgedAt`, so later reconciles, or a tenant deleting its VaultAuth, never purge live data.
