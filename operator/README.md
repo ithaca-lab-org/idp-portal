@@ -43,7 +43,7 @@ Off by default. With `VAULT_ENABLED=false` the operator creates no Vault objects
 | Env | Default | Meaning |
 |---|---|---|
 | `VAULT_ENABLED` | `false` | turn the integration on |
-| `VAULT_ADDR` | `http://vault.vault.svc.cluster.local:8200` | Vault API (purge only) |
+| `VAULT_ADDR` | `https://vault.vault.svc.cluster.local:8200` | Vault API (purge only) |
 | `VAULT_PURGE_ROLE` | `idp-operator-purge` | Kubernetes-auth role for the purge login |
 | `VAULT_AUTH_MOUNT` | `kubernetes` | auth mount for the purge login (the VaultAuth `mount` is fixed to `kubernetes` by the contract and the admission policy) |
 | `VAULT_KV_MOUNT` | `kv` | KV v2 mount holding `<ns>/...` |

@@ -38,7 +38,7 @@ type Vault interface {
 
 // VaultConfig configures VaultClient. Every field has a default (see DefaultVaultConfig).
 type VaultConfig struct {
-	Addr      string // e.g. http://vault.vault.svc.cluster.local:8200
+	Addr      string // e.g. https://vault.vault.svc.cluster.local:8200
 	Role      string // Kubernetes auth role
 	AuthMount string // Kubernetes auth mount, e.g. kubernetes
 	KVMount   string // KV v2 mount, e.g. kv
@@ -51,7 +51,7 @@ type VaultConfig struct {
 
 func DefaultVaultConfig() VaultConfig {
 	return VaultConfig{
-		Addr:      "http://vault.vault.svc.cluster.local:8200",
+		Addr:      "https://vault.vault.svc.cluster.local:8200",
 		Role:      "portal-secrets",
 		AuthMount: "kubernetes",
 		KVMount:   "kv",

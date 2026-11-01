@@ -75,7 +75,7 @@ type Purger interface {
 }
 
 const (
-	defaultVaultAddr        = "http://vault.vault.svc.cluster.local:8200"
+	defaultVaultAddr        = "https://vault.vault.svc.cluster.local:8200"
 	defaultVaultPurgeRole   = "idp-operator-purge"
 	defaultVaultAuthMount   = "kubernetes"
 	defaultVaultKVMount     = "kv"

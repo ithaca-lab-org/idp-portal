@@ -105,7 +105,6 @@ func TestVaultCACertOptionErrors(t *testing.T) {
 	}
 	for name, env := range map[string]map[string]string{
 		"http address": {"VAULT_ADDR": "http://vault:8200", "VAULT_CACERT": ca},
-		"default http": {"VAULT_CACERT": ca},
 		"missing file": {"VAULT_ADDR": "https://vault:8200", "VAULT_CACERT": filepath.Join(t.TempDir(), "missing")},
 		"no PEM":       {"VAULT_ADDR": "https://vault:8200", "VAULT_CACERT": junk},
 	} {
@@ -113,5 +112,11 @@ func TestVaultCACertOptionErrors(t *testing.T) {
 		if _, err := VaultOptionsFromEnv(func(k string) string { return env[k] }); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
+	} // The default address is https, so VAULT_CACERT alone is valid.
+	o, err := VaultOptionsFromEnv(func(k string) string {
+		return map[string]string{"VAULT_ENABLED": "true", "VAULT_CACERT": ca}[k]
+	})
+	if err != nil || o.Addr.Scheme != "https" || o.RootCAs == nil {
+		t.Errorf("default https with VAULT_CACERT: %v %v", o, err)
 	}
 }

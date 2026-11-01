@@ -353,7 +353,7 @@ func TestVaultOptionsFromEnv(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if o.Addr.String() != "http://vault.vault.svc.cluster.local:8200" || o.PurgeRole != "idp-operator-purge" || o.AuthMount != "kubernetes" ||
+	if o.Addr.String() != "https://vault.vault.svc.cluster.local:8200" || o.PurgeRole != "idp-operator-purge" || o.AuthMount != "kubernetes" ||
 		o.KVMount != "kv" || o.TokenPath != "/var/run/secrets/vault/token" || o.GiveUpAfter != 30*time.Minute {
 		t.Errorf("defaults = %+v", o)
 	}

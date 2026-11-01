@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -120,5 +121,8 @@ func TestVaultCACertConfigErrors(t *testing.T) {
 	}
 	if _, err := tlsClient(t, "https://vault:8200", ca); err != nil {
 		t.Errorf("valid CA file rejected: %v", err)
+	}
+	if d := DefaultVaultConfig(); !strings.HasPrefix(d.Addr, "https://") {
+		t.Errorf("default address %q is not https", d.Addr)
 	}
 }
