@@ -2,8 +2,11 @@ package controller
 
 import (
 	"context"
+	"crypto/x509"
+	"errors"
 	"fmt"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -54,6 +57,9 @@ type VaultOptions struct {
 	KVMount   string
 	// TokenPath is a projected ServiceAccount token with audience "vault".
 	TokenPath string
+	// RootCAs, when non-nil, is the only set of roots trusted for Vault's TLS
+	// certificate (VAULT_CACERT, read once at start). Nil means system roots.
+	RootCAs *x509.CertPool
 	// GiveUpAfter bounds how long a failing purge may block deletion, counted
 	// from the TeamNamespace's deletionTimestamp.
 	GiveUpAfter time.Duration
@@ -69,7 +75,7 @@ type Purger interface {
 }
 
 const (
-	defaultVaultAddr        = "http://vault.vault.svc.cluster.local:8200"
+	defaultVaultAddr        = "https://vault.vault.svc.cluster.local:8200"
 	defaultVaultPurgeRole   = "idp-operator-purge"
 	defaultVaultAuthMount   = "kubernetes"
 	defaultVaultKVMount     = "kv"
@@ -110,6 +116,14 @@ func VaultOptionsFromEnv(getenv func(string) string) (*VaultOptions, error) {
 		KVMount:   strings.Trim(env("VAULT_KV_MOUNT", defaultVaultKVMount), "/"),
 		TokenPath: env("VAULT_TOKEN_PATH", defaultVaultTokenPath),
 	}
+	if ca := env("VAULT_CACERT", ""); ca != "" {
+		if addr.Scheme != "https" {
+			return nil, errors.New("VAULT_CACERT is set but VAULT_ADDR is not https")
+		}
+		if o.RootCAs, err = loadCAFile(ca); err != nil {
+			return nil, err
+		}
+	}
 	if !roleRe.MatchString(o.PurgeRole) {
 		return nil, fmt.Errorf("VAULT_PURGE_ROLE %q is not a valid role name", o.PurgeRole)
 	}
@@ -123,6 +137,21 @@ func VaultOptionsFromEnv(getenv func(string) string) (*VaultOptions, error) {
 		return nil, fmt.Errorf("VAULT_PURGE_GIVE_UP_AFTER must be a positive duration")
 	}
 	return o, nil
+}
+
+// loadCAFile reads a PEM file with the CA that signs Vault's listener
+// certificate. The in-cluster CA lives as long as the cluster; a new CA needs a
+// restart of the operator.
+func loadCAFile(file string) (*x509.CertPool, error) {
+	pem, err := os.ReadFile(file)
+	if err != nil {
+		return nil, fmt.Errorf("VAULT_CACERT: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("VAULT_CACERT: no PEM certificate in %s", file)
+	}
+	return pool, nil
 }
 
 func (o *VaultOptions) now() time.Time {

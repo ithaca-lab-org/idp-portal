@@ -3,6 +3,7 @@ package controller
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,11 +40,18 @@ type httpPurger struct {
 }
 
 func newHTTPPurger(o *VaultOptions) *httpPurger {
-	return &httpPurger{opts: o, client: &http.Client{
+	c := &http.Client{
 		Timeout: vaultRequestTimeout,
 		// A redirect would resend X-Vault-Token to wherever it points.
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-	}}
+	}
+	if o.RootCAs != nil {
+		// Only the configured CA (VAULT_CACERT) is trusted, not the system roots.
+		tr := http.DefaultTransport.(*http.Transport).Clone()
+		tr.TLSClientConfig = &tls.Config{RootCAs: o.RootCAs, MinVersion: tls.VersionTLS12}
+		c.Transport = tr
+	}
+	return &httpPurger{opts: o, client: c}
 }
 
 // Purge deletes kv/metadata/<namespace>/... recursively (all versions of every

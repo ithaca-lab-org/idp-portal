@@ -78,7 +78,8 @@ func main() {
 	}
 	if vaultOpts != nil {
 		log.Info("Vault integration enabled", "addr", vaultOpts.Addr.String(), "purgeRole", vaultOpts.PurgeRole,
-			"authMount", vaultOpts.AuthMount, "kvMount", vaultOpts.KVMount, "giveUpAfter", vaultOpts.GiveUpAfter.String())
+			"authMount", vaultOpts.AuthMount, "kvMount", vaultOpts.KVMount, "giveUpAfter", vaultOpts.GiveUpAfter.String(),
+			"customCA", vaultOpts.RootCAs != nil)
 	}
 
 	if err := (&controller.TeamNamespaceReconciler{

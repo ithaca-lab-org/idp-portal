@@ -64,6 +64,8 @@ func vaultConfigFromEnv() secrets.VaultConfig {
 		AuthMount: envOr("VAULT_AUTH_MOUNT", d.AuthMount),
 		KVMount:   envOr("VAULT_KV_MOUNT", d.KVMount),
 		TokenPath: envOr("VAULT_TOKEN_PATH", d.TokenPath),
+		// Same name as the vault CLI uses; the PEM CA of Vault's listener certificate.
+		CACertFile: os.Getenv("VAULT_CACERT"),
 	}
 }
 
