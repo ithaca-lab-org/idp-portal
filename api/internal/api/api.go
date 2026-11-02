@@ -18,6 +18,7 @@ import (
 	"github.com/ithaca-lab-org/idp-portal/api/internal/auth"
 	"github.com/ithaca-lab-org/idp-portal/api/internal/orders"
 	"github.com/ithaca-lab-org/idp-portal/api/internal/secrets"
+	"github.com/ithaca-lab-org/idp-portal/api/internal/workloads"
 )
 
 const (
@@ -38,13 +39,18 @@ type API struct {
 	Secrets      *secrets.Service
 	secretWrites *limiter
 	secretReads  *limiter
+	// Workloads is the Workloads page backend; nil (WORKLOADS_ENABLED not true) makes its routes 404.
+	Workloads      *workloads.Service
+	workloadWrites *limiter
+	workloadReads  *limiter
 }
 
 // New builds the API with a per-user limit on order placement: every attempt consumes an order
 // number and a database write, so it must not be unbounded.
 func New(a *auth.Handler, svc *orders.Service) *API {
 	return &API{Auth: a, Svc: svc, limiter: newLimiter(10, time.Minute),
-		secretWrites: newLimiter(secretWritesPerMinute, time.Minute), secretReads: newLimiter(secretReadsPerMinute, time.Minute)}
+		secretWrites: newLimiter(secretWritesPerMinute, time.Minute), secretReads: newLimiter(secretReadsPerMinute, time.Minute),
+		workloadWrites: newLimiter(workloadWritesPerMinute, time.Minute), workloadReads: newLimiter(workloadReadsPerMinute, time.Minute)}
 }
 
 // limiter allows at most max events per key within a sliding window.
@@ -92,6 +98,7 @@ func (a *API) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/orders", a.user(a.listOrders))
 	mux.HandleFunc("GET /api/orders/{id}", a.user(a.getOrder))
 	a.secretRoutes(mux)
+	a.workloadRoutes(mux)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

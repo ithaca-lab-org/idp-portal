@@ -172,11 +172,16 @@ func contains(list []string, v string) bool {
 // ListNamespaces returns the namespaces the caller may manage: COMPLETE namespace orders of one
 // of the caller's groups.
 func (s *Service) ListNamespaces(ctx context.Context, who Requester) ([]Namespace, error) {
+	return ListNamespaces(ctx, s.Namespaces, who)
+}
+
+// ListNamespaces is the Service method on any Namespaces lookup (the Workloads page shares it).
+func ListNamespaces(ctx context.Context, ns Namespaces, who Requester) ([]Namespace, error) {
 	out := []Namespace{}
 	if who.Sub == "" || len(who.Groups) == 0 {
 		return out, nil
 	}
-	list, err := s.Namespaces.CompleteNamespacesFor(ctx, who.Groups, maxNamespaces)
+	list, err := ns.CompleteNamespacesFor(ctx, who.Groups, maxNamespaces)
 	if err != nil {
 		return nil, err
 	}
@@ -191,10 +196,15 @@ func (s *Service) ListNamespaces(ctx context.Context, who Requester) ([]Namespac
 // It returns the id of that order: metadata belongs to one order, so a namespace that is
 // released and ordered again (maybe by another business unit) starts with no secrets listed.
 func (s *Service) authorize(ctx context.Context, who Requester, ns string) (string, error) {
+	return AuthorizeNamespace(ctx, s.Namespaces, who, ns)
+}
+
+// AuthorizeNamespace is the check behind every namespace-scoped action (Secrets and Workloads).
+func AuthorizeNamespace(ctx context.Context, nss Namespaces, who Requester, ns string) (string, error) {
 	if who.Sub == "" || !validPathSegment(ns) || orders.ValidateName(ns) != nil {
 		return "", ErrNotFound
 	}
-	o, err := s.Namespaces.CompleteNamespace(ctx, ns)
+	o, err := nss.CompleteNamespace(ctx, ns)
 	if errors.Is(err, orders.ErrNotFound) {
 		return "", ErrNotFound
 	}
