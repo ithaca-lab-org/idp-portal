@@ -201,6 +201,28 @@ func TestPurgeDeletesNestedKeysOfOneNamespaceOnly(t *testing.T) {
 	}
 }
 
+// A sub-path purge (WorkloadIdentity deletion) removes only the directory
+// kv/<ns>/<workload>/, not the leaf kv/<ns>/<workload> nor any sibling.
+func TestPurgeSubPathOnly(t *testing.T) {
+	fv := newFakeVault(t, "team-a/api/db", "team-a/api/x/y", "team-a/api", "team-a/api-v2/db", "team-a/web/db", "team-b/api/db")
+	if err := newHTTPPurger(fv.options(t)).Purge(context.Background(), "team-a", "api"); err != nil {
+		t.Fatal(err)
+	}
+	calls, remaining := fv.snapshot()
+	if want := []string{"team-a/api", "team-a/api-v2/db", "team-a/web/db", "team-b/api/db"}; !slices.Equal(remaining, want) {
+		t.Errorf("remaining = %v, want %v", remaining, want)
+	}
+	wantOnlyNamespaceCalls(t, "team-a/api", calls)
+	for _, sub := range []string{"", "..", "a/b", "A", "x?list=true"} {
+		if err := newHTTPPurger(fv.options(t)).Purge(context.Background(), "team-a", sub); !errors.Is(err, ErrInvalidSubPath) {
+			t.Errorf("Purge(team-a, %q) = %v, want ErrInvalidSubPath", sub, err)
+		}
+	}
+	if calls2, _ := fv.snapshot(); len(calls2) != len(calls) {
+		t.Errorf("invalid sub-paths reached Vault: %v", calls2[len(calls):])
+	}
+}
+
 func TestPurgeTreatsMissingNamespaceAsSuccess(t *testing.T) {
 	fv := newFakeVault(t, "other/app/db")
 	if err := newHTTPPurger(fv.options(t)).Purge(context.Background(), "team-empty"); err != nil {

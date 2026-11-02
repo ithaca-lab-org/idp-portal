@@ -58,7 +58,7 @@ var (
 	emailRe  = regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9-]+([.][a-zA-Z0-9-]+)+$`)
 	// ReservedNames and ReservedPrefixes must match operator/internal/controller/resources.go.
 	ReservedNames    = []string{"default", "argocd", "cert-manager", "tailscale", "identity", "idp-system", "echo", "vault"}
-	ReservedPrefixes = []string{"kube-", "istio-", "gke-", "vault-"}
+	ReservedPrefixes = []string{"kube-", "istio-", "gke-", "vault-", "vproof-"}
 )
 
 const maxNameLen = 40

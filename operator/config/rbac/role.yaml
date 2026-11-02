@@ -64,6 +64,16 @@ rules:
   verbs:
   - create
 - apiGroups:
+  - gateway.networking.k8s.io
+  resources:
+  - httproutes
+  verbs:
+  - create
+  - get
+  - list
+  - update
+  - watch
+- apiGroups:
   - idp.ithaca-idp.com
   resources:
   - managedsecrets
@@ -76,6 +86,7 @@ rules:
   resources:
   - managedsecrets/finalizers
   - teamnamespaces/finalizers
+  - workloadidentities/finalizers
   verbs:
   - update
 - apiGroups:
@@ -83,6 +94,7 @@ rules:
   resources:
   - managedsecrets/status
   - teamnamespaces/status
+  - workloadidentities/status
   verbs:
   - get
   - update
@@ -90,6 +102,7 @@ rules:
   - idp.ithaca-idp.com
   resources:
   - teamnamespaces
+  - workloadidentities
   verbs:
   - get
   - list
@@ -141,15 +154,6 @@ rules:
   - update
 - apiGroups:
   - secrets.hashicorp.com
-  resources:
-  - vaultauths
-  verbs:
-  - create
-  - get
-  - list
-  - watch
-- apiGroups:
-  - secrets.hashicorp.com
   resourceNames:
   - vault-reader
   resources:
@@ -160,7 +164,18 @@ rules:
 - apiGroups:
   - secrets.hashicorp.com
   resources:
+  - vaultauths
   - vaultstaticsecrets
+  verbs:
+  - create
+  - get
+  - list
+  - update
+  - watch
+- apiGroups:
+  - security.istio.io
+  resources:
+  - authorizationpolicies
   verbs:
   - create
   - get

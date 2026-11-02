@@ -20,6 +20,11 @@ const (
 	LabelTeamNamespace = "idp.ithaca-idp.com/team-namespace"
 	LabelBusinessUnit  = "idp.ithaca-idp.com/business-unit"
 	LabelDataplaneMode = "istio.io/dataplane-mode"
+	// LabelGatewayAccess lets HTTPRoutes in the namespace attach to the https
+	// listener of Gateway istio-ingress/ingress (allowedRoutes selector in
+	// idp-gitops workloads/ingress/gateway.yaml). Change both together.
+	LabelGatewayAccess = "ithaca.idp/gateway-access"
+	GatewayAccessValue = "allowed"
 
 	AnnotationOwner   = "idp.ithaca-idp.com/owner"
 	AnnotationOrderID = "idp.ithaca-idp.com/order-id"
@@ -37,7 +42,7 @@ var reservedNames = map[string]bool{
 	"identity": true, "idp-system": true, "echo": true, "vault": true,
 }
 
-var reservedPrefixes = []string{"kube-", "istio-", "gke-", "vault-"}
+var reservedPrefixes = []string{"kube-", "istio-", "gke-", "vault-", "vproof-"}
 
 func IsReserved(name string) bool {
 	if reservedNames[name] {
@@ -57,6 +62,7 @@ func namespaceLabels(tn *idpv1alpha1.TeamNamespace) map[string]string {
 		LabelTeamNamespace:                   tn.Name,
 		LabelBusinessUnit:                    tn.Spec.BusinessUnit,
 		LabelDataplaneMode:                   "ambient",
+		LabelGatewayAccess:                   GatewayAccessValue,
 		"pod-security.kubernetes.io/enforce": "baseline",
 		"pod-security.kubernetes.io/warn":    "restricted",
 	}

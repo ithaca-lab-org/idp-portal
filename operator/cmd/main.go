@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -31,11 +32,16 @@ func main() {
 		probeAddr     string
 		secureMetrics bool
 		leaderElect   bool
+		wiOpts        controller.WorkloadIdentityOptions
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8443", "Metrics endpoint address; \"0\" disables it.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "Health and readiness probe address.")
 	flag.BoolVar(&secureMetrics, "metrics-secure", true, "Serve metrics over HTTPS with Kubernetes authn/authz.")
 	flag.BoolVar(&leaderElect, "leader-elect", false, "Enable leader election for high availability.")
+	flag.StringVar(&wiOpts.TrustDomain, "trust-domain", envOr("TRUST_DOMAIN", controller.DefaultTrustDomain),
+		"Istio trust domain for WorkloadIdentity SPIFFE IDs and the gateway principal (env TRUST_DOMAIN).")
+	flag.StringVar(&wiOpts.HostnameSuffix, "workload-hostname-suffix", envOr("WORKLOAD_HOSTNAME_SUFFIX", controller.DefaultHostnameSuffix),
+		"WorkloadIdentity hostnames are <name>.<namespace>.<suffix> (env WORKLOAD_HOSTNAME_SUFFIX).")
 	zapOpts := zap.Options{Development: false}
 	zapOpts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -66,6 +72,11 @@ func main() {
 	})
 	if err != nil {
 		log.Error(err, "unable to create manager")
+		os.Exit(1)
+	}
+
+	if err := wiOpts.Validate(); err != nil {
+		log.Error(err, "invalid WorkloadIdentity configuration")
 		os.Exit(1)
 	}
 
@@ -103,6 +114,29 @@ func main() {
 		}
 	}
 
+	// WorkloadIdentity needs the Gateway API and Istio CRDs (and the VSO CRD
+	// with Vault on); without Vault it creates no VaultAuth. If a CRD is
+	// missing the controller is skipped instead of failing the manager (the
+	// CRD check runs once at start; restart the operator after installing them).
+	missing, err := controller.WorkloadIdentityCRDsMissing(mgr.GetRESTMapper(), vaultOpts != nil)
+	switch {
+	case err != nil:
+		log.Error(err, "unable to check the CRDs for WorkloadIdentity")
+		os.Exit(1)
+	case len(missing) > 0:
+		log.Info("WorkloadIdentity controller disabled: required CRDs are not installed", "missing", missing)
+	default:
+		if err := (&controller.WorkloadIdentityReconciler{
+			Client:  mgr.GetClient(),
+			Scheme:  mgr.GetScheme(),
+			Options: wiOpts,
+			Vault:   vaultOpts,
+		}).SetupWithManager(mgr); err != nil {
+			log.Error(err, "unable to set up controller", "controller", "WorkloadIdentity")
+			os.Exit(1)
+		}
+	}
+
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		log.Error(err, "unable to set up health check")
 		os.Exit(1)
@@ -112,9 +146,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	log.Info("starting manager")
+	log.Info("starting manager", "trustDomain", wiOpts.TrustDomain, "workloadHostnameSuffix", wiOpts.HostnameSuffix)
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		log.Error(err, "manager exited with error")
 		os.Exit(1)
 	}
+}
+
+func envOr(key, def string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return def
 }

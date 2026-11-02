@@ -188,7 +188,8 @@ spec:
         - message: name is reserved for the platform
           rule: '!(self.metadata.name in [''default'', ''argocd'', ''cert-manager'',
             ''tailscale'', ''identity'', ''idp-system'', ''echo'', ''vault'']) &&
-            ![''kube-'', ''istio-'', ''gke-'', ''vault-''].exists(p, self.metadata.name.startsWith(p))'
+            ![''kube-'', ''istio-'', ''gke-'', ''vault-'', ''vproof-''].exists(p,
+            self.metadata.name.startsWith(p))'
     served: true
     storage: true
     subresources:

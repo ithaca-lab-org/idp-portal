@@ -115,7 +115,7 @@ func (r *ManagedSecretReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 	log := logf.FromContext(ctx)
 
-	managed, why, err := r.namespaceManaged(ctx, ms.Namespace)
+	managed, why, err := namespaceManaged(ctx, r.Client, ms.Namespace)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -179,20 +179,28 @@ func (r *ManagedSecretReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 // by hand or by another controller is a name conflict and is never adopted
 // (the admission policy refuses that too).
 func vssBlocked(ms *idpv1alpha1.ManagedSecret, vss *unstructured.Unstructured) (ctrl.Result, string, string) {
-	ref := metav1.GetControllerOf(vss)
+	return childBlocked(ms, "ManagedSecret", LabelManagedSecret, vss, "VaultStaticSecret")
+}
+
+// childBlocked decides about an existing child with its owner's name (owner of
+// kind ownerKind, child labelled ownerLabel=<owner name> by the operator), as
+// described at vssBlocked. An empty reason means the child is the owner's own.
+func childBlocked(owner metav1.Object, ownerKind, ownerLabel string, child metav1.Object, childKind string) (ctrl.Result, string, string) {
+	ref := metav1.GetControllerOf(child)
+	name := owner.GetName()
 	switch {
-	case !vss.GetDeletionTimestamp().IsZero():
+	case !child.GetDeletionTimestamp().IsZero():
 		return ctrl.Result{RequeueAfter: previousRequeue}, ReasonPreviousTerminating,
-			fmt.Sprintf("previous VaultStaticSecret %s is being deleted; waiting", ms.Name)
-	case ref != nil && ref.UID == ms.UID:
+			fmt.Sprintf("previous %s %s is being deleted; waiting", childKind, name)
+	case ref != nil && ref.UID == owner.GetUID():
 		return ctrl.Result{}, "", ""
-	case ref != nil && ref.Kind == "ManagedSecret" && ref.Name == ms.Name &&
-		ref.APIVersion == idpv1alpha1.GroupVersion.String() && vss.GetLabels()[LabelManagedSecret] == ms.Name:
+	case ref != nil && ref.Kind == ownerKind && ref.Name == name &&
+		ref.APIVersion == idpv1alpha1.GroupVersion.String() && child.GetLabels()[ownerLabel] == name:
 		return ctrl.Result{RequeueAfter: previousRequeue}, ReasonPreviousTerminating,
-			fmt.Sprintf("VaultStaticSecret %s still belongs to a deleted ManagedSecret of the same name; waiting for garbage collection", ms.Name)
+			fmt.Sprintf("%s %s still belongs to a deleted %s of the same name; waiting for garbage collection", childKind, name, ownerKind)
 	}
 	return ctrl.Result{RequeueAfter: nameConflictRequeue}, ReasonNameConflict,
-		fmt.Sprintf("a VaultStaticSecret named %s exists that this ManagedSecret does not own; it is left untouched", ms.Name)
+		fmt.Sprintf("a %s named %s exists that this %s does not own; it is left untouched", childKind, name, ownerKind)
 }
 
 // setVaultStaticSecret writes the operator's labels, spec and controller
@@ -246,7 +254,7 @@ func syncedCondition(ms *idpv1alpha1.ManagedSecret, status metav1.ConditionStatu
 
 // namespaceManaged reports whether ns is a live namespace created by this
 // operator for a live TeamNamespace of the same name.
-func (r *ManagedSecretReconciler) namespaceManaged(ctx context.Context, name string) (bool, string, error) {
+func namespaceManaged(ctx context.Context, r client.Reader, name string) (bool, string, error) {
 	if IsReserved(name) {
 		return false, fmt.Sprintf("namespace %s is reserved for the platform", name), nil
 	}

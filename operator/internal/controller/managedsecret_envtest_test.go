@@ -32,7 +32,7 @@ const (
 
 func testVaultOptions() *VaultOptions {
 	return &VaultOptions{AuthMount: defaultVaultAuthMount, GiveUpAfter: time.Minute,
-		Purger: purgerFunc(func(context.Context, string) error { return nil })}
+		Purger: purgerFunc(func(context.Context, string, ...string) error { return nil })}
 }
 
 // vaultNamespace creates a TeamNamespace and reconciles it with Vault on, so
