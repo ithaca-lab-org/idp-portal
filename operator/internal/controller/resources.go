@@ -42,7 +42,7 @@ var reservedNames = map[string]bool{
 	"identity": true, "idp-system": true, "echo": true, "vault": true,
 }
 
-var reservedPrefixes = []string{"kube-", "istio-", "gke-", "vault-", "vproof-"}
+var reservedPrefixes = []string{"kube-", "istio-", "gke-", "vault-"}
 
 func IsReserved(name string) bool {
 	if reservedNames[name] {

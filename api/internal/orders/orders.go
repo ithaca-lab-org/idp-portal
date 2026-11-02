@@ -58,7 +58,11 @@ var (
 	emailRe  = regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9-]+([.][a-zA-Z0-9-]+)+$`)
 	// ReservedNames and ReservedPrefixes must match operator/internal/controller/resources.go.
 	ReservedNames    = []string{"default", "argocd", "cert-manager", "tailscale", "identity", "idp-system", "echo", "vault"}
-	ReservedPrefixes = []string{"kube-", "istio-", "gke-", "vault-", "vproof-"}
+	ReservedPrefixes = []string{"kube-", "istio-", "gke-", "vault-"}
+	// apiOnlyPrefixes are refused here only: the idp-infra proof script (an admin) creates
+	// vproof-a/b as TeamNamespaces directly, so the operator must accept them, while tenants
+	// ordering through this API must not get them.
+	apiOnlyPrefixes = []string{"vproof-"}
 )
 
 const maxNameLen = 40
@@ -72,7 +76,7 @@ func ValidateName(name string) error {
 			return invalid("name %q is reserved", name)
 		}
 	}
-	for _, p := range ReservedPrefixes {
+	for _, p := range append(append([]string(nil), ReservedPrefixes...), apiOnlyPrefixes...) {
 		if strings.HasPrefix(name, p) {
 			return invalid("names starting with %q are reserved", p)
 		}

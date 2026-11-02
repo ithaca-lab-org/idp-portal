@@ -95,7 +95,7 @@ type TeamNamespaceStatus struct {
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 // +kubebuilder:validation:XValidation:rule="self.metadata.name.size() <= 40",message="name must be at most 40 characters"
 // +kubebuilder:validation:XValidation:rule="self.metadata.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')",message="name must be a DNS-1123 label"
-// +kubebuilder:validation:XValidation:rule="!(self.metadata.name in ['default', 'argocd', 'cert-manager', 'tailscale', 'identity', 'idp-system', 'echo', 'vault']) && !['kube-', 'istio-', 'gke-', 'vault-', 'vproof-'].exists(p, self.metadata.name.startsWith(p))",message="name is reserved for the platform"
+// +kubebuilder:validation:XValidation:rule="!(self.metadata.name in ['default', 'argocd', 'cert-manager', 'tailscale', 'identity', 'idp-system', 'echo', 'vault']) && !['kube-', 'istio-', 'gke-', 'vault-'].exists(p, self.metadata.name.startsWith(p))",message="name is reserved for the platform"
 type TeamNamespace struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

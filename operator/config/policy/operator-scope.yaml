@@ -98,7 +98,7 @@ spec:
     - expression: >-
         !variables.isNamespace || request.operation != 'CREATE' ||
         (!(request.name in ['default', 'argocd', 'cert-manager', 'tailscale', 'identity', 'idp-system', 'echo', 'vault']) &&
-         !['kube-', 'istio-', 'gke-', 'vault-', 'vproof-'].exists(p, request.name.startsWith(p)))
+         !['kube-', 'istio-', 'gke-', 'vault-'].exists(p, request.name.startsWith(p)))
       reason: Forbidden
       messageExpression: "'idp-operator may not create reserved namespace ' + request.name"
     # Without this, the operator could relax Pod Security on a namespace it owns.
