@@ -32,6 +32,10 @@ const (
 
 var ErrInvalidNamespace = errors.New("namespace name is not a DNS-1123 label or is reserved for the platform")
 
+// ErrInvalidSubPath is returned for a sub-path segment that is not a DNS-1123
+// label (WorkloadIdentity names are; nothing else is purged below a namespace).
+var ErrInvalidSubPath = errors.New("purge sub-path segment is not a DNS-1123 label")
+
 // httpPurger talks to the Vault HTTP API with net/http. Errors carry method,
 // path and status only: never tokens, the JWT or response bodies.
 type httpPurger struct {
@@ -54,13 +58,20 @@ func newHTTPPurger(o *VaultOptions) *httpPurger {
 	return &httpPurger{opts: o, client: c}
 }
 
-// Purge deletes kv/metadata/<namespace>/... recursively (all versions of every
-// key). A namespace with no data (404) is a success.
-func (p *httpPurger) Purge(ctx context.Context, namespace string) error {
+// Purge deletes kv/metadata/<namespace>/<sub...>/... recursively (all
+// versions of every key); with no sub, the whole namespace. Only the directory
+// is walked: a leaf key kv/<namespace>/<sub> itself is kept. A path with no
+// data (404) is a success.
+func (p *httpPurger) Purge(ctx context.Context, namespace string, sub ...string) error {
 	// Reserved names are platform namespaces (kv/vault/, kv/idp-system/...):
 	// never purge them, whatever the caller checked.
 	if len(validation.IsDNS1123Label(namespace)) != 0 || IsReserved(namespace) {
 		return ErrInvalidNamespace
+	}
+	for _, s := range sub {
+		if len(validation.IsDNS1123Label(s)) != 0 {
+			return ErrInvalidSubPath
+		}
 	}
 	ctx, cancel := context.WithTimeout(ctx, vaultPurgeTimeout)
 	defer cancel()
@@ -72,7 +83,7 @@ func (p *httpPurger) Purge(ctx context.Context, namespace string) error {
 	defer p.revokeSelf(token)
 
 	w := &purgeWalk{token: token}
-	if err := p.purgeDir(ctx, w, []string{namespace}, 1); err != nil {
+	if err := p.purgeDir(ctx, w, append([]string{namespace}, sub...), 1+len(sub)); err != nil {
 		return err
 	}
 	return errors.Join(w.skipped...)

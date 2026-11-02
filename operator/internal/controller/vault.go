@@ -69,9 +69,10 @@ type VaultOptions struct {
 	Purger Purger
 }
 
-// Purger removes all KV data for one namespace.
+// Purger removes all KV data for one namespace, or with sub only the
+// directory kv/<namespace>/<sub...>/.
 type Purger interface {
-	Purge(ctx context.Context, namespace string) error
+	Purge(ctx context.Context, namespace string, sub ...string) error
 }
 
 const (
@@ -169,23 +170,33 @@ func (o *VaultOptions) purger() Purger {
 }
 
 func newVaultAuth(namespace string) *unstructured.Unstructured {
+	return newVaultAuthNamed(namespace, VaultAuthName)
+}
+
+func newVaultAuthNamed(namespace, name string) *unstructured.Unstructured {
 	u := &unstructured.Unstructured{}
 	u.SetGroupVersionKind(VaultAuthGVK)
 	u.SetNamespace(namespace)
-	u.SetName(VaultAuthName)
+	u.SetName(name)
 	return u
 }
 
 // desiredVaultAuthSpec is the full spec the operator owns; VSO reads it to log
 // in to Vault as vault-reader with role ns-reader.
 func desiredVaultAuthSpec() map[string]any {
+	return vaultAuthSpec(VaultReaderRole, VaultReaderServiceAccount)
+}
+
+// vaultAuthSpec is the fixed VaultAuth shape (pinned by the admission policy);
+// only the Vault role and the ServiceAccount VSO logs in as differ.
+func vaultAuthSpec(role, serviceAccount string) map[string]any {
 	return map[string]any{
 		"method":             "kubernetes",
 		"mount":              VaultReaderAuthMount,
 		"vaultConnectionRef": VaultConnectionRef,
 		"kubernetes": map[string]any{
-			"role":                   VaultReaderRole,
-			"serviceAccount":         VaultReaderServiceAccount,
+			"role":                   role,
+			"serviceAccount":         serviceAccount,
 			"audiences":              []any{VaultAudience},
 			"tokenExpirationSeconds": int64(vaultTokenExpirationSec),
 		},

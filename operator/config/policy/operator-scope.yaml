@@ -36,6 +36,15 @@ spec:
         apiVersions: ["*"]
         operations: ["CREATE", "UPDATE", "DELETE"]
         resources: ["vaultstaticsecrets", "vaultstaticsecrets/*"]
+      # WorkloadIdentity children (Gateway API and Istio CRDs).
+      - apiGroups: ["gateway.networking.k8s.io"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["httproutes", "httproutes/*"]
+      - apiGroups: ["security.istio.io"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["authorizationpolicies", "authorizationpolicies/*"]
   matchConditions:
     - name: is-idp-operator
       expression: "request.userInfo.username == 'system:serviceaccount:idp-system:idp-operator'"
@@ -67,6 +76,13 @@ spec:
         namespaceObject.metadata.labels[?'idp.ithaca-idp.com/team-namespace'] == optional.of(namespaceObject.metadata.name)
     - name: isVSS
       expression: "request.resource.resource == 'vaultstaticsecrets'"
+    # Objects named after a WorkloadIdentity: all HTTPRoutes and
+    # AuthorizationPolicies, and ServiceAccounts and VaultAuths other than the
+    # TeamNamespace child vault-reader (a reserved WorkloadIdentity name).
+    - name: isWI
+      expression: >-
+        request.resource.resource in ['httproutes', 'authorizationpolicies'] ||
+        (request.resource.resource in ['serviceaccounts', 'vaultauths'] && request.name != 'vault-reader')
   validations:
     - expression: >-
         !variables.isNamespace ||
@@ -82,7 +98,7 @@ spec:
     - expression: >-
         !variables.isNamespace || request.operation != 'CREATE' ||
         (!(request.name in ['default', 'argocd', 'cert-manager', 'tailscale', 'identity', 'idp-system', 'echo', 'vault']) &&
-         !['kube-', 'istio-', 'gke-', 'vault-'].exists(p, request.name.startsWith(p)))
+         !['kube-', 'istio-', 'gke-', 'vault-', 'vproof-'].exists(p, request.name.startsWith(p)))
       reason: Forbidden
       messageExpression: "'idp-operator may not create reserved namespace ' + request.name"
     # Without this, the operator could relax Pod Security on a namespace it owns.
@@ -98,7 +114,7 @@ spec:
     # Child names are fixed in the controller; pinning them stops extra objects
     # (e.g. an allow-all NetworkPolicy) from being added next to the managed ones.
     - expression: >-
-        variables.isNamespace || variables.isVSS ||
+        variables.isNamespace || variables.isVSS || variables.isWI ||
         request.name in {
           'resourcequotas': ['idp-quota'],
           'limitranges': ['idp-limits'],
@@ -121,18 +137,23 @@ spec:
       reason: Forbidden
       message: "idp-operator RoleBindings must bind ClusterRole admin to exactly one User subject (no groups, service accounts or system: users)"
     # The VaultAuth is pinned to exactly the spec the controller writes
-    # (desiredVaultAuthSpec): it can only log in as the namespace's own
-    # vault-reader with role ns-reader through the shared connection, never as
-    # another ServiceAccount, role, method, Vault namespace or with extra
-    # headers/params. Field names follow the VSO 1.6.2 VaultAuth CRD.
+    # (vaultAuthSpec): vault-reader can only log in as the namespace's own
+    # vault-reader with role ns-reader, and a WorkloadIdentity's VaultAuth <name>
+    # only as the ServiceAccount <name> with role workload-reader, through the
+    # shared connection, never as another ServiceAccount, role, method, Vault
+    # namespace or with extra headers/params. Field names follow the VSO 1.6.2
+    # VaultAuth CRD.
     - expression: >-
         request.resource.resource != 'vaultauths' || request.operation == 'DELETE' ||
         (has(object.spec) && has(object.spec.kubernetes) &&
          object.spec.?method.orValue('') == 'kubernetes' &&
          object.spec.?mount.orValue('') == 'kubernetes' &&
          object.spec.?vaultConnectionRef.orValue('') == 'vault-secrets-operator/idp-vault' &&
-         object.spec.kubernetes.?role.orValue('') == 'ns-reader' &&
-         object.spec.kubernetes.?serviceAccount.orValue('') == 'vault-reader' &&
+         (object.metadata.name == 'vault-reader' ?
+           object.spec.kubernetes.?role.orValue('') == 'ns-reader' &&
+           object.spec.kubernetes.?serviceAccount.orValue('') == 'vault-reader' :
+           object.spec.kubernetes.?role.orValue('') == 'workload-reader' &&
+           object.spec.kubernetes.?serviceAccount.orValue('') == object.metadata.name) &&
          object.spec.kubernetes.?audiences.orValue([]) == ['vault'] &&
          object.spec.kubernetes.?tokenExpirationSeconds.orValue(0) == 600 &&
          !has(object.spec.allowedNamespaces) && !has(object.spec.headers) && !has(object.spec.params) &&
@@ -140,7 +161,7 @@ spec:
          !has(object.spec.gcp) && !has(object.spec.jwt) && !has(object.spec.storageEncryption) &&
          !has(object.spec.vaultAuthGlobalRef))
       reason: Forbidden
-      message: "idp-operator VaultAuths must match the operator's fixed spec (kubernetes auth as vault-reader, role ns-reader, connection vault-secrets-operator/idp-vault, audience vault, 600s tokens, no other fields)"
+      message: "idp-operator VaultAuths must match the operator's fixed spec (kubernetes auth as vault-reader with role ns-reader, or as ServiceAccount <name> with role workload-reader; connection vault-secrets-operator/idp-vault, audience vault, 600s tokens, no other fields)"
     # VaultStaticSecret names follow the ManagedSecrets, so they cannot be listed
     # here. Instead the object must be controlled by a ManagedSecret of the same
     # name (one ownerReference, controller=true), and on UPDATE the stored object
@@ -182,6 +203,92 @@ spec:
          !has(object.spec.rolloutRestartTargets) && !has(object.spec.syncConfig))
       reason: Forbidden
       message: "idp-operator VaultStaticSecrets must match the operator's fixed spec (vaultAuthRef vault-reader, kv-v2 mount kv, path <namespace>/<name>, refreshAfter 60s, destination <name> with create true and overwrite false, no other fields)"
+    # WorkloadIdentity children are named after it, so, as for VaultStaticSecrets,
+    # they must be controlled by the WorkloadIdentity of the same name (one
+    # ownerReference, controller=true), and on UPDATE the stored object must
+    # already be: a ServiceAccount, VaultAuth, HTTPRoute or AuthorizationPolicy
+    # made by hand or by another controller can never be adopted. Subresource
+    # writes (serviceaccounts/token) carry no such owner and are refused. The
+    # policy cannot look the WorkloadIdentity up; a made-up owner UID is removed
+    # by the garbage collector.
+    - expression: >-
+        !variables.isWI ||
+        (request.operation == 'DELETE' ? [oldObject] : request.operation == 'UPDATE' ? [object, oldObject] : [object]).all(v,
+          has(v.metadata.ownerReferences) && size(v.metadata.ownerReferences) == 1 &&
+          v.metadata.ownerReferences.all(o,
+            o.apiVersion == 'idp.ithaca-idp.com/v1alpha1' && o.kind == 'WorkloadIdentity' &&
+            o.name == v.metadata.name && o.?controller.orValue(false) == true))
+      reason: Forbidden
+      messageExpression: "'idp-operator ' + request.resource.resource + ' must be (and, on update, already be) controlled by the WorkloadIdentity of the same name (' + request.name + ')'"
+    # Mirrors the WorkloadIdentity CRD name rules, so a made-up owner cannot
+    # carry a name the CRD would refuse (default, kube-*, ...).
+    - expression: >-
+        !variables.isWI ||
+        (request.name.size() <= 40 && request.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$') &&
+         !(request.name in ['vault-reader', 'default']) &&
+         !['default-token', 'vault-reader-token', 'sh-helm', 'kube-', 'istio-', 'idp-'].exists(p, request.name.startsWith(p)))
+      reason: Forbidden
+      messageExpression: "'idp-operator may not write ' + request.resource.resource + ' named ' + request.name + ' (not a valid WorkloadIdentity name)'"
+    # WorkloadIdentity children carry no annotations at all (the allowlist is
+    # empty): Istio reads behaviour from annotations, e.g. istio.io/dry-run turns
+    # an AuthorizationPolicy into log-only. The controller drops any it finds.
+    - expression: >-
+        !variables.isWI || request.operation == 'DELETE' ||
+        size(object.metadata.?annotations.orValue({})) == 0
+      reason: Forbidden
+      messageExpression: "'idp-operator ' + request.resource.resource + ' for WorkloadIdentities may not carry annotations (' + request.name + ')'"
+    # The workload ServiceAccount carries nothing but automountServiceAccountToken
+    # false: no token or image pull Secrets.
+    - expression: >-
+        request.resource.resource != 'serviceaccounts' || !variables.isWI || request.operation == 'DELETE' ||
+        (object.?automountServiceAccountToken.orValue(true) == false &&
+         !has(object.secrets) && !has(object.imagePullSecrets))
+      reason: Forbidden
+      message: "idp-operator workload ServiceAccounts must set automountServiceAccountToken false and carry no secrets or imagePullSecrets"
+    # The HTTPRoute is exactly desiredHTTPRouteSpec in substance: one parentRef,
+    # the https listener of Gateway istio-ingress/ingress; one hostname
+    # <name>.<namespace>.apps.ithaca-idp.com (the operator flag
+    # --workload-hostname-suffix must match; change both together); and no rule with backendRefs or filters, so the route
+    # cannot forward or redirect anywhere. Field names are those of Gateway API
+    # v1 (standard channel) HTTPRoute.
+    - expression: >-
+        request.resource.resource != 'httproutes' || request.operation == 'DELETE' ||
+        (has(object.spec) && has(object.spec.parentRefs) && size(object.spec.parentRefs) == 1 &&
+         object.spec.parentRefs.all(p,
+           p.?group.orValue('gateway.networking.k8s.io') == 'gateway.networking.k8s.io' &&
+           p.?kind.orValue('Gateway') == 'Gateway' &&
+           p.?namespace.orValue('') == 'istio-ingress' && p.name == 'ingress' &&
+           p.?sectionName.orValue('') == 'https' && !has(p.port)) &&
+         object.spec.?hostnames.orValue([]) == [object.metadata.name + '.' + request.namespace + '.apps.ithaca-idp.com'] &&
+         object.spec.?rules.orValue([]).all(r, !has(r.backendRefs) && !has(r.filters)))
+      reason: Forbidden
+      message: "idp-operator HTTPRoutes must attach only to istio-ingress/ingress section https, carry exactly the hostname <name>.<namespace>.apps.ithaca-idp.com, and have no backendRefs or filters"
+    # The AuthorizationPolicy is exactly desiredAuthorizationPolicySpec: ALLOW for
+    # pods labelled idp.ithaca-idp.com/workload=<name>, one rule whose two
+    # sources are the request namespace and the principal
+    # <trust domain>/ns/istio-ingress/sa/ingress-istio; no targetRefs, provider,
+    # to, when or other source fields (an empty source would match everyone).
+    # Field names follow the Istio 1.27 AuthorizationPolicy CRD.
+    - expression: >-
+        request.resource.resource != 'authorizationpolicies' || request.operation == 'DELETE' ||
+        (has(object.spec) && object.spec.?action.orValue('') == 'ALLOW' &&
+         !has(object.spec.provider) && !has(object.spec.targetRef) && !has(object.spec.targetRefs) &&
+         has(object.spec.selector) &&
+         object.spec.selector.?matchLabels.orValue({}) == {'idp.ithaca-idp.com/workload': object.metadata.name} &&
+         has(object.spec.rules) && size(object.spec.rules) == 1 &&
+         object.spec.rules.all(r, !has(r.to) && !has(r.when) && has(r.from) && size(r.from) == 2 &&
+           r.from.all(f, has(f.source) &&
+             !has(f.source.ipBlocks) && !has(f.source.notIpBlocks) &&
+             !has(f.source.remoteIpBlocks) && !has(f.source.notRemoteIpBlocks) &&
+             !has(f.source.notNamespaces) && !has(f.source.notPrincipals) &&
+             !has(f.source.requestPrincipals) && !has(f.source.notRequestPrincipals) &&
+             !has(f.source.serviceAccounts) && !has(f.source.notServiceAccounts)) &&
+           r.from[0].source.?namespaces.orValue([]) == [request.namespace] && !has(r.from[0].source.principals) &&
+           !has(r.from[1].source.namespaces) && size(r.from[1].source.?principals.orValue([])) == 1 &&
+           r.from[1].source.principals.all(p,
+             p.matches('^[a-z0-9]([-a-z0-9.]*[a-z0-9])?/ns/istio-ingress/sa/ingress-istio$'))))
+      reason: Forbidden
+      message: "idp-operator AuthorizationPolicies must match the operator's fixed spec (ALLOW for pods labelled idp.ithaca-idp.com/workload=<name> from the same namespace and the ingress gateway principal only)"
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding

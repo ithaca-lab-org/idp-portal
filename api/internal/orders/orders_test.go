@@ -73,7 +73,7 @@ func TestValidateName(t *testing.T) {
 	good := []string{"a", "payments-team", "team1", strings.Repeat("a", 40)}
 	bad := []string{"", "Upper", "-lead", "trail-", "has_underscore", "has.dot", strings.Repeat("a", 41),
 		"default", "argocd", "cert-manager", "tailscale", "identity", "idp-system", "echo", "vault", "vault-demo", "vault-secrets-operator",
-		"kube-system", "kube-x", "istio-system", "istio-ingress", "gke-managed"}
+		"kube-system", "kube-x", "istio-system", "istio-ingress", "gke-managed", "vproof-a", "vproof-b"}
 	for _, n := range good {
 		if err := ValidateName(n); err != nil {
 			t.Errorf("%q should be valid: %v", n, err)

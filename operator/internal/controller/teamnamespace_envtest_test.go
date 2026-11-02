@@ -65,6 +65,7 @@ func TestCreatesNamespaceAndGuardrails(t *testing.T) {
 		LabelTeamNamespace:                   name,
 		LabelBusinessUnit:                    "payments",
 		"istio.io/dataplane-mode":            "ambient",
+		"ithaca.idp/gateway-access":          "allowed",
 		"pod-security.kubernetes.io/enforce": "baseline",
 		"pod-security.kubernetes.io/warn":    "restricted",
 	} {
@@ -228,6 +229,9 @@ func TestDriftIsCorrected(t *testing.T) {
 	ns.Labels["istio.io/dataplane-mode"] = "none"
 	ns.Labels["pod-security.kubernetes.io/enforce"] = "privileged"
 	ns.Labels["team/extra"] = "kept"
+	// Namespaces created before the gateway-access label existed get it on
+	// their next reconcile, the same way.
+	delete(ns.Labels, LabelGatewayAccess)
 	if err := k8s.Update(ctx, ns); err != nil {
 		t.Fatal(err)
 	}
@@ -246,6 +250,9 @@ func TestDriftIsCorrected(t *testing.T) {
 	ns = get(t, &corev1.Namespace{}, "", name)
 	if ns.Labels["istio.io/dataplane-mode"] != "ambient" || ns.Labels["pod-security.kubernetes.io/enforce"] != "baseline" {
 		t.Errorf("namespace labels not converged: %v", ns.Labels)
+	}
+	if ns.Labels[LabelGatewayAccess] != GatewayAccessValue {
+		t.Errorf("gateway-access label not restored: %v", ns.Labels)
 	}
 	if ns.Labels["team/extra"] != "kept" {
 		t.Error("foreign namespace labels should be preserved")

@@ -266,7 +266,7 @@ func TestPolicyDeniesOperatorOutsideManagedNamespaces(t *testing.T) {
 			LabelManagedBy: ManagedByValue, LabelTeamNamespace: "team-y", "pod-security.kubernetes.io/enforce": "baseline",
 		}}}
 		wantPolicyDenial(t, "create with mismatched team label", op.Create(ctx, wrong, dry))
-		reserved := []string{"kube-evil", "istio-evil", "gke-evil", "vault-evil"}
+		reserved := []string{"kube-evil", "istio-evil", "gke-evil", "vault-evil", "vproof-evil"}
 		for n := range reservedNames {
 			reserved = append(reserved, n)
 		}
@@ -416,9 +416,11 @@ func TestPolicyIsWhatDenies(t *testing.T) {
 	}
 }
 
-type purgerFunc func(ctx context.Context, ns string) error
+type purgerFunc func(ctx context.Context, ns string, sub ...string) error
 
-func (f purgerFunc) Purge(ctx context.Context, ns string) error { return f(ctx, ns) }
+func (f purgerFunc) Purge(ctx context.Context, ns string, sub ...string) error {
+	return f(ctx, ns, sub...)
+}
 
 func vaultAuthFor(ns, name string) *unstructured.Unstructured {
 	va := newVaultAuth(ns)
@@ -434,7 +436,7 @@ func TestOperatorVaultAccessUnderRBACAndPolicy(t *testing.T) {
 	op := operatorClient(t)
 	var purged []string
 	o := &VaultOptions{AuthMount: defaultVaultAuthMount, GiveUpAfter: time.Minute,
-		Purger: purgerFunc(func(_ context.Context, ns string) error { purged = append(purged, ns); return nil })}
+		Purger: purgerFunc(func(_ context.Context, ns string, _ ...string) error { purged = append(purged, ns); return nil })}
 	managed := "team-vault-rbac"
 	if err := k8s.Create(ctx, newTN(managed)); err != nil {
 		t.Fatal(err)

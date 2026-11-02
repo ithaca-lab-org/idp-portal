@@ -43,7 +43,8 @@ func TestMain(m *testing.M) {
 	env := &envtest.Environment{
 		CRDDirectoryPaths: []string{
 			filepath.Join("..", "..", "config", "crd", "bases"),
-			// Stub of the VSO VaultAuth CRD (see the file header).
+			// Stubs of the VSO CRDs and upstream copies of the Gateway API
+			// HTTPRoute and Istio AuthorizationPolicy CRDs (see the file headers).
 			filepath.Join("..", "..", "test", "crds"),
 		},
 		ErrorIfCRDPathMissing: true,

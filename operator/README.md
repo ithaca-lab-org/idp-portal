@@ -1,6 +1,6 @@
 # idp-operator
 
-Reconciles `TeamNamespace` custom resources (written by portal-api for Order #01) into a guarded namespace. The portal never touches Kubernetes objects directly.
+Reconciles `TeamNamespace` custom resources (written by portal-api for Order #01) into a guarded namespace, and `WorkloadIdentity` resources (Order #03) into a per-workload identity inside it. The portal never touches Kubernetes objects directly.
 
 ## What it creates
 
@@ -8,7 +8,7 @@ For a cluster-scoped `TeamNamespace` named `<name>`:
 
 | Object | Name | Notes |
 |---|---|---|
-| Namespace | `<name>` | labels `app.kubernetes.io/managed-by=idp-operator`, `idp.ithaca-idp.com/team-namespace`, `idp.ithaca-idp.com/business-unit`, `istio.io/dataplane-mode=ambient`, PSS enforce `baseline` / warn `restricted`; annotations `idp.ithaca-idp.com/owner`, `idp.ithaca-idp.com/order-id` |
+| Namespace | `<name>` | labels `app.kubernetes.io/managed-by=idp-operator`, `idp.ithaca-idp.com/team-namespace`, `idp.ithaca-idp.com/business-unit`, `istio.io/dataplane-mode=ambient`, `ithaca.idp/gateway-access=allowed` (lets HTTPRoutes attach to the https listener of Gateway `istio-ingress/ingress`; namespaces created earlier get it on their next reconcile), PSS enforce `baseline` / warn `restricted`; annotations `idp.ithaca-idp.com/owner`, `idp.ithaca-idp.com/order-id` |
 | ResourceQuota | `idp-quota` | sized by `spec.size`; LoadBalancer and NodePort Services capped at 0 |
 | LimitRange | `idp-limits` | container defaults and max, sized by `spec.size` |
 | NetworkPolicy | `idp-default-deny-ingress`, `idp-allow-same-namespace` | deny all ingress, then allow from pods in the same namespace |
@@ -27,7 +27,7 @@ Child specs are overwritten on every reconcile, so manual edits are reverted. Ex
 
 | Field | Rules |
 |---|---|
-| `metadata.name` | DNS-1123 label, at most 40 chars, not reserved (`default`, `kube-*`, `istio-*`, `gke-*`, `argocd`, `cert-manager`, `tailscale`, `identity`, `idp-system`, `echo`, `vault`, `vault-*`) |
+| `metadata.name` | DNS-1123 label, at most 40 chars, not reserved (`default`, `kube-*`, `istio-*`, `gke-*`, `argocd`, `cert-manager`, `tailscale`, `identity`, `idp-system`, `echo`, `vault`, `vault-*`, `vproof-*`) |
 | `spec.businessUnit` | required DNS label, immutable |
 | `spec.owner` | required email (CEL), mutable (ownership transfer) |
 | `spec.size` | `small` (default) or `medium` |
@@ -95,6 +95,26 @@ Limits: a ManagedSecret being deleted (deletionTimestamp set, waiting for garbag
 
 **Delete.** The portal deletes the ManagedSecret (default background propagation; do not use `Foreground`, which would wait on VSO's finalizer). The garbage collector then deletes the VaultStaticSecret (VSO drops its finalizer `vaultstaticsecret.secrets.hashicorp.com/finalizer`), and then the Kubernetes Secret `<name>`, which VSO 1.6.2 creates with an ownerReference to the VaultStaticSecret (`helpers/secrets.go`, `create: true`). The KV data in Vault is **not** deleted: the portal removes `kv/<ns>/<name>` itself; the operator only purges `kv/<ns>/` when the TeamNamespace is deleted. With `overwrite: false`, VSO refuses to take over an existing Secret `<name>` it did not create (the VaultStaticSecret then reports an error), so a ManagedSecret cannot replace or later garbage-collect a foreign Secret.
 
+## WorkloadIdentity (Order #03)
+
+Namespaced `WorkloadIdentity` (short name `wid`), written by portal-api (PR 2). `metadata.name` is the workload name, with the same rules as a ManagedSecret name; `spec` has no fields. Only in a managed namespace (as for ManagedSecrets; otherwise `NamespaceNotManaged`), the operator creates, all named `<name>`, labelled `idp.ithaca-idp.com/workload=<name>` and controlled by the WorkloadIdentity (never adopting an existing object: `NameConflict`, or `PreviousTerminating` while one from an earlier WorkloadIdentity of that name waits for garbage collection):
+
+| Object | Notes |
+|---|---|
+| AuthorizationPolicy (`security.istio.io/v1`) | created first; `ALLOW` for pods labelled `idp.ithaca-idp.com/workload=<name>` from `namespaces: [<ns>]` and `principals: [<trust domain>/ns/istio-ingress/sa/ingress-istio]` (the gateway's ServiceAccount, `<gateway>-<class>`). L4 only, because ambient without a waypoint is enforced by ztunnel. A ServiceAccount cannot be a policy target in Istio 1.27 (`targetRefs` takes Gateway, GatewayClass, Service, ServiceEntry and is enforced by waypoints), so pods are selected by label: **workload pods must carry `idp.ithaca-idp.com/workload=<name>`**, otherwise only the namespace NetworkPolicies apply to them. |
+| ServiceAccount | `automountServiceAccountToken: false`; create-only (the operator has no `update` on it). Istio issues `spiffe://<trust domain>/ns/<ns>/sa/<name>` to pods running as it. |
+| HTTPRoute (`gateway.networking.k8s.io/v1`) | parent `istio-ingress/ingress`, section `https`; hostname `<name>.<ns>.<suffix>`; one rule (PathPrefix `/`) with no `backendRefs` or filters. The Gateway API spec answers a matching request with 500 when a rule has no valid backend and no responding filter, so the route only reserves the hostname (Istio is expected to send a direct 500; not yet observed on the cluster). |
+| VaultAuth (only with `VAULT_ENABLED=true`) | as `vault-reader`'s, but `role: workload-reader`, `serviceAccount: <name>`. The Vault role (policy `kv/data/<ns>/<sa name>/*`) is configured in idp-gitops; the operator does not write to Vault. |
+
+Status: `spiffeID`, `hostname`, `observedGeneration`, condition `Synced` (`True`/`Synced`; `False`: `NamespaceNotManaged`, `NameConflict`, `PreviousTerminating`, `SyncError`). Specs are reverted on drift, except the ServiceAccount; annotations on the children are dropped (the policy refuses any, e.g. `istio.io/dry-run`). Namespace and TeamNamespace events re-queue the WorkloadIdentities in that namespace, so one created early syncs once the namespace is managed. Deleting the WorkloadIdentity removes the children by garbage collection. With `VAULT_ENABLED=true` it carries the finalizer `idp.ithaca-idp.com/workload-vault-purge`: on deletion the operator purges `kv/<ns>/<name>/` (only that directory, not a leaf key `kv/<ns>/<name>`) with the TeamNamespace purge's login, retry, `VaultPurgePending` condition and `VAULT_PURGE_GIVE_UP_AFTER`; it is skipped when the namespace exists without the operator labels.
+
+| Flag (env) | Default | Meaning |
+|---|---|---|
+| `--trust-domain` (`TRUST_DOMAIN`) | `cluster.local` | Istio trust domain for `spiffeID` and the gateway principal |
+| `--workload-hostname-suffix` (`WORKLOAD_HOSTNAME_SUFFIX`) | `apps.ithaca-idp.com` | hostname suffix; the admission policy pins `.apps.ithaca-idp.com`, change both together |
+
+At start the operator checks (RESTMapper) that the HTTPRoute and AuthorizationPolicy CRDs, and with Vault on the VaultAuth CRD, are served; if one is missing it logs `WorkloadIdentity controller disabled` and runs without that controller (restart it after installing the CRDs).
+
 ## Develop
 
 ```sh
@@ -108,7 +128,8 @@ Tool versions are pinned in the `Makefile` and run with `go run`. Generated file
 
 - The child objects live in namespaces created at runtime, so `create` on resourcequotas, limitranges, networkpolicies and rolebindings is cluster-wide. `update` (and `delete` on rolebindings) is limited by `resourceNames` to the operator's fixed child names.
 - Creating a RoleBinding to `admin` requires holding every permission in `admin` or `bind` on it. The operator gets `bind` on `clusterroles` with `resourceNames: [admin]` only; no `escalate`, no wildcards.
-- ServiceAccounts and VaultAuths (`secrets.hashicorp.com`): `create` cluster-wide, `update`/`delete` pinned to `vault-reader`. No `serviceaccounts/token`. The rules exist even with Vault off; the admission policy confines them.
+- ServiceAccounts: `create` cluster-wide, `update`/`delete` pinned to `vault-reader`. VaultAuths: `create`/`update` cluster-wide (WorkloadIdentity VaultAuths follow the workload names), `delete` pinned to `vault-reader`. No `serviceaccounts/token`. The rules exist even with Vault off; the admission policy confines them.
+- HTTPRoutes and AuthorizationPolicies: `get`/`list`/`watch`/`create`/`update` cluster-wide, no `delete`. WorkloadIdentities: read, `update` (the Vault purge finalizer), `status` update, and `finalizers` update for `blockOwnerDeletion`.
 - VaultStaticSecrets: `get`/`list`/`watch`/`create`/`update` cluster-wide (names follow the ManagedSecrets, so `resourceNames` cannot pin them), no `delete` (garbage collection removes them). ManagedSecrets: read, `status` update, and `finalizers` update for `blockOwnerDeletion`. A VaultStaticSecret that exists without the owner reference cannot be adopted on clusters with `OwnerReferencesPermissionEnforcement` (changing ownerReferences needs `delete`); it stays `SyncError`.
 - Namespaces need `create`, `update` and `delete` cluster-wide; RBAC cannot scope them by label, so the label check in code is the guard.
 - `tokenreviews`/`subjectaccessreviews` `create` protect the HTTPS metrics endpoint; leases and events are a namespaced Role in `idp-system` for leader election.
@@ -121,6 +142,7 @@ Tool versions are pinned in the `Makefile` and run with `go run`. Generated file
 - ResourceQuotas, LimitRanges, NetworkPolicies, RoleBindings, ServiceAccounts, VaultAuths: only in namespaces carrying both labels, and only under the fixed child names (ServiceAccount and VaultAuth: `vault-reader`). Subresources such as `serviceaccounts/token` fall under the same rule.
 - VaultAuths: the spec must be exactly what the controller writes (`method`/`mount` kubernetes, `vaultConnectionRef: vault-secrets-operator/idp-vault`, role `ns-reader`, ServiceAccount `vault-reader`, audiences `[vault]`, `tokenExpirationSeconds: 600`) and none of `allowedNamespaces`, `headers`, `params`, `namespace`, `appRole`, `aws`, `gcp`, `jwt`, `storageEncryption`, `vaultAuthGlobalRef` (the VSO 1.6.2 field set), so the operator cannot point a VaultAuth at the purge role, another ServiceAccount, connection or Vault namespace.
 - VaultStaticSecrets: only in managed namespaces, with exactly one ownerReference, `controller: true`, to a `ManagedSecret` of the same name, and on `UPDATE` the stored object must already have it, so a hand-made VaultStaticSecret cannot be adopted (the controller also leaves it alone with `NameConflict`; on clusters with `OwnerReferencesPermissionEnforcement` adding the ownerReference is refused earlier for lack of `delete`). The policy cannot look the ManagedSecret up; a made-up owner UID is removed by the garbage collector, and exactly the spec above: `vaultAuthRef: vault-reader`, `mount: kv`, `type: kv-v2`, `path: <request namespace>/<name>`, `refreshAfter: 60s`, `hmacSecretData` true, destination name `<name>` with `create: true` and `overwrite: false`, and none of `namespace`, `version`, `rolloutRestartTargets`, `syncConfig`, `destination.type/labels/annotations/transformation` (the VSO 1.6.2 field set).
+- WorkloadIdentity children (ServiceAccounts and VaultAuths other than `vault-reader`, all HTTPRoutes and AuthorizationPolicies): only in managed namespaces, with exactly one controller ownerReference to a `WorkloadIdentity` of the same name (on `UPDATE` already on the stored object), under a valid WorkloadIdentity name, with no annotations, and with the fixed shape: ServiceAccount without token automount, `secrets` or `imagePullSecrets`; VaultAuth role `workload-reader` as ServiceAccount `<name>` (and `vault-reader` keeps role `ns-reader`); HTTPRoute with one parentRef `istio-ingress/ingress` section `https`, exactly the hostname `<name>.<ns>.apps.ithaca-idp.com` and no `backendRefs` or `filters`; AuthorizationPolicy `ALLOW`, selector exactly `idp.ithaca-idp.com/workload=<name>`, one rule with exactly the two sources above (principal checked as `<trust domain>/ns/istio-ingress/sa/ingress-istio`), no `targetRefs`, `provider`, `to`, `when` or other source fields.
 - RoleBindings: roleRef `ClusterRole admin`, exactly one `User` subject that contains `@` and does not start with `system:` (no groups, ServiceAccounts or `system:serviceaccount:...` users).
 
 `config/policy/portal-scope.yaml` (`idp-portal-scope`, same style) evaluates only `system:serviceaccount:idp-system:portal-api` on `managedsecrets` and its subresources: `CREATE`/`DELETE` only in namespaces carrying both operator labels, never `UPDATE` or a subresource write, and no `finalizers` or `ownerReferences` on create. Its RBAC (get, create, delete on `managedsecrets`, no list/watch/update/patch) lives in idp-gitops `workloads/portal/portal-rbac.yaml`.
@@ -133,7 +155,7 @@ What it does not protect:
 - `namespaceObject` comes from the apiserver's informer cache, so for a short window after an admin removes the labels the operator may still write children in that namespace.
 - Writes to other kinds are left to RBAC (the policy is not an allowlist of everything the operator can touch).
 
-envtest installs test-only stubs of the VSO VaultAuth and VaultStaticSecret CRDs (`test/crds/`, typed fields only, so misspelt fields are pruned and fail the tests); the real CRD comes from the VSO chart. `internal/controller/policy_envtest_test.go` installs `config/rbac` and `config/policy` in envtest (RBAC on), impersonates the ServiceAccount, runs the reconciler end to end, checks the denials with server-side dry-run, and removes the binding to show those denials come from the policy and not RBAC.
+envtest installs test-only stubs of the VSO VaultAuth and VaultStaticSecret CRDs (`test/crds/`, typed fields only, so misspelt fields are pruned and fail the tests; the real CRD comes from the VSO chart) and unmodified upstream copies of the Gateway API v1.3.0 HTTPRoute and Istio 1.27.1 AuthorizationPolicy CRDs. `internal/controller/policy_envtest_test.go` installs `config/rbac` and `config/policy` in envtest (RBAC on), impersonates the ServiceAccount, runs the reconciler end to end, checks the denials with server-side dry-run, and removes the binding to show those denials come from the policy and not RBAC.
 
 ## Known limits
 
@@ -141,5 +163,5 @@ envtest installs test-only stubs of the VSO VaultAuth and VaultStaticSecret CRDs
 - Anyone (other than the operator) who can label namespaces can make an existing namespace adoptable by adding the two operator labels. The policy cannot stop this; restrict namespace `update`/`patch` to platform admins.
 - The informer cache watches all namespaces, quotas, limit ranges, network policies and role bindings cluster-wide.
 - The finalizer is removed once the namespace delete is accepted, not when it has finished terminating; a CR recreated meanwhile waits in `Pending`.
-- In ambient mode, traffic from the Istio ingress gateway or waypoints is blocked by the default-deny policy until a later order adds an allow rule.
+- In ambient mode, traffic from the Istio ingress gateway or waypoints is blocked by the default-deny NetworkPolicy until a later change adds an allow rule (the WorkloadIdentity AuthorizationPolicy alone does not open it).
 - Grafana folder is not implemented yet. Vault per-namespace access is behind `VAULT_ENABLED` (above); with it on, the cache also watches ServiceAccounts, VaultAuths, ManagedSecrets and VaultStaticSecrets cluster-wide, and the VSO CRDs (VaultAuth, VaultStaticSecret) and the ManagedSecret CRD must exist before the operator starts.
