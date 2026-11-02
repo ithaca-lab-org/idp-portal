@@ -3,6 +3,8 @@ ignore: |
   .github/ISSUE_TEMPLATE/
   operator/config/crd/bases/
   operator/config/rbac/role.yaml
+  operator/test/crds/gateway.networking.k8s.io_httproutes.yaml
+  operator/test/crds/security.istio.io_authorizationpolicies.yaml
 rules:
   line-length: disable
   document-start: disable

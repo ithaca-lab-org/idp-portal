@@ -143,3 +143,46 @@ export async function deleteSecret(ns: string, name: string): Promise<void> {
     throw new ApiError(res.status, msg);
   }
 }
+
+export interface WorkloadCondition {
+  type: string;
+  status: string;
+  reason?: string;
+  message?: string;
+  lastTransitionTime?: string;
+}
+
+/** A WorkloadIdentity as the operator reports it; spiffeId and hostname are empty until it has. */
+export interface Workload {
+  namespace: string;
+  name: string;
+  serviceAccount: string;
+  spiffeId: string;
+  hostname: string;
+  status: Status;
+  reason?: string;
+  conditions: WorkloadCondition[];
+  createdAt?: string;
+}
+
+/** The namespaces the user may order workloads in; null when the Workloads page is turned off (404). */
+export async function listWorkloadNamespaces(): Promise<SecretsInfo | null> {
+  try {
+    return await call<SecretsInfo>("/api/workloads/namespaces");
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404) return null;
+    throw e;
+  }
+}
+
+export const listWorkloads = async (ns: string) =>
+  (await call<{ workloads: Workload[] }>(`/api/workloads?namespace=${seg(ns)}`)).workloads;
+
+export const getWorkload = (ns: string, name: string) => call<Workload>(`/api/workloads/${seg(ns)}/${seg(name)}`);
+
+export const placeWorkload = (namespace: string, name: string) =>
+  call<Workload>("/api/orders/workloads", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ namespace, name }),
+  });
