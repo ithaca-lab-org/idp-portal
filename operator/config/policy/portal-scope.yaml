@@ -1,10 +1,12 @@
-# Confines the portal's ServiceAccount (idp-system/portal-api) on ManagedSecrets.
-# Its RBAC (ClusterRole idp-portal-orders in idp-gitops workloads/portal) grants
-# get, create and delete on managedsecrets cluster-wide, because tenant
-# namespaces are created at runtime; this policy limits those writes to
-# namespaces the operator manages. Only the portal's requests are evaluated.
-# The ManagedSecret CRD prunes unknown spec fields (the spec has none), so the
-# portal cannot pass anything to the operator except a namespace and a name.
+# Confines the portal's ServiceAccount (idp-system/portal-api) on ManagedSecrets
+# and WorkloadIdentities. Its RBAC (ClusterRole idp-portal-orders in idp-gitops
+# workloads/portal) grants get, create and delete on managedsecrets and get,
+# list and create on workloadidentities cluster-wide, because tenant namespaces
+# are created at runtime; this policy limits those writes to namespaces the
+# operator manages. Only the portal's requests are evaluated.
+# The CRDs prune unknown spec fields (the specs have none), so the portal cannot
+# pass anything to the operator except a namespace and a name. A
+# WorkloadIdentity is create-only for the portal (no update, no delete).
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -16,7 +18,7 @@ spec:
       - apiGroups: ["idp.ithaca-idp.com"]
         apiVersions: ["*"]
         operations: ["CREATE", "UPDATE", "DELETE"]
-        resources: ["managedsecrets", "managedsecrets/*"]
+        resources: ["managedsecrets", "managedsecrets/*", "workloadidentities", "workloadidentities/*"]
   matchConditions:
     - name: is-portal-api
       expression: "request.userInfo.username == 'system:serviceaccount:idp-system:portal-api'"
@@ -30,18 +32,44 @@ spec:
     - expression: "variables.parentOwned"
       reason: Forbidden
       messageExpression: >-
-        'portal-api may only ' + request.operation + ' managedsecrets in namespaces managed by idp-operator (namespace ' + request.namespace + ')'
+        'portal-api may only ' + request.operation + ' ' + request.resource.resource + ' in namespaces managed by idp-operator (namespace ' + request.namespace + ')'
     # Create and delete only; never edit an existing object or its status.
     - expression: "request.operation != 'UPDATE' && request.?subResource.orValue('') == ''"
       reason: Forbidden
-      message: "portal-api may not update managedsecrets or their subresources"
+      message: "portal-api may not update managedsecrets, workloadidentities or their subresources"
     # A finalizer could block deletion forever, an ownerReference could hand the
     # object to the garbage collector; the portal needs neither.
     - expression: >-
         request.operation != 'CREATE' ||
         (!has(object.metadata.finalizers) && !has(object.metadata.ownerReferences))
       reason: Forbidden
-      message: "portal-api may not set finalizers or ownerReferences on managedsecrets"
+      message: "portal-api may not set finalizers or ownerReferences on managedsecrets or workloadidentities"
+    # A WorkloadIdentity owns a ServiceAccount, a route and (with Vault on) a purge of
+    # kv/<ns>/<name>/ when it goes away: the portal creates them and never deletes.
+    - expression: "request.resource.resource != 'workloadidentities' || request.operation == 'CREATE'"
+      reason: Forbidden
+      message: "portal-api may only create workloadidentities"
+    # Same name rules as the CRD (operator/api/v1alpha1/workloadidentity_types.go), so they
+    # still hold if the CRD's own rules are ever loosened. The spec must be empty.
+    - expression: >-
+        request.resource.resource != 'workloadidentities' || request.operation != 'CREATE' ||
+        (object.metadata.name.size() <= 40 &&
+        object.metadata.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$') &&
+        !(object.metadata.name in ['vault-reader', 'default']) &&
+        !['default-token', 'vault-reader-token', 'sh-helm', 'kube-', 'istio-', 'idp-'].exists(p, object.metadata.name.startsWith(p)))
+      reason: Forbidden
+      message: "portal-api may not create a workloadidentity with that name"
+    # Labels and annotations would be inherited or read by nothing the portal needs.
+    - expression: >-
+        request.resource.resource != 'workloadidentities' || request.operation != 'CREATE' ||
+        (!has(object.metadata.labels) && !has(object.metadata.annotations))
+      reason: Forbidden
+      message: "portal-api may not set labels or annotations on workloadidentities"
+    - expression: >-
+        request.resource.resource != 'workloadidentities' || request.operation != 'CREATE' ||
+        !has(object.spec) || size(object.spec) == 0
+      reason: Forbidden
+      message: "portal-api may not set a workloadidentity spec"
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding

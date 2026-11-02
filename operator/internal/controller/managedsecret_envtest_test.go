@@ -526,6 +526,7 @@ func portalAPIClient(t *testing.T) client.Client {
 			&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: "idp-portal-orders"}, Rules: []rbacv1.PolicyRule{
 				{APIGroups: []string{idpv1alpha1.GroupVersion.Group}, Resources: []string{"teamnamespaces"}, Verbs: []string{"get", "create"}},
 				{APIGroups: []string{idpv1alpha1.GroupVersion.Group}, Resources: []string{"managedsecrets"}, Verbs: []string{"get", "create", "delete"}},
+				{APIGroups: []string{idpv1alpha1.GroupVersion.Group}, Resources: []string{"workloadidentities"}, Verbs: []string{"get", "list", "create"}},
 			}},
 			&rbacv1.ClusterRoleBinding{
 				ObjectMeta: metav1.ObjectMeta{Name: "idp-portal-orders"},
@@ -645,6 +646,84 @@ func TestPortalManagedSecretScope(t *testing.T) {
 	if err := pc.Delete(ctx, newMS(managed, "stripe")); err != nil {
 		t.Errorf("portal delete in managed ns: %v", err)
 	}
+}
+
+func TestPortalWorkloadIdentityScope(t *testing.T) {
+	pc := portalAPIClient(t)
+	managed := "team-wi-portal"
+	createAndReconcile(t, newTN(managed))
+	plain := "plain-ns"
+	dry := client.DryRunAll
+
+	// Allowed: create, get and list in a managed namespace.
+	if err := pc.Create(ctx, newWI(managed, "orders")); err != nil {
+		t.Fatalf("portal create in managed ns: %v", err)
+	}
+	wi := &idpv1alpha1.WorkloadIdentity{}
+	if err := pc.Get(ctx, types.NamespacedName{Namespace: managed, Name: "orders"}, wi); err != nil {
+		t.Fatalf("portal get: %v", err)
+	}
+	list := &idpv1alpha1.WorkloadIdentityList{}
+	if err := pc.List(ctx, list, client.InNamespace(managed)); err != nil || len(list.Items) != 1 {
+		t.Fatalf("portal list: %v %d", err, len(list.Items))
+	}
+
+	wantPortal := func(what string, err error) {
+		t.Helper()
+		if !isPortalDenial(err) {
+			t.Errorf("%s: want denial by %s, got %v", what, portalPolicyName, err)
+		}
+	}
+	wantPortal("create in unlabelled ns", pc.Create(ctx, newWI(plain, "orders"), dry))
+	wantPortal("create in kube-system", pc.Create(ctx, newWI("kube-system", "orders"), dry))
+	wantPortal("create in idp-system", pc.Create(ctx, newWI("idp-system", "orders"), dry))
+	withFinalizer := newWI(managed, "fin")
+	withFinalizer.Finalizers = []string{"example.com/block"}
+	wantPortal("create with a finalizer", pc.Create(ctx, withFinalizer, dry))
+	withOwner := newWI(managed, "owned")
+	withOwner.OwnerReferences = []metav1.OwnerReference{{APIVersion: "v1", Kind: "ConfigMap", Name: "x", UID: "00000000-0000-0000-0000-000000000004"}}
+	wantPortal("create with an ownerReference", pc.Create(ctx, withOwner, dry))
+	if err := k8s.Create(ctx, newWI(plain, "admin-made")); err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatal(err)
+	}
+	labelled := newWI(managed, "labelled")
+	labelled.Labels = map[string]string{"x": "y"}
+	wantPortal("create with a label", pc.Create(ctx, labelled, dry))
+	annotated := newWI(managed, "annotated")
+	annotated.Annotations = map[string]string{"x": "y"}
+	wantPortal("create with an annotation", pc.Create(ctx, annotated, dry))
+	// the portal never deletes or edits a WorkloadIdentity, even in a managed namespace: RBAC
+	// refuses first; the policy repeats it in case the ClusterRole is ever widened
+	wantForbidden(t, "delete in managed ns", pc.Delete(ctx, newWI(managed, "orders"), dry))
+	wantForbidden(t, "delete in unlabelled ns", pc.Delete(ctx, newWI(plain, "admin-made"), dry))
+	upd := wi.DeepCopy()
+	upd.Labels = map[string]string{"x": "y"}
+	wantForbidden(t, "update workloadidentity", pc.Update(ctx, upd, dry))
+	st := wi.DeepCopy()
+	st.Status.SpiffeID = "spiffe://evil/ns/x/sa/y"
+	wantForbidden(t, "update workloadidentity status", pc.Status().Update(ctx, st, dry))
+
+	// reserved or malformed names are refused (by the CRD rules; the policy repeats them)
+	for _, n := range []string{"vault-reader", "default", "kube-x", "istio-x", "idp-x", "Upper", strings.Repeat("a", 41)} {
+		if err := pc.Create(ctx, newWI(managed, n), dry); err == nil {
+			t.Errorf("name %q accepted", n)
+		}
+	}
+	extra := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": idpv1alpha1.GroupVersion.String(), "kind": "WorkloadIdentity",
+		"metadata": map[string]any{"name": "extra", "namespace": managed},
+		"spec":     map[string]any{"hostname": "x.apps.example.com", "serviceAccount": "default"},
+	}}
+	if err := pc.Create(ctx, extra, dry); err != nil {
+		t.Fatal(err)
+	} else if spec, _, _ := unstructured.NestedMap(extra.Object, "spec"); len(spec) != 0 {
+		t.Errorf("extra spec fields stored: %v", spec)
+	}
+
+	// RBAC: no update, patch, delete, deletecollection, watch or other kinds.
+	wantForbidden(t, "patch workloadidentity", pc.Patch(ctx, upd, client.MergeFrom(wi), dry))
+	wantForbidden(t, "deletecollection workloadidentities", pc.DeleteAllOf(ctx, &idpv1alpha1.WorkloadIdentity{}, client.InNamespace(managed), dry))
+	wantForbidden(t, "create ServiceAccount", pc.Create(ctx, &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "sa", Namespace: managed}}, dry))
 }
 
 // TestPortalPolicyIsWhatDenies removes the portal binding and shows that RBAC

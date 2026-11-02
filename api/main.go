@@ -24,6 +24,7 @@ import (
 	"github.com/ithaca-lab-org/idp-portal/api/internal/secrets"
 	"github.com/ithaca-lab-org/idp-portal/api/internal/session"
 	"github.com/ithaca-lab-org/idp-portal/api/internal/webui"
+	"github.com/ithaca-lab-org/idp-portal/api/internal/workloads"
 )
 
 func mustEnv(name string) string {
@@ -161,6 +162,12 @@ func main() {
 		}
 		slog.Info("secrets page enabled")
 	}
+	// The Workloads page is off unless WORKLOADS_ENABLED is exactly "true"; off, its routes answer 404.
+	var workloadSvc *workloads.Service
+	if os.Getenv("WORKLOADS_ENABLED") == "true" {
+		workloadSvc = workloads.NewService(workloads.DynamicCluster{Client: dyn}, store)
+		slog.Info("workloads page enabled")
+	}
 	go svc.RunSyncer(ctx, 5*time.Second, 12) // COMPLETE orders are checked every minute
 
 	mux := http.NewServeMux()
@@ -168,6 +175,7 @@ func main() {
 	h.Routes(mux)
 	apiHandler := api.New(h, svc)
 	apiHandler.Secrets = secretSvc
+	apiHandler.Workloads = workloadSvc
 	apiHandler.Routes(mux)
 	mux.Handle("GET /", webui.Handler())
 
