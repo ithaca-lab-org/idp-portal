@@ -24,7 +24,7 @@ func TestIsReserved(t *testing.T) {
 		"default": true, "kube-system": true, "kube-public": true, "istio-system": true,
 		"gke-managed-system": true, "argocd": true, "cert-manager": true, "tailscale": true,
 		"identity": true, "idp-system": true, "echo": true, "vault": true, "vault-demo": true, "vault-secrets-operator": true,
-		"payments": false, "kubeflow": false, "echo-team": false, "my-istio-app": false, "vaulted": false, "my-vault": false, "vproof-a": true, "vproof": false,
+		"payments": false, "kubeflow": false, "echo-team": false, "my-istio-app": false, "vaulted": false, "my-vault": false, "vproof-a": false, "vproof": false,
 	} {
 		if got := IsReserved(name); got != want {
 			t.Errorf("IsReserved(%q) = %v, want %v", name, got, want)

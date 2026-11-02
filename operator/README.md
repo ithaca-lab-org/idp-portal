@@ -27,7 +27,7 @@ Child specs are overwritten on every reconcile, so manual edits are reverted. Ex
 
 | Field | Rules |
 |---|---|
-| `metadata.name` | DNS-1123 label, at most 40 chars, not reserved (`default`, `kube-*`, `istio-*`, `gke-*`, `argocd`, `cert-manager`, `tailscale`, `identity`, `idp-system`, `echo`, `vault`, `vault-*`, `vproof-*`) |
+| `metadata.name` | DNS-1123 label, at most 40 chars, not reserved (`default`, `kube-*`, `istio-*`, `gke-*`, `argocd`, `cert-manager`, `tailscale`, `identity`, `idp-system`, `echo`, `vault`, `vault-*`) |
 | `spec.businessUnit` | required DNS label, immutable |
 | `spec.owner` | required email (CEL), mutable (ownership transfer) |
 | `spec.size` | `small` (default) or `medium` |

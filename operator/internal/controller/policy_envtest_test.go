@@ -266,7 +266,7 @@ func TestPolicyDeniesOperatorOutsideManagedNamespaces(t *testing.T) {
 			LabelManagedBy: ManagedByValue, LabelTeamNamespace: "team-y", "pod-security.kubernetes.io/enforce": "baseline",
 		}}}
 		wantPolicyDenial(t, "create with mismatched team label", op.Create(ctx, wrong, dry))
-		reserved := []string{"kube-evil", "istio-evil", "gke-evil", "vault-evil", "vproof-evil"}
+		reserved := []string{"kube-evil", "istio-evil", "gke-evil", "vault-evil"}
 		for n := range reservedNames {
 			reserved = append(reserved, n)
 		}
