@@ -101,6 +101,25 @@ func TestCreatesNamespaceAndGuardrails(t *testing.T) {
 		t.Errorf("same-namespace policy = %+v", same.Spec)
 	}
 
+	gw := get(t, &networkingv1.NetworkPolicy{}, name, GatewayPolicyName)
+	if !equality.Semantic.DeepEqual(gw.Spec, desiredAllowIngressGatewaySpec(GatewayOptions{})) {
+		t.Errorf("gateway policy = %+v", gw.Spec)
+	}
+	if len(gw.Spec.Ingress) != 1 || len(gw.Spec.Ingress[0].From) != 1 || len(gw.Spec.Ingress[0].Ports) != 1 {
+		t.Fatalf("gateway policy must have one rule, one peer, one port: %+v", gw.Spec)
+	}
+	peer := gw.Spec.Ingress[0].From[0]
+	if peer.NamespaceSelector == nil || peer.PodSelector == nil || peer.IPBlock != nil ||
+		peer.NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"] != "istio-ingress" ||
+		peer.PodSelector.MatchLabels["gateway.networking.k8s.io/gateway-name"] != "ingress" {
+		t.Errorf("gateway peer = %+v", peer)
+	}
+	// Owned by the TeamNamespace, so it is garbage collected with it, and the
+	// namespace deletion removes it with everything else in the namespace.
+	if ref := metav1.GetControllerOf(gw); ref == nil || ref.Kind != "TeamNamespace" || ref.Name != name {
+		t.Errorf("gateway policy owner = %+v", ref)
+	}
+
 	rb := get(t, &rbacv1.RoleBinding{}, name, AdminRoleBindingName)
 	if rb.RoleRef != (rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: "admin"}) {
 		t.Errorf("roleRef = %+v", rb.RoleRef)
@@ -147,6 +166,7 @@ func resourceVersions(t *testing.T, name string) map[string]string {
 		"lr":   &corev1.LimitRange{},
 		"deny": &networkingv1.NetworkPolicy{},
 		"same": &networkingv1.NetworkPolicy{},
+		"gw":   &networkingv1.NetworkPolicy{},
 		"rb":   &rbacv1.RoleBinding{},
 	}
 	keys := map[string]types.NamespacedName{
@@ -155,6 +175,7 @@ func resourceVersions(t *testing.T, name string) map[string]string {
 		"lr":   {Namespace: name, Name: LimitRangeName},
 		"deny": {Namespace: name, Name: DenyIngressPolicyName},
 		"same": {Namespace: name, Name: SameNamespacePolicy},
+		"gw":   {Namespace: name, Name: GatewayPolicyName},
 		"rb":   {Namespace: name, Name: AdminRoleBindingName},
 	}
 	out := map[string]string{}
@@ -214,6 +235,10 @@ func TestDriftIsCorrected(t *testing.T) {
 	if err := k8s.Delete(ctx, &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: DenyIngressPolicyName, Namespace: name}}); err != nil {
 		t.Fatal(err)
 	}
+	// A deleted policy is recreated; a widened one (extra open peer) is repaired.
+	if err := k8s.Delete(ctx, &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: GatewayPolicyName, Namespace: name}}); err != nil {
+		t.Fatal(err)
+	}
 	q := get(t, &corev1.ResourceQuota{}, name, QuotaName)
 	q.Spec.Hard[corev1.ResourcePods] = resource.MustParse("999")
 	q.Spec.Hard[corev1.ResourceSecrets] = resource.MustParse("1")
@@ -239,6 +264,9 @@ func TestDriftIsCorrected(t *testing.T) {
 	reconcileOnce(t, k8s, name)
 
 	get(t, &networkingv1.NetworkPolicy{}, name, DenyIngressPolicyName)
+	if gw := get(t, &networkingv1.NetworkPolicy{}, name, GatewayPolicyName); !equality.Semantic.DeepEqual(gw.Spec, desiredAllowIngressGatewaySpec(GatewayOptions{})) {
+		t.Errorf("gateway policy not recreated: %+v", gw.Spec)
+	}
 	q = get(t, &corev1.ResourceQuota{}, name, QuotaName)
 	if !equality.Semantic.DeepEqual(q.Spec, desiredQuotaSpec(getTN(t, name))) {
 		t.Errorf("quota not converged: %v", q.Spec.Hard)
@@ -256,6 +284,49 @@ func TestDriftIsCorrected(t *testing.T) {
 	}
 	if ns.Labels["team/extra"] != "kept" {
 		t.Error("foreign namespace labels should be preserved")
+	}
+}
+
+func TestGatewayPolicyDriftIsRepaired(t *testing.T) {
+	requireEnvtest(t)
+	name := "team-gw-drift"
+	createAndReconcile(t, newTN(name))
+
+	gw := get(t, &networkingv1.NetworkPolicy{}, name, GatewayPolicyName)
+	gw.Spec.Ingress[0].From = append(gw.Spec.Ingress[0].From, networkingv1.NetworkPolicyPeer{PodSelector: &metav1.LabelSelector{}})
+	gw.Spec.Ingress[0].Ports = nil
+	if err := k8s.Update(ctx, gw); err != nil {
+		t.Fatal(err)
+	}
+	reconcileOnce(t, k8s, name)
+	gw = get(t, &networkingv1.NetworkPolicy{}, name, GatewayPolicyName)
+	if !equality.Semantic.DeepEqual(gw.Spec, desiredAllowIngressGatewaySpec(GatewayOptions{})) {
+		t.Errorf("gateway policy not repaired: %+v", gw.Spec)
+	}
+}
+
+func TestGatewayPolicyFollowsOptions(t *testing.T) {
+	requireEnvtest(t)
+	name := "team-gw-opts"
+	if err := k8s.Create(ctx, newTN(name)); err != nil {
+		t.Fatal(err)
+	}
+	r := &TeamNamespaceReconciler{Client: k8s, Scheme: testScheme, Gateway: GatewayOptions{Namespace: "edge", Name: "front"}}
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: name}}); err != nil {
+		t.Fatal(err)
+	}
+	peer := get(t, &networkingv1.NetworkPolicy{}, name, GatewayPolicyName).Spec.Ingress[0].From[0]
+	if peer.NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"] != "edge" ||
+		peer.PodSelector.MatchLabels["gateway.networking.k8s.io/gateway-name"] != "front" {
+		t.Errorf("peer = %+v", peer)
+	}
+	for _, bad := range []GatewayOptions{{Namespace: "edge"}, {Name: "front"}, {Namespace: "Bad_NS"}} {
+		if err := bad.Validate(); err == nil {
+			t.Errorf("%+v should be invalid", bad)
+		}
+	}
+	if err := (GatewayOptions{}).Validate(); err != nil {
+		t.Errorf("defaults invalid: %v", err)
 	}
 }
 

@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"fmt"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -8,6 +9,7 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 
 	idpv1alpha1 "github.com/ithaca-lab-org/idp-portal/operator/api/v1alpha1"
 )
@@ -33,8 +35,10 @@ const (
 	LimitRangeName        = "idp-limits"
 	DenyIngressPolicyName = "idp-default-deny-ingress"
 	SameNamespacePolicy   = "idp-allow-same-namespace"
-	AdminRoleBindingName  = "idp-namespace-admin"
-	AdminClusterRole      = "admin"
+	// GatewayPolicyName admits the ingress Gateway pods (see GatewayOptions).
+	GatewayPolicyName    = "idp-allow-ingress-gateway"
+	AdminRoleBindingName = "idp-namespace-admin"
+	AdminClusterRole     = "admin"
 )
 
 var reservedNames = map[string]bool{
@@ -158,6 +162,68 @@ func desiredSameNamespaceSpec() networkingv1.NetworkPolicySpec {
 		PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
 		Ingress: []networkingv1.NetworkPolicyIngressRule{{
 			From: []networkingv1.NetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{}}},
+		}},
+	}
+}
+
+// GatewayOptions names the ingress Gateway whose pods may reach workload pods.
+// Empty fields fall back to the defaults. The admission policy
+// (config/policy/operator-scope.yaml) pins the defaults, so a different value
+// makes the policy write fail until the policy changes too.
+type GatewayOptions struct {
+	Namespace string
+	Name      string
+}
+
+const (
+	DefaultGatewayNamespace = "istio-ingress"
+	DefaultGatewayName      = "ingress"
+
+	labelGatewayName = "gateway.networking.k8s.io/gateway-name"
+	labelNamespaceID = "kubernetes.io/metadata.name"
+)
+
+func (g GatewayOptions) withDefaults() GatewayOptions {
+	if g.Namespace == "" {
+		g.Namespace = DefaultGatewayNamespace
+	}
+	if g.Name == "" {
+		g.Name = DefaultGatewayName
+	}
+	return g
+}
+
+// Validate refuses anything but the defaults: the admission policy and the
+// WorkloadIdentity AuthorizationPolicy hard-code istio-ingress/ingress.
+func (g GatewayOptions) Validate() error {
+	g = g.withDefaults()
+	if g.Namespace != DefaultGatewayNamespace || g.Name != DefaultGatewayName {
+		return fmt.Errorf("gateway %s/%s: only %s/%s is supported (pinned by the admission policy)",
+			g.Namespace, g.Name, DefaultGatewayNamespace, DefaultGatewayName)
+	}
+	return nil
+}
+
+// desiredAllowIngressGatewaySpec admits the ingress Gateway pods to all pods of
+// the namespace. Namespace and pod selector sit in ONE peer so they AND (two
+// peers would OR, admitting every pod of the gateway namespace or every pod
+// with that label anywhere). Only TCP 15008 is open: the gateway reaches
+// ambient workloads through HBONE on 15008 only (ADR-0002 check 4 in
+// idp-infra/docs/smoke-ambient.md showed a 15008-only policy keeps ambient
+// working). Non-ambient tenant pods are intentionally not reachable through
+// the gateway.
+func desiredAllowIngressGatewaySpec(g GatewayOptions) networkingv1.NetworkPolicySpec {
+	g = g.withDefaults()
+	tcp, hbone := corev1.ProtocolTCP, intstr.FromInt32(15008)
+	return networkingv1.NetworkPolicySpec{
+		PodSelector: metav1.LabelSelector{},
+		PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
+		Ingress: []networkingv1.NetworkPolicyIngressRule{{
+			Ports: []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: &hbone}},
+			From: []networkingv1.NetworkPolicyPeer{{
+				NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{labelNamespaceID: g.Namespace}},
+				PodSelector:       &metav1.LabelSelector{MatchLabels: map[string]string{labelGatewayName: g.Name}},
+			}},
 		}},
 	}
 }

@@ -22,6 +22,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/rest"
 	"k8s.io/utils/ptr"
@@ -355,6 +356,94 @@ func TestPolicyDeniesOperatorOutsideManagedNamespaces(t *testing.T) {
 		allow := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "allow-all", Namespace: managed},
 			Spec: networkingv1.NetworkPolicySpec{Ingress: []networkingv1.NetworkPolicyIngressRule{{}}}}
 		wantPolicyDenial(t, "extra networkpolicy in managed ns", op.Create(ctx, allow, dry))
+	})
+
+	t.Run("gateway networkpolicy", func(t *testing.T) {
+		mk := func(name string, mut func(*networkingv1.NetworkPolicySpec)) *networkingv1.NetworkPolicy {
+			np := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: managed},
+				Spec: desiredAllowIngressGatewaySpec(GatewayOptions{})}
+			if mut != nil {
+				mut(&np.Spec)
+			}
+			return np
+		}
+		// Allowed: the exact spec, on update too (the policy already exists).
+		if err := op.Create(ctx, mk("idp-allow-ingress-gateway-x", nil), dry); !isPolicyDenial(err) {
+			t.Errorf("a different name must be denied, got %v", err)
+		}
+		existing := get(t, &networkingv1.NetworkPolicy{}, managed, GatewayPolicyName)
+		existing.Spec = desiredAllowIngressGatewaySpec(GatewayOptions{})
+		if err := op.Update(ctx, existing, dry); err != nil {
+			t.Errorf("exact spec update denied: %v", err)
+		}
+		gone := mk(GatewayPolicyName, nil)
+		gone.Namespace = plain
+		wantPolicyDenial(t, "gateway policy in unmanaged ns", op.Create(ctx, gone, dry))
+
+		sel := func(k, v string) *metav1.LabelSelector {
+			return &metav1.LabelSelector{MatchLabels: map[string]string{k: v}}
+		}
+		// An entirely empty peer, and an ipBlock combined with selectors, are
+		// rejected by the built-in NetworkPolicy validation before admission.
+		cases := map[string]func(*networkingv1.NetworkPolicySpec){
+			"extra peer": func(s *networkingv1.NetworkPolicySpec) {
+				s.Ingress[0].From = append(s.Ingress[0].From, networkingv1.NetworkPolicyPeer{PodSelector: sel("a", "b")})
+			},
+			"empty selectors": func(s *networkingv1.NetworkPolicySpec) {
+				s.Ingress[0].From = []networkingv1.NetworkPolicyPeer{{
+					NamespaceSelector: &metav1.LabelSelector{}, PodSelector: &metav1.LabelSelector{}}}
+			},
+			"no from (allow all)": func(s *networkingv1.NetworkPolicySpec) { s.Ingress[0].From = nil },
+			"empty rule":          func(s *networkingv1.NetworkPolicySpec) { s.Ingress = []networkingv1.NetworkPolicyIngressRule{{}} },
+			"ipBlock": func(s *networkingv1.NetworkPolicySpec) {
+				s.Ingress[0].From = []networkingv1.NetworkPolicyPeer{{IPBlock: &networkingv1.IPBlock{CIDR: "0.0.0.0/0"}}}
+			},
+			"namespace only": func(s *networkingv1.NetworkPolicySpec) { s.Ingress[0].From[0].PodSelector = nil },
+			"pods only":      func(s *networkingv1.NetworkPolicySpec) { s.Ingress[0].From[0].NamespaceSelector = nil },
+			"wrong namespace": func(s *networkingv1.NetworkPolicySpec) {
+				s.Ingress[0].From[0].NamespaceSelector = sel("kubernetes.io/metadata.name", "kube-system")
+			},
+			"wrong pod selector": func(s *networkingv1.NetworkPolicySpec) {
+				s.Ingress[0].From[0].PodSelector = sel("gateway.networking.k8s.io/gateway-name", "other")
+			},
+			"extra pod label": func(s *networkingv1.NetworkPolicySpec) {
+				s.Ingress[0].From[0].PodSelector.MatchLabels["x"] = "y"
+			},
+			"matchExpressions": func(s *networkingv1.NetworkPolicySpec) {
+				s.Ingress[0].From[0].PodSelector = &metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{
+					{Key: "gateway.networking.k8s.io/gateway-name", Operator: metav1.LabelSelectorOpExists}}}
+			},
+			"no ports": func(s *networkingv1.NetworkPolicySpec) { s.Ingress[0].Ports = nil },
+			"port 8080": func(s *networkingv1.NetworkPolicySpec) {
+				p := intstr.FromInt32(8080)
+				s.Ingress[0].Ports[0].Port = &p
+			},
+			"second port": func(s *networkingv1.NetworkPolicySpec) {
+				p := intstr.FromInt32(8080)
+				s.Ingress[0].Ports = append(s.Ingress[0].Ports, networkingv1.NetworkPolicyPort{Port: &p})
+			},
+			"UDP": func(s *networkingv1.NetworkPolicySpec) {
+				u := corev1.ProtocolUDP
+				s.Ingress[0].Ports[0].Protocol = &u
+			},
+			"port range": func(s *networkingv1.NetworkPolicySpec) {
+				e := int32(16000)
+				s.Ingress[0].Ports[0].EndPort = &e
+			},
+			"second rule": func(s *networkingv1.NetworkPolicySpec) {
+				s.Ingress = append(s.Ingress, networkingv1.NetworkPolicyIngressRule{})
+			},
+			"narrowed target pods": func(s *networkingv1.NetworkPolicySpec) { s.PodSelector = *sel("a", "b") },
+			"egress type": func(s *networkingv1.NetworkPolicySpec) {
+				s.PolicyTypes = append(s.PolicyTypes, networkingv1.PolicyTypeEgress)
+			},
+		}
+		for what, mut := range cases {
+			wantPolicyDenial(t, "create gateway policy with "+what, op.Create(ctx, mk("idp-allow-ingress-gateway", mut), dry))
+			bad := get(t, &networkingv1.NetworkPolicy{}, managed, GatewayPolicyName)
+			bad.Spec = mk(GatewayPolicyName, mut).Spec
+			wantPolicyDenial(t, "update gateway policy with "+what, op.Update(ctx, bad, dry))
+		}
 	})
 }
 
