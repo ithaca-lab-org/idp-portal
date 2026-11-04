@@ -118,7 +118,7 @@ spec:
         request.name in {
           'resourcequotas': ['idp-quota'],
           'limitranges': ['idp-limits'],
-          'networkpolicies': ['idp-default-deny-ingress', 'idp-allow-same-namespace'],
+          'networkpolicies': ['idp-default-deny-ingress', 'idp-allow-same-namespace', 'idp-allow-ingress-gateway'],
           'rolebindings': ['idp-namespace-admin'],
           'serviceaccounts': ['vault-reader'],
           'vaultauths': ['vault-reader']
@@ -289,6 +289,27 @@ spec:
              p.matches('^[a-z0-9]([-a-z0-9.]*[a-z0-9])?/ns/istio-ingress/sa/ingress-istio$'))))
       reason: Forbidden
       message: "idp-operator AuthorizationPolicies must match the operator's fixed spec (ALLOW for pods labelled idp.ithaca-idp.com/workload=<name> from the same namespace and the ingress gateway principal only)"
+    # idp-allow-ingress-gateway is exactly desiredAllowIngressGatewaySpec: all
+    # pods, Ingress, one rule with ONE peer holding both selectors (namespace
+    # istio-ingress AND pods gateway-name=ingress), only TCP 15008 (HBONE). An extra peer, an
+    # empty peer (allow all), an ipBlock or any other selector is denied. The
+    # literals are the --gateway-namespace/--gateway-name defaults; change both
+    # together. Other NetworkPolicy specs are not constrained here.
+    - expression: >-
+        request.resource.resource != 'networkpolicies' || request.operation == 'DELETE' ||
+        request.name != 'idp-allow-ingress-gateway' ||
+        (has(object.spec) && size(object.spec.?podSelector.orValue({})) == 0 &&
+         object.spec.?policyTypes.orValue([]) == ['Ingress'] && !has(object.spec.egress) &&
+         has(object.spec.ingress) && size(object.spec.ingress) == 1 &&
+         object.spec.ingress.all(r, has(r.ports) && size(r.ports) == 1 &&
+           r.ports.all(p, p.?protocol.orValue('') == 'TCP' && p.?port.orValue(0) == 15008 && !has(p.endPort)) && has(r.from) && size(r.from) == 1 &&
+           r.from.all(f, !has(f.ipBlock) &&
+             has(f.namespaceSelector) && !has(f.namespaceSelector.matchExpressions) &&
+             f.namespaceSelector.?matchLabels.orValue({}) == {'kubernetes.io/metadata.name': 'istio-ingress'} &&
+             has(f.podSelector) && !has(f.podSelector.matchExpressions) &&
+             f.podSelector.?matchLabels.orValue({}) == {'gateway.networking.k8s.io/gateway-name': 'ingress'})))
+      reason: Forbidden
+      message: "idp-operator may write idp-allow-ingress-gateway only as: all pods, Ingress, one peer admitting pods labelled gateway.networking.k8s.io/gateway-name=ingress in namespace istio-ingress, only TCP 15008"
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding

@@ -33,6 +33,7 @@ func main() {
 		secureMetrics bool
 		leaderElect   bool
 		wiOpts        controller.WorkloadIdentityOptions
+		gwOpts        controller.GatewayOptions
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8443", "Metrics endpoint address; \"0\" disables it.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "Health and readiness probe address.")
@@ -42,6 +43,10 @@ func main() {
 		"Istio trust domain for WorkloadIdentity SPIFFE IDs and the gateway principal (env TRUST_DOMAIN).")
 	flag.StringVar(&wiOpts.HostnameSuffix, "workload-hostname-suffix", envOr("WORKLOAD_HOSTNAME_SUFFIX", controller.DefaultHostnameSuffix),
 		"WorkloadIdentity hostnames are <name>.<namespace>.<suffix> (env WORKLOAD_HOSTNAME_SUFFIX).")
+	flag.StringVar(&gwOpts.Namespace, "gateway-namespace", envOr("GATEWAY_NAMESPACE", controller.DefaultGatewayNamespace),
+		"Namespace of the ingress Gateway pods admitted by idp-allow-ingress-gateway (env GATEWAY_NAMESPACE).")
+	flag.StringVar(&gwOpts.Name, "gateway-name", envOr("GATEWAY_NAME", controller.DefaultGatewayName),
+		"Name of the ingress Gateway (label gateway.networking.k8s.io/gateway-name) admitted by idp-allow-ingress-gateway (env GATEWAY_NAME).")
 	zapOpts := zap.Options{Development: false}
 	zapOpts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -80,6 +85,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err := gwOpts.Validate(); err != nil {
+		log.Error(err, "invalid gateway configuration")
+		os.Exit(1)
+	}
+
 	// VAULT_ENABLED=false (default) keeps the operator free of any Vault objects,
 	// finalizer or calls.
 	vaultOpts, err := controller.VaultOptionsFromEnv(os.Getenv)
@@ -94,9 +104,10 @@ func main() {
 	}
 
 	if err := (&controller.TeamNamespaceReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		Vault:  vaultOpts,
+		Client:  mgr.GetClient(),
+		Scheme:  mgr.GetScheme(),
+		Vault:   vaultOpts,
+		Gateway: gwOpts,
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to set up controller", "controller", "TeamNamespace")
 		os.Exit(1)
@@ -146,7 +157,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	log.Info("starting manager", "trustDomain", wiOpts.TrustDomain, "workloadHostnameSuffix", wiOpts.HostnameSuffix)
+	log.Info("starting manager", "gateway", gwOpts.Namespace+"/"+gwOpts.Name, "trustDomain", wiOpts.TrustDomain, "workloadHostnameSuffix", wiOpts.HostnameSuffix)
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		log.Error(err, "manager exited with error")
 		os.Exit(1)

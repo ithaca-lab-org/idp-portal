@@ -79,6 +79,10 @@ type TeamNamespaceStatus struct {
 }
 
 // TeamNamespace requests a guarded namespace whose name equals metadata.name.
+// Ingress is denied by default (idp-default-deny-ingress); the operator adds
+// idp-allow-same-namespace and idp-allow-ingress-gateway, which admits the
+// ingress Gateway pods (istio-ingress, gateway-name=ingress) to all pods so
+// HTTPRoutes of WorkloadIdentities can reach their workloads.
 // With VAULT_ENABLED=true the operator also adds the finalizer
 // idp.ithaca-idp.com/vault-purge, which deletes all Vault KV data under
 // kv/<name>/ before the resource goes away. If Vault is unreachable it retries
