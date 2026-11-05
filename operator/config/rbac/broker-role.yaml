@@ -1,0 +1,70 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: idp-broker
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - namespaces
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - events.k8s.io
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
+  - idp.ithaca-idp.com
+  resources:
+  - bucketclaims
+  - resourcegrants
+  verbs:
+  - get
+  - list
+  - update
+  - watch
+- apiGroups:
+  - idp.ithaca-idp.com
+  resources:
+  - bucketclaims/finalizers
+  - resourcegrants/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - idp.ithaca-idp.com
+  resources:
+  - bucketclaims/status
+  - resourcegrants/status
+  verbs:
+  - get
+  - update
+- apiGroups:
+  - idp.ithaca-idp.com
+  resources:
+  - teamnamespaces
+  - workloadidentities
+  verbs:
+  - get
+  - list
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: idp-broker
+  namespace: idp-system
+rules:
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - create
+  - get
+  - update

@@ -32,6 +32,7 @@ jobs:
         include:
           - {image: portal-api, context: ., file: Dockerfile}
           - {image: idp-operator, context: operator, file: operator/Dockerfile}
+          - {image: idp-broker, context: operator, file: operator/Dockerfile.broker}
           - {image: portal-notifier, context: notifier, file: notifier/Dockerfile}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -74,6 +75,7 @@ jobs:
         include:
           - {image: portal-api, context: ., file: Dockerfile}
           - {image: idp-operator, context: operator, file: operator/Dockerfile}
+          - {image: idp-broker, context: operator, file: operator/Dockerfile.broker}
           - {image: portal-notifier, context: notifier, file: notifier/Dockerfile}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
