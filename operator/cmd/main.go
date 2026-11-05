@@ -3,13 +3,20 @@ package main
 import (
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
@@ -34,6 +41,8 @@ func main() {
 		leaderElect   bool
 		wiOpts        controller.WorkloadIdentityOptions
 		gwOpts        controller.GatewayOptions
+		tcOpts        controller.TenantCertOptions
+		tcEnabled     bool
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8443", "Metrics endpoint address; \"0\" disables it.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "Health and readiness probe address.")
@@ -47,6 +56,17 @@ func main() {
 		"Namespace of the ingress Gateway pods admitted by idp-allow-ingress-gateway (env GATEWAY_NAMESPACE).")
 	flag.StringVar(&gwOpts.Name, "gateway-name", envOr("GATEWAY_NAME", controller.DefaultGatewayName),
 		"Name of the ingress Gateway (label gateway.networking.k8s.io/gateway-name) admitted by idp-allow-ingress-gateway (env GATEWAY_NAME).")
+	tcEnabledDefault, err := strconv.ParseBool(envOr("TENANT_CERT_ENABLED", "false"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "invalid TENANT_CERT_ENABLED:", err)
+		os.Exit(1)
+	}
+	flag.BoolVar(&tcEnabled, "tenant-cert-enabled", tcEnabledDefault,
+		"Keep spec.dnsNames of the platform wildcard Certificate in step with the TeamNamespaces (env TENANT_CERT_ENABLED).")
+	flag.StringVar(&tcOpts.Namespace, "tenant-cert-namespace", envOr("TENANT_CERT_NAMESPACE", controller.DefaultTenantCertNamespace),
+		"Namespace of the Certificate whose dnsNames are managed (env TENANT_CERT_NAMESPACE).")
+	flag.StringVar(&tcOpts.Name, "tenant-cert-name", envOr("TENANT_CERT_NAME", controller.DefaultTenantCertName),
+		"Name of the Certificate whose dnsNames are managed (env TENANT_CERT_NAME).")
 	zapOpts := zap.Options{Development: false}
 	zapOpts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -68,7 +88,42 @@ func main() {
 		metricsOpts.FilterProvider = filters.WithAuthenticationAndAuthorization
 	}
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	restCfg := ctrl.GetConfigOrDie()
+
+	// The tenant certificate controller needs the cert-manager Certificate CRD.
+	// The check runs before the manager exists because the cache restriction
+	// below (one namespace, so Certificates are not listed cluster-wide) needs
+	// the CRD to be served at manager creation.
+	cacheOpts := cache.Options{}
+	tenantCert := false
+	if tcEnabled {
+		tcOpts.BaseDomain, err = controller.TenantCertBaseDomain(wiOpts.HostnameSuffix)
+		if err == nil {
+			err = tcOpts.Validate()
+		}
+		if err != nil {
+			log.Error(err, "invalid tenant certificate configuration")
+			os.Exit(1)
+		}
+		missing, err := tenantCertCRDMissing(restCfg)
+		switch {
+		case err != nil:
+			log.Error(err, "unable to check the Certificate CRD")
+			os.Exit(1)
+		case missing:
+			log.Info("tenant certificate controller disabled: cert-manager.io Certificate CRD is not served (restart the operator after installing it)")
+		default:
+			tenantCert = true
+			cacheOpts.ByObject = map[client.Object]cache.ByObject{
+				newCertificate(): {Namespaces: map[string]cache.Config{tcOpts.Namespace: {}}},
+			}
+		}
+	} else {
+		log.Info("tenant certificate controller disabled (--tenant-cert-enabled=false)")
+	}
+
+	mgr, err := ctrl.NewManager(restCfg, ctrl.Options{
+		Cache:                  cacheOpts,
 		Scheme:                 scheme,
 		Metrics:                metricsOpts,
 		HealthProbeBindAddress: probeAddr,
@@ -148,6 +203,14 @@ func main() {
 		}
 	}
 
+	if tenantCert {
+		if err := (&controller.TenantCertReconciler{Client: mgr.GetClient(), Options: tcOpts}).SetupWithManager(mgr); err != nil {
+			log.Error(err, "unable to set up controller", "controller", "TenantCert")
+			os.Exit(1)
+		}
+		log.Info("tenant certificate controller enabled", "certificate", tcOpts.Namespace+"/"+tcOpts.Name, "baseDomain", tcOpts.BaseDomain)
+	}
+
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		log.Error(err, "unable to set up health check")
 		os.Exit(1)
@@ -162,6 +225,24 @@ func main() {
 		log.Error(err, "manager exited with error")
 		os.Exit(1)
 	}
+}
+
+func newCertificate() *unstructured.Unstructured {
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(controller.CertificateGVK)
+	return u
+}
+
+func tenantCertCRDMissing(cfg *rest.Config) (bool, error) {
+	httpClient, err := rest.HTTPClientFor(cfg)
+	if err != nil {
+		return false, err
+	}
+	mapper, err := apiutil.NewDynamicRESTMapper(cfg, httpClient)
+	if err != nil {
+		return false, err
+	}
+	return controller.TenantCertCRDMissing(mapper)
 }
 
 func envOr(key, def string) string {

@@ -45,6 +45,11 @@ spec:
         apiVersions: ["*"]
         operations: ["CREATE", "UPDATE", "DELETE"]
         resources: ["authorizationpolicies", "authorizationpolicies/*"]
+      # The platform wildcard Certificate: only its spec.dnsNames may be updated.
+      - apiGroups: ["cert-manager.io"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["certificates", "certificates/*"]
   matchConditions:
     - name: is-idp-operator
       expression: "request.userInfo.username == 'system:serviceaccount:idp-system:idp-operator'"
@@ -74,6 +79,8 @@ spec:
         namespaceObject != null && has(namespaceObject.metadata.labels) &&
         namespaceObject.metadata.labels[?'app.kubernetes.io/managed-by'] == optional.of('idp-operator') &&
         namespaceObject.metadata.labels[?'idp.ithaca-idp.com/team-namespace'] == optional.of(namespaceObject.metadata.name)
+    - name: isCert
+      expression: "request.resource.group == 'cert-manager.io' && request.resource.resource == 'certificates'"
     - name: isVSS
       expression: "request.resource.resource == 'vaultstaticsecrets'"
     # Objects named after a WorkloadIdentity: all HTTPRoutes and
@@ -107,14 +114,14 @@ spec:
         object.metadata.labels[?'pod-security.kubernetes.io/enforce'].orValue('') in ['baseline', 'restricted']
       reason: Forbidden
       message: "idp-operator must keep pod-security.kubernetes.io/enforce at baseline or restricted"
-    - expression: "variables.isNamespace || variables.parentOwned"
+    - expression: "variables.isNamespace || variables.isCert || variables.parentOwned"
       reason: Forbidden
       messageExpression: >-
         'idp-operator may only write ' + request.resource.resource + ' in namespaces labelled app.kubernetes.io/managed-by=idp-operator (namespace ' + request.namespace + ')'
     # Child names are fixed in the controller; pinning them stops extra objects
     # (e.g. an allow-all NetworkPolicy) from being added next to the managed ones.
     - expression: >-
-        variables.isNamespace || variables.isVSS || variables.isWI ||
+        variables.isNamespace || variables.isCert || variables.isVSS || variables.isWI ||
         request.name in {
           'resourcequotas': ['idp-quota'],
           'limitranges': ['idp-limits'],
@@ -125,6 +132,49 @@ spec:
         }[request.resource.resource]
       reason: Forbidden
       messageExpression: "'idp-operator may not write ' + request.resource.resource + ' named ' + request.name"
+    # The tenant certificate (ADR 0009, option 2b): the one Certificate
+    # istio-ingress/wildcard-apps (the Gateway's only certificateRef), UPDATE
+    # only, never CREATE, DELETE or a subresource. The Certificate lives in a
+    # platform namespace, so the managed-namespace rule above does not apply.
+    - expression: >-
+        !variables.isCert ||
+        (request.operation == 'UPDATE' && request.?subResource.orValue('') == '' &&
+         request.name == 'wildcard-apps' && request.namespace == 'istio-ingress')
+      reason: Forbidden
+      message: "idp-operator may only UPDATE the Certificate istio-ingress/wildcard-apps (no create, delete or subresource)"
+    # Everything but spec.dnsNames is unchanged: other spec fields (issuerRef,
+    # secretName, commonName, ...) compared key by key in both directions, so a
+    # field added by a later cert-manager release is covered too (dyn() lets
+    # the comprehension range over the typed spec), and labels, annotations,
+    # ownerReferences and finalizers.
+    - expression: >-
+        !variables.isCert || request.operation != 'UPDATE' ||
+        (has(object.spec) && has(oldObject.spec) &&
+         object.metadata.?labels.orValue({}) == oldObject.metadata.?labels.orValue({}) &&
+         object.metadata.?annotations.orValue({}) == oldObject.metadata.?annotations.orValue({}) &&
+         object.metadata.?ownerReferences.orValue([]) == oldObject.metadata.?ownerReferences.orValue([]) &&
+         object.metadata.?finalizers.orValue([]) == oldObject.metadata.?finalizers.orValue([]) &&
+         dyn(object.spec).all(k, k == 'dnsNames' || (k in dyn(oldObject.spec) && dyn(object.spec)[k] == dyn(oldObject.spec)[k])) &&
+         dyn(oldObject.spec).all(k, k == 'dnsNames' || k in dyn(object.spec)))
+      reason: Forbidden
+      message: "idp-operator may change only spec.dnsNames of the tenant Certificate"
+    # dnsNames: [0] is the platform wildcard, every other entry is
+    # *.<label>.apps.ithaca-idp.com with ONE label of at most 40 characters that
+    # is not a reserved namespace name (same list as for namespaces), no
+    # duplicates, at most 100 entries (Let's Encrypt). The literals follow
+    # --workload-hostname-suffix; change both together.
+    - expression: >-
+        !variables.isCert || request.operation != 'UPDATE' ||
+        (object.spec.?dnsNames.orValue([]).size() >= 1 && object.spec.?dnsNames.orValue([]).size() <= 100 &&
+         object.spec.dnsNames[0] == '*.apps.ithaca-idp.com' &&
+         object.spec.dnsNames.all(a, object.spec.dnsNames.exists_one(b, a == b)) &&
+         object.spec.dnsNames.all(n, n == '*.apps.ithaca-idp.com' ||
+           (n.matches('^[*][.][a-z0-9]([-a-z0-9]*[a-z0-9])?[.]apps[.]ithaca-idp[.]com$') &&
+            [n.substring(2, n.size() - '.apps.ithaca-idp.com'.size())].all(l, l.size() <= 40 &&
+              !(l in ['default', 'argocd', 'cert-manager', 'tailscale', 'identity', 'idp-system', 'echo', 'vault']) &&
+              !['kube-', 'istio-', 'gke-', 'vault-'].exists(p, l.startsWith(p))))))
+      reason: Forbidden
+      message: "idp-operator Certificate dnsNames must be *.apps.ithaca-idp.com first, then only *.<namespace>.apps.ithaca-idp.com for non-reserved single labels of at most 40 characters, no duplicates, at most 100 names"
     # One User subject that looks like an email: no Groups, no ServiceAccounts,
     # and no 'system:' users (a ServiceAccount can also be named as a User
     # system:serviceaccount:<ns>:<name>).
