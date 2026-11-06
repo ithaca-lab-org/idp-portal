@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { ApiError, getWorkload, type Workload } from "./api";
 
 /** A copy button; the clipboard can be refused (no permission, insecure context), so say so. */
-function CopyButton({ label, value }: { label: string; value: string }) {
+export function CopyButton({ label, value }: { label: string; value: string }) {
   const [state, setState] = useState<"idle" | "copied" | "failed">("idle");
   async function copy() {
     try {

@@ -527,6 +527,8 @@ func portalAPIClient(t *testing.T) client.Client {
 				{APIGroups: []string{idpv1alpha1.GroupVersion.Group}, Resources: []string{"teamnamespaces"}, Verbs: []string{"get", "create"}},
 				{APIGroups: []string{idpv1alpha1.GroupVersion.Group}, Resources: []string{"managedsecrets"}, Verbs: []string{"get", "create", "delete"}},
 				{APIGroups: []string{idpv1alpha1.GroupVersion.Group}, Resources: []string{"workloadidentities"}, Verbs: []string{"get", "list", "create"}},
+				{APIGroups: []string{idpv1alpha1.GroupVersion.Group}, Resources: []string{"bucketclaims"}, Verbs: []string{"get", "list", "create"}},
+				{APIGroups: []string{idpv1alpha1.GroupVersion.Group}, Resources: []string{"resourcegrants"}, Verbs: []string{"get", "list", "create", "delete"}},
 			}},
 			&rbacv1.ClusterRoleBinding{
 				ObjectMeta: metav1.ObjectMeta{Name: "idp-portal-orders"},

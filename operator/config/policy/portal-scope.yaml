@@ -1,12 +1,19 @@
-# Confines the portal's ServiceAccount (idp-system/portal-api) on ManagedSecrets
-# and WorkloadIdentities. Its RBAC (ClusterRole idp-portal-orders in idp-gitops
-# workloads/portal) grants get, create and delete on managedsecrets and get,
-# list and create on workloadidentities cluster-wide, because tenant namespaces
-# are created at runtime; this policy limits those writes to namespaces the
-# operator manages. Only the portal's requests are evaluated.
-# The CRDs prune unknown spec fields (the specs have none), so the portal cannot
-# pass anything to the operator except a namespace and a name. A
-# WorkloadIdentity is create-only for the portal (no update, no delete).
+# Confines the portal's ServiceAccount (idp-system/portal-api) on ManagedSecrets,
+# WorkloadIdentities, BucketClaims and ResourceGrants. Its RBAC (ClusterRole
+# idp-portal-orders in idp-gitops workloads/portal) grants get, create and delete
+# on managedsecrets, get, list and create on workloadidentities and bucketclaims,
+# and get, list, create and delete on resourcegrants cluster-wide, because
+# tenant namespaces are created at runtime; this policy limits those writes to
+# namespaces the operator manages. Only the portal's requests are evaluated.
+# The CRDs prune unknown spec fields (the specs have none, except a
+# ResourceGrant's three), so the portal cannot pass anything to the operator
+# except a namespace, a name and, for a grant, a workload, a bucket claim and an
+# access level. A WorkloadIdentity and a BucketClaim are create-only for the
+# portal (no update, no delete: a deleted claim can orphan a bucket that holds
+# data); a ResourceGrant can be created and deleted (revoked), never updated.
+# The BucketClaim and ResourceGrant rules repeat the CRDs' (ADR 0010); where the
+# CRD's own validation rejects first (name length and format, the access enum,
+# the grant's fields) the envtest says so instead of expecting this policy's text.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -18,7 +25,8 @@ spec:
       - apiGroups: ["idp.ithaca-idp.com"]
         apiVersions: ["*"]
         operations: ["CREATE", "UPDATE", "DELETE"]
-        resources: ["managedsecrets", "managedsecrets/*", "workloadidentities", "workloadidentities/*"]
+        resources: ["managedsecrets", "managedsecrets/*", "workloadidentities", "workloadidentities/*",
+                    "bucketclaims", "bucketclaims/*", "resourcegrants", "resourcegrants/*"]
   matchConditions:
     - name: is-portal-api
       expression: "request.userInfo.username == 'system:serviceaccount:idp-system:portal-api'"
@@ -36,14 +44,14 @@ spec:
     # Create and delete only; never edit an existing object or its status.
     - expression: "request.operation != 'UPDATE' && request.?subResource.orValue('') == ''"
       reason: Forbidden
-      message: "portal-api may not update managedsecrets, workloadidentities or their subresources"
+      message: "portal-api may not update managedsecrets, workloadidentities, bucketclaims, resourcegrants or their subresources"
     # A finalizer could block deletion forever, an ownerReference could hand the
     # object to the garbage collector; the portal needs neither.
     - expression: >-
         request.operation != 'CREATE' ||
         (!has(object.metadata.finalizers) && !has(object.metadata.ownerReferences))
       reason: Forbidden
-      message: "portal-api may not set finalizers or ownerReferences on managedsecrets or workloadidentities"
+      message: "portal-api may not set finalizers or ownerReferences on managedsecrets, workloadidentities, bucketclaims or resourcegrants"
     # A WorkloadIdentity owns a ServiceAccount, a route and (with Vault on) a purge of
     # kv/<ns>/<name>/ when it goes away: the portal creates them and never deletes.
     - expression: "request.resource.resource != 'workloadidentities' || request.operation == 'CREATE'"
@@ -70,6 +78,52 @@ spec:
         !has(object.spec) || size(object.spec) == 0
       reason: Forbidden
       message: "portal-api may not set a workloadidentity spec"
+    # A BucketClaim is create-only: the broker deletes the bucket only if it is empty and
+    # otherwise keeps it with its data, so the portal never deletes a claim (ADR 0010).
+    - expression: "request.resource.resource != 'bucketclaims' || request.operation == 'CREATE'"
+      reason: Forbidden
+      message: "portal-api may only create bucketclaims"
+    # A ResourceGrant is created and revoked (deleted); UPDATE is refused above.
+    - expression: "request.resource.resource != 'resourcegrants' || request.operation in ['CREATE', 'DELETE']"
+      reason: Forbidden
+      message: "portal-api may only create and delete resourcegrants"
+    # Same rules as the BucketClaim CRD and the broker (operator/internal/broker/rules.go): a DNS
+    # label of at most 18 characters, no "google" and no "goog" prefix, in a namespace of at most
+    # 31 characters (so that idp-<ns>-<claim>-<8 hex> fits the 63 of a bucket name) that Cloud
+    # Storage accepts. The spec must be empty.
+    - expression: >-
+        request.resource.resource != 'bucketclaims' || request.operation != 'CREATE' ||
+        (object.metadata.name.size() <= 18 &&
+        object.metadata.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$') &&
+        !object.metadata.name.contains('google') && !object.metadata.name.startsWith('goog') &&
+        request.namespace.size() <= 31 &&
+        !request.namespace.contains('google') && !request.namespace.startsWith('goog'))
+      reason: Forbidden
+      message: "portal-api may not create a bucketclaim with that name or in that namespace"
+    - expression: >-
+        request.resource.resource != 'bucketclaims' || request.operation != 'CREATE' ||
+        !has(object.spec) || size(object.spec) == 0
+      reason: Forbidden
+      message: "portal-api may not set a bucketclaim spec"
+    # A grant is one reviewed shape: the access is on the menu, the name is exactly
+    # <workload>-<resource> (so a repeat is a duplicate, and a grant cannot hide behind another
+    # name), and both parts follow the CRD's name rules. The CRD's own validation rejects a bad
+    # enum value or part first; this repeats it in case the CRD is ever loosened.
+    - expression: >-
+        request.resource.resource != 'resourcegrants' || request.operation != 'CREATE' ||
+        (object.spec.access in ['reader', 'writer'] &&
+        object.metadata.name == object.spec.workload + '-' + object.spec.resource &&
+        object.spec.workload.size() <= 40 && object.spec.resource.size() <= 18 &&
+        object.spec.workload.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$') &&
+        object.spec.resource.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'))
+      reason: Forbidden
+      message: "portal-api may not create a resourcegrant with that spec or name"
+    # Labels and annotations on these kinds would be read by nothing the portal needs.
+    - expression: >-
+        !(request.resource.resource in ['bucketclaims', 'resourcegrants']) || request.operation != 'CREATE' ||
+        (!has(object.metadata.labels) && !has(object.metadata.annotations))
+      reason: Forbidden
+      message: "portal-api may not set labels or annotations on bucketclaims or resourcegrants"
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding

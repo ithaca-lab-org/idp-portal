@@ -589,3 +589,42 @@ func TestGrantSyncDuringReleaseWritesNothing(t *testing.T) {
 		t.Errorf("labels = %v", b.labels)
 	}
 }
+
+// TestSameClaimNameInTwoNamespacesKeepsSeparateBuckets: claims, grants and workloads of the same
+// names in two namespaces get different buckets, and each bucket binds only its own namespace's
+// principal.
+func TestSameClaimNameInTwoNamespacesKeepsSeparateBuckets(t *testing.T) {
+	requireEnvtest(t)
+	f := newFakeCloud()
+	r := grantReconciler(f)
+	buckets := map[string]*fakeBucket{}
+	for _, ns := range []string{"rg-twin-a", "rg-twin-b"} {
+		managedNamespace(t, ns)
+		buckets[ns] = readyClaim(t, f, ns, "data")
+		newWI(t, ns, "web")
+		if err := k8s.Create(ctx, newGrant(ns, "web-data", "web", "data", "reader")); err != nil {
+			t.Fatal(err)
+		}
+		reconcileGrant(t, r, ns, "web-data")
+	}
+	if bn("rg-twin-a", "data") == bn("rg-twin-b", "data") {
+		t.Fatal("two namespaces share a bucket name")
+	}
+	for ns, b := range buckets {
+		if got := b.members(RoleReader); len(got) != 1 || got[0] != memberOf(ns, "web") {
+			t.Errorf("%s readers = %v", ns, got)
+		}
+	}
+	// revoking in one namespace leaves the other's binding alone
+	g := get(t, &idpv1alpha1.ResourceGrant{}, "rg-twin-a", "web-data")
+	if err := k8s.Delete(ctx, g); err != nil {
+		t.Fatal(err)
+	}
+	reconcileGrant(t, r, "rg-twin-a", "web-data")
+	if got := buckets["rg-twin-a"].members(RoleReader); len(got) != 0 {
+		t.Errorf("a revoked binding remains: %v", got)
+	}
+	if got := buckets["rg-twin-b"].members(RoleReader); len(got) != 1 {
+		t.Errorf("the other namespace lost its binding: %v", got)
+	}
+}
