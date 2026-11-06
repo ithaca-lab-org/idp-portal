@@ -3,6 +3,7 @@ ignore: |
   .github/ISSUE_TEMPLATE/
   operator/config/crd/bases/
   operator/config/rbac/role.yaml
+  operator/config/rbac/broker-role.yaml
   operator/test/crds/gateway.networking.k8s.io_httproutes.yaml
   operator/test/crds/security.istio.io_authorizationpolicies.yaml
   operator/test/crds/cert-manager.io_certificates.yaml
