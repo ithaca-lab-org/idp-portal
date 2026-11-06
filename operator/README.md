@@ -135,6 +135,46 @@ The base domain comes from `--workload-hostname-suffix` (a leading dot is accept
 - **RBAC.** Nothing cluster-wide: the generated ClusterRole has no rule for certificates and the cache watches only the Certificate's namespace. A Role in that namespace (idp-gitops) grants `get`, `list`, `watch` on `certificates` and `update`, `patch` on `certificates` with `resourceNames: [wildcard-apps]`.
 - **Admission policy.** The operator may only `UPDATE` that Certificate; create, delete and subresources are denied. Everything except `spec.dnsNames` (other spec fields, labels, annotations, ownerReferences, finalizers) must be unchanged, `dnsNames[0]` is `*.apps.ithaca-idp.com`, every other entry is `*.<label>.apps.ithaca-idp.com` (one label, at most 40 characters, not a reserved namespace name), no duplicates, at most 100 entries. The literals follow `--workload-hostname-suffix`; change both together.
 
+## Resource broker (ADR 0010)
+
+A second binary, `cmd/broker` (image `idp-broker`, `Dockerfile.broker`, Deployment `idp-system/idp-broker` with its own ServiceAccount and Google service account), not part of the operator manager. It turns two namespaced kinds, written by portal-api only, into Cloud Storage buckets and bucket-level IAM bindings. All Google calls go through the `Cloud` interface (`internal/broker/cloud.go`); `gcs.go` is the real implementation, tests use an in-memory fake.
+
+| Kind | Short | Meaning |
+|---|---|---|
+| `BucketClaim` | `bclaim` | empty spec (unknown fields pruned). `metadata.name` = bucket suffix: DNS-1123 label, at most 18 characters. Bucket `idp-<namespace>-<name>-<8 hex>` where the hex is the start of `sha256(<project number>/<namespace>/<name>)`: 4 + namespace (at most 31) + 1 + name (at most 18) + 1 + 8 = 63, the bucket name limit. A namespace of 32 to 40 characters cannot own buckets, and a name containing `google` or starting with `goog` (refused by Cloud Storage) is refused too: `InvalidName`, no Google call. The hash keeps `a-b`/`c` and `a`/`b-c` apart and makes names hard to guess for squatting. |
+| `ResourceGrant` | `rgrant` | `spec.workload` (a WorkloadIdentity in the namespace; WorkloadIdentity name rules), `spec.resource` (a BucketClaim in the namespace), `spec.access` `reader` or `writer`. All three immutable (delete and re-create). Name: DNS-1123 label, at most 63 characters. |
+
+The broker acts only in a namespace managed by a TeamNamespace (the same check as ManagedSecret) and only with `--enabled`.
+
+**Bucket.** Created with uniform bucket-level access, public access prevention enforced, no versioning, no autoclass, location `BUCKET_LOCATION`, and labels `idp-managed=true`, `idp-namespace=<ns>`, `idp-claim=<name>`, `idp-claim-uid=<claim UID>`. Claim condition `Ready`: `True/Provisioned`; `False`: `NamespaceNotManaged`, `InvalidName`, `NameTaken`, `CreateFailed`, `Terminating`, `Orphaned`. `status.bucketName` is set when Ready.
+
+**Ownership rules** (`internal/broker/rules.go`, `Classify`; the file to review). Bucket names are global, so ownership is the project and the labels together. The broker never touches a bucket unless it is in the broker's project (`PROJECT_NUMBER`: the real `GetBucket` answers `ErrForbidden` for any other project, and the controllers check `ProjectNumber` again on every ownership check: adopt, grant sync, release, orphan) and carries `idp-managed=true` and `idp-namespace`, `idp-claim` and `idp-claim-uid` exactly as the claim. If the bucket exists it is read first: same owner labels, same claim UID and created no earlier than the claim (2 min clock tolerance) means adopt (an idempotent retry after a crash of the same claim); anything else (no labels, another owner, an earlier incarnation of the claim with the same name, another project's bucket with copied labels, a bucket retired by an earlier deletion) is `Ready=False/NameTaken` and nothing else is done. Deletes and label changes carry the metageneration of the read that verified ownership; on a precondition failure the bucket is re-read and re-verified.
+
+**Grants.** Role menu, fixed in code: `reader` = `roles/storage.objectViewer`, `writer` = `roles/storage.objectUser`. Member: `principal://iam.googleapis.com/projects/<PROJECT_NUMBER>/locations/global/workloadIdentityPools/<PROJECT_ID>.svc.id.goog/subject/ns/<namespace>/sa/<workload>`. The grant needs: the namespace managed, a live WorkloadIdentity of that name (read-only Get), and a Ready claim whose bucket carries the owner labels. The broker then recomputes the bucket's managed bindings from all non-terminating grants of the claim (only those whose workload exists) and writes them in one read-modify-write with the policy etag (retried on conflicts). It manages only bindings with a menu role and a `principal://` member of this namespace and project; every other binding, conditional bindings included, is left as it is. Missing managed bindings are added, managed ones without a grant (drift, deleted workload) are removed. `CheckMutation(scope, before, after)` refuses any write that adds or removes anything the scope does not manage (another namespace's principal, another project's pool, a non-menu role). Grant condition `Ready`: `True/Bound`; `False`: `NotManaged`, `WorkloadNotFound`, `ClaimNotFound`, `ClaimNotReady`, `GrantFailed`, `Terminating`; `status.member` shows the principal. Finalizer `idp.ithaca-idp.com/grant-release` recomputes the set without the grant on delete; a failing cloud is retried, and the give-up time applies only once the namespace is itself deleting or gone.
+
+**Release and orphan policy (claim delete).** Finalizer `idp.ithaca-idp.com/bucket-release`. Order on delete, so a grant sync cannot undo it: (a) label the bucket `idp-releasing=true` (verified ownership, metageneration precondition), after which every grant refuses the bucket; (b) remove every binding the broker manages (menu roles for `principal://` members of that namespace); (c) try `DeleteBucket` (never recursive; Cloud Storage refuses a bucket with objects, so no object listing is needed): an empty bucket is gone; (d) if it still has objects: label `idp-orphaned=true` and `idp-orphaned-at=<unix>`, remove the bindings again (a grant may have written between (a) and (b)), log, set condition `Orphaned` and record an Event. A grant sync reads the bucket again after its write and strips the bindings if a release began meanwhile. Either way the finalizer is removed, so a claim never blocks namespace deletion or `make down`; grant finalizers on a releasing, retired or missing bucket succeed (nothing to remove). An orphaned bucket is never adopted again (a new claim of that name gets `NameTaken`); a human deletes it. If Google keeps failing, the release is retried with backoff until `BROKER_GIVE_UP_AFTER` (default 30 min) after the deletion timestamp; then the broker retires the bucket best effort (orphan labels, bindings removed), logs an error and drops the finalizer. Even if that fails too, the bucket keeps the old claim's UID label, so a new claim does not adopt it.
+
+| Flag (env) | Default | Meaning |
+|---|---|---|
+| `--enabled` (`BROKER_ENABLED`) | `false` | run the controllers; false is an idle process with probes and no Google call |
+| `--project-id` (`PROJECT_ID`) | (required) | project that owns the buckets; names the identity pool |
+| `--project-number` (`PROJECT_NUMBER`) | (required) | numeric project number used in the member strings |
+| `--bucket-location` (`BUCKET_LOCATION`) | `us-central1` | location of new buckets |
+| `--give-up-after` (`BROKER_GIVE_UP_AFTER`) | `30m` | see above |
+| `--metrics-bind-address` (`METRICS_BIND_ADDRESS`) | `0` (off) | plain HTTP, no authn (the broker has no TokenReview rights) |
+| `--health-probe-bind-address` (`HEALTH_PROBE_BIND_ADDRESS`) | `:8081` | `/healthz`, `/readyz` |
+| `--leader-elect` | `false` | Lease `idp-broker` in `idp-system` |
+
+Each controller runs 4 reconciles in parallel (IAM syncs of one bucket are serialised in-process, and the policy write uses the etag); Google calls share a client-side limit of 10 per second (burst 20).
+
+The cache is cluster-wide for BucketClaims, ResourceGrants, WorkloadIdentities, TeamNamespaces and Namespaces (read-only for the last three).
+
+**Google calls** (application default credentials; on GKE Workload Identity of `idp-system/idp-broker`), all on buckets named `idp-*`: `storage.buckets.insert` (permission `storage.buckets.create`), `storage.buckets.get`, `storage.buckets.patch` (`storage.buckets.update`, labels only, metageneration-guarded), `storage.buckets.delete` (metageneration-guarded), `storage.buckets.getIamPolicy` (policy version 3) and `storage.buckets.setIamPolicy` (with the etag). No object permission: the broker never lists, reads, writes or deletes objects.
+
+**RBAC** (`config/rbac/broker-role.yaml`, generated from the markers in `internal/broker`, ClusterRole and Role `idp-broker`): `bucketclaims`, `resourcegrants`: get, list, watch, update; their `/status`: get, update; their `/finalizers`: update; `workloadidentities`, `teamnamespaces`, `namespaces`: get, list, watch; `events.k8s.io` `events`: create, patch; Role in `idp-system`: `coordination.k8s.io` `leases` get, create, update. Nothing else: no Secrets, no create or delete of anything.
+
+**Admission policy** (`config/policy/broker-scope.yaml`, `idp-broker-scope`): the broker may only UPDATE bucketclaims and resourcegrants and their status; `spec`, labels, annotations and ownerReferences must be unchanged, the finalizers it adds or removes may only be the kind's own (`bucket-release` on claims, `grant-release` on grants; foreign ones such as `foregroundDeletion` may be present and stay), status writes leave finalizers alone, and a claim reports only `status.bucketName` = `idp-<namespace>-<name>-<8 hex>`. portal-api's own policy and RBAC for the two kinds are a later step.
+
 ## Develop
 
 ```sh
@@ -142,7 +182,7 @@ make test     # controller-gen (deepcopy, CRD, RBAC), fetch envtest binaries int
 make check    # gofmt, go vet, test, govulncheck
 ```
 
-Tool versions are pinned in the `Makefile` and run with `go run`. Generated files (`api/v1alpha1/zz_generated.deepcopy.go`, `config/crd/bases`, `config/rbac/role.yaml`) are committed. After `make envtest`, plain `go test ./...` also finds the binaries; without them the envtest tests skip.
+Tool versions are pinned in the `Makefile` and run with `go run`. Generated files (`api/v1alpha1/zz_generated.deepcopy.go`, `config/crd/bases`, `config/rbac/role.yaml`, `config/rbac/broker-role.yaml`) are committed. After `make envtest`, plain `go test ./...` also finds the binaries; without them the envtest tests skip.
 
 ## RBAC rationale
 

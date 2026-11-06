@@ -1,0 +1,87 @@
+# Confines the resource broker's ServiceAccount (idp-system/idp-broker, ADR 0010)
+# to what it needs on BucketClaims and ResourceGrants: UPDATE only (never create
+# or delete), of metadata.finalizers and status only. Spec, labels, annotations
+# and ownerReferences must be unchanged, and the finalizers may only be the
+# kind's own release finalizer. Its RBAC (config/rbac/broker-role.yaml) already
+# grants nothing else; this policy keeps the writes on those two kinds narrow
+# even if the role is widened by mistake. Only the broker's requests are
+# evaluated (matchConditions).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: idp-broker-scope
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    # Subresources are matched too, and DELETE also covers deletecollection.
+    resourceRules:
+      - apiGroups: ["idp.ithaca-idp.com"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["bucketclaims", "bucketclaims/*", "resourcegrants", "resourcegrants/*"]
+  matchConditions:
+    - name: is-idp-broker
+      expression: "request.userInfo.username == 'system:serviceaccount:idp-system:idp-broker'"
+  variables:
+    - name: isClaim
+      expression: "request.resource.resource == 'bucketclaims'"
+    - name: subResource
+      expression: "request.?subResource.orValue('')"
+  validations:
+    - expression: "request.operation == 'UPDATE'"
+      reason: Forbidden
+      messageExpression: "'idp-broker may not ' + request.operation + ' ' + request.resource.resource + ' (update only)'"
+    # The main resource and status; anything else (scale, finalizers, ...) is not used.
+    - expression: "variables.subResource in ['', 'status']"
+      reason: Forbidden
+      message: "idp-broker may only update bucketclaims and resourcegrants and their status"
+    - expression: >-
+        object.?spec.orValue({}) == oldObject.?spec.orValue({})
+      reason: Forbidden
+      message: "idp-broker may not change the spec"
+    - expression: >-
+        object.metadata.?labels.orValue({}) == oldObject.metadata.?labels.orValue({}) &&
+        object.metadata.?annotations.orValue({}) == oldObject.metadata.?annotations.orValue({}) &&
+        object.metadata.?ownerReferences.orValue([]) == oldObject.metadata.?ownerReferences.orValue([])
+      reason: Forbidden
+      message: "idp-broker may not change labels, annotations or ownerReferences"
+    # The finalizers the broker adds or removes may only be the kind's own
+    # release finalizer (BucketFinalizerName and GrantFinalizerName in
+    # internal/broker/common.go; change them together). Others, such as
+    # foregroundDeletion or a tenant's, may be present and are left as they are.
+    - expression: >-
+        object.metadata.?finalizers.orValue([]).filter(f, !(f in oldObject.metadata.?finalizers.orValue([]))).all(f,
+          f == (variables.isClaim ? 'idp.ithaca-idp.com/bucket-release' : 'idp.ithaca-idp.com/grant-release')) &&
+        oldObject.metadata.?finalizers.orValue([]).filter(f, !(f in object.metadata.?finalizers.orValue([]))).all(f,
+          f == (variables.isClaim ? 'idp.ithaca-idp.com/bucket-release' : 'idp.ithaca-idp.com/grant-release'))
+      reason: Forbidden
+      message: "idp-broker may only add or remove its own release finalizer"
+    # A status write does not touch finalizers, a metadata write does not touch status.
+    - expression: >-
+        variables.subResource != 'status' ||
+        object.metadata.?finalizers.orValue([]) == oldObject.metadata.?finalizers.orValue([])
+      reason: Forbidden
+      message: "idp-broker may not change finalizers through the status subresource"
+    - expression: >-
+        variables.subResource == 'status' ||
+        object.?status.orValue({}) == oldObject.?status.orValue({})
+      reason: Forbidden
+      message: "idp-broker may change the status only through the status subresource"
+    # The bucket a claim reports is the one its name dictates:
+    # idp-<namespace>-<name>-<8 hex> (the hash cannot be computed here).
+    - expression: >-
+        !variables.isClaim || variables.subResource != 'status' ||
+        object.?status.bucketName.orValue('') == '' ||
+        (object.status.bucketName.startsWith('idp-' + request.namespace + '-' + object.metadata.name + '-') &&
+         object.status.bucketName.size() == ('idp-' + request.namespace + '-' + object.metadata.name + '-').size() + 8 &&
+         object.status.bucketName.substring(('idp-' + request.namespace + '-' + object.metadata.name + '-').size()).matches('^[0-9a-f]{8}$'))
+      reason: Forbidden
+      message: "idp-broker may only report status.bucketName idp-<namespace>-<name>-<8 hex>"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: idp-broker-scope
+spec:
+  policyName: idp-broker-scope
+  validationActions: ["Deny"]
