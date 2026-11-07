@@ -79,6 +79,14 @@ func childLabels(tn *idpv1alpha1.TeamNamespace) map[string]string {
 	}
 }
 
+// Object-count quotas for the portal's Resources page (ADR 0010), enforced atomically by the API
+// server, so the portal's own count-then-create check cannot be raced past them. They match the
+// portal's caps (3 BucketClaims, 10 ResourceGrants per namespace) and are the same for every size.
+const (
+	QuotaBucketClaims   corev1.ResourceName = "count/bucketclaims.idp.ithaca-idp.com"
+	QuotaResourceGrants corev1.ResourceName = "count/resourcegrants.idp.ithaca-idp.com"
+)
+
 type sizeProfile struct {
 	quota    corev1.ResourceList
 	maxLimit corev1.ResourceList
@@ -97,6 +105,8 @@ var profiles = map[idpv1alpha1.Size]sizeProfile{
 			corev1.ResourcePersistentVolumeClaims: resource.MustParse("5"),
 			corev1.ResourceServicesLoadBalancers:  resource.MustParse("0"),
 			corev1.ResourceServicesNodePorts:      resource.MustParse("0"),
+			QuotaBucketClaims:                     resource.MustParse("3"),
+			QuotaResourceGrants:                   resource.MustParse("10"),
 		},
 		maxLimit: corev1.ResourceList{
 			corev1.ResourceCPU:    resource.MustParse("2"),
@@ -115,6 +125,8 @@ var profiles = map[idpv1alpha1.Size]sizeProfile{
 			corev1.ResourcePersistentVolumeClaims: resource.MustParse("10"),
 			corev1.ResourceServicesLoadBalancers:  resource.MustParse("0"),
 			corev1.ResourceServicesNodePorts:      resource.MustParse("0"),
+			QuotaBucketClaims:                     resource.MustParse("3"),
+			QuotaResourceGrants:                   resource.MustParse("10"),
 		},
 		maxLimit: corev1.ResourceList{
 			corev1.ResourceCPU:    resource.MustParse("4"),

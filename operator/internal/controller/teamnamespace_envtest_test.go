@@ -85,6 +85,11 @@ func TestCreatesNamespaceAndGuardrails(t *testing.T) {
 	if got := q.Spec.Hard[corev1.ResourceServicesLoadBalancers]; !got.IsZero() {
 		t.Errorf("loadbalancers quota = %s, want 0", got.String())
 	}
+	for res, want := range map[corev1.ResourceName]string{QuotaBucketClaims: "3", QuotaResourceGrants: "10"} {
+		if got := q.Spec.Hard[res]; got.Cmp(resource.MustParse(want)) != 0 {
+			t.Errorf("small quota %s = %s, want %s", res, got.String(), want)
+		}
+	}
 	lr := get(t, &corev1.LimitRange{}, name, LimitRangeName)
 	if len(lr.Spec.Limits) != 1 || lr.Spec.Limits[0].Type != corev1.LimitTypeContainer {
 		t.Errorf("limitrange = %+v", lr.Spec)
@@ -217,6 +222,11 @@ func TestSizeChangeUpdatesQuotaAndLimits(t *testing.T) {
 	if got := q.Spec.Hard[corev1.ResourceLimitsMemory]; got.Cmp(resource.MustParse("16Gi")) != 0 {
 		t.Errorf("medium quota limits.memory = %s", got.String())
 	}
+	for res, want := range map[corev1.ResourceName]string{QuotaBucketClaims: "3", QuotaResourceGrants: "10"} {
+		if got := q.Spec.Hard[res]; got.Cmp(resource.MustParse(want)) != 0 {
+			t.Errorf("medium quota %s = %s, want %s", res, got.String(), want)
+		}
+	}
 	lr := get(t, &corev1.LimitRange{}, name, LimitRangeName)
 	if got := lr.Spec.Limits[0].Max[corev1.ResourceMemory]; got.Cmp(resource.MustParse("8Gi")) != 0 {
 		t.Errorf("medium limitrange max memory = %s", got.String())
@@ -242,6 +252,9 @@ func TestDriftIsCorrected(t *testing.T) {
 	q := get(t, &corev1.ResourceQuota{}, name, QuotaName)
 	q.Spec.Hard[corev1.ResourcePods] = resource.MustParse("999")
 	q.Spec.Hard[corev1.ResourceSecrets] = resource.MustParse("1")
+	// a namespace from before the Resources page has no object-count quotas: reconcile adds them
+	delete(q.Spec.Hard, QuotaBucketClaims)
+	q.Spec.Hard[QuotaResourceGrants] = resource.MustParse("999")
 	if err := k8s.Update(ctx, q); err != nil {
 		t.Fatal(err)
 	}

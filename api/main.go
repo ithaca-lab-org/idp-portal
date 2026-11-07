@@ -21,6 +21,7 @@ import (
 	"github.com/ithaca-lab-org/idp-portal/api/internal/auth"
 	"github.com/ithaca-lab-org/idp-portal/api/internal/orders"
 	"github.com/ithaca-lab-org/idp-portal/api/internal/pubsubpub"
+	"github.com/ithaca-lab-org/idp-portal/api/internal/resources"
 	"github.com/ithaca-lab-org/idp-portal/api/internal/secrets"
 	"github.com/ithaca-lab-org/idp-portal/api/internal/session"
 	"github.com/ithaca-lab-org/idp-portal/api/internal/webui"
@@ -168,6 +169,13 @@ func main() {
 		workloadSvc = workloads.NewService(workloads.DynamicCluster{Client: dyn}, store)
 		slog.Info("workloads page enabled")
 	}
+	// The Resources page (buckets and grants, ADR 0010) is off unless RESOURCES_ENABLED is exactly
+	// "true"; off, its routes answer 404 and nothing calls the cluster.
+	var resourceSvc *resources.Service
+	if os.Getenv("RESOURCES_ENABLED") == "true" {
+		resourceSvc = resources.NewService(resources.DynamicCluster{Client: dyn}, store)
+		slog.Info("resources page enabled")
+	}
 	go svc.RunSyncer(ctx, 5*time.Second, 12) // COMPLETE orders are checked every minute
 
 	mux := http.NewServeMux()
@@ -176,6 +184,7 @@ func main() {
 	apiHandler := api.New(h, svc)
 	apiHandler.Secrets = secretSvc
 	apiHandler.Workloads = workloadSvc
+	apiHandler.Resources = resourceSvc
 	apiHandler.Routes(mux)
 	mux.Handle("GET /", webui.Handler())
 

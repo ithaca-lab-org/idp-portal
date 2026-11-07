@@ -1,7 +1,19 @@
 import { useEffect, useState } from "react";
-import { businessUnits, listNamespaces, listWorkloadNamespaces, logout, me, type Order, type SecretsInfo, type User } from "./api";
+import {
+  businessUnits,
+  listNamespaces,
+  listResourceNamespaces,
+  listWorkloadNamespaces,
+  logout,
+  me,
+  type Order,
+  type ResourcesInfo,
+  type SecretsInfo,
+  type User,
+} from "./api";
 import { OrderForm } from "./OrderForm";
 import { OrderHistory } from "./OrderHistory";
+import { ResourcesPage } from "./ResourcesPage";
 import { SecretsPage } from "./SecretsPage";
 import { WorkloadsPage } from "./WorkloadsPage";
 
@@ -11,7 +23,8 @@ type Session =
   | { state: "error" }
   // secrets is null when the Secrets page is turned off on the server
   // workloads is null when the Workloads page is turned off on the server
-  | { state: "in"; user: User; units: string[]; secrets: SecretsInfo | null; workloads: SecretsInfo | null };
+  // resources is null when the Resources page is turned off on the server
+  | { state: "in"; user: User; units: string[]; secrets: SecretsInfo | null; workloads: SecretsInfo | null; resources: ResourcesInfo | null };
 
 /** The Secrets page is optional: any failure to list namespaces just hides it. */
 async function secretNamespaces(): Promise<SecretsInfo | null> {
@@ -31,19 +44,33 @@ async function workloadNamespaces(): Promise<SecretsInfo | null> {
   }
 }
 
+/** The Resources page is optional too. */
+async function resourceNamespaces(): Promise<ResourcesInfo | null> {
+  try {
+    return await listResourceNamespaces();
+  } catch {
+    return null;
+  }
+}
+
 export function App() {
   const [session, setSession] = useState<Session>({ state: "loading" });
   const [fresh, setFresh] = useState<Order | null>(null);
   const [signOutError, setSignOutError] = useState(false);
-  const [page, setPage] = useState<"orders" | "secrets" | "workloads">("orders");
+  const [page, setPage] = useState<"orders" | "secrets" | "workloads" | "resources">("orders");
 
   useEffect(() => {
     (async () => {
       try {
         const user = await me();
         if (!user) return setSession({ state: "anonymous" });
-        const [units, secrets, workloads] = await Promise.all([businessUnits(), secretNamespaces(), workloadNamespaces()]);
-        setSession({ state: "in", user, units, secrets, workloads });
+        const [units, secrets, workloads, resources] = await Promise.all([
+          businessUnits(),
+          secretNamespaces(),
+          workloadNamespaces(),
+          resourceNamespaces(),
+        ]);
+        setSession({ state: "in", user, units, secrets, workloads, resources });
       } catch {
         setSession({ state: "error" });
       }
@@ -79,7 +106,7 @@ export function App() {
         </span>
         <button onClick={signOut}>Sign out</button>
       </header>
-      {(session.secrets !== null || session.workloads !== null) && (
+      {(session.secrets !== null || session.workloads !== null || session.resources !== null) && (
         <nav aria-label="Pages">
           <button aria-current={page === "orders" ? "page" : undefined} onClick={() => setPage("orders")}>
             Orders
@@ -94,6 +121,11 @@ export function App() {
               Workloads
             </button>
           )}
+          {session.resources !== null && (
+            <button aria-current={page === "resources" ? "page" : undefined} onClick={() => setPage("resources")}>
+              Resources
+            </button>
+          )}
         </nav>
       )}
       {signOutError && <p role="alert">Sign out failed. You are still signed in; try again.</p>}
@@ -101,6 +133,8 @@ export function App() {
         <SecretsPage namespaces={session.secrets.namespaces} rules={session.secrets} />
       ) : page === "workloads" && session.workloads !== null ? (
         <WorkloadsPage namespaces={session.workloads.namespaces} rules={session.workloads} />
+      ) : page === "resources" && session.resources !== null ? (
+        <ResourcesPage info={session.resources} />
       ) : (
         <>
           <OrderForm units={session.units} onPlaced={setFresh} />

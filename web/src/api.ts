@@ -186,3 +186,88 @@ export const placeWorkload = (namespace: string, name: string) =>
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ namespace, name }),
   });
+
+export interface AccessOption {
+  value: "reader" | "writer";
+  label: string;
+}
+
+/** What the Resources page needs up front: the namespaces and the rules the API applies. */
+export interface ResourcesInfo {
+  namespaces: Namespace[];
+  maxNamespaceLength: number;
+  maxNameLength: number;
+  maxBuckets: number;
+  maxGrants: number;
+  access: AccessOption[];
+}
+
+/** A BucketClaim as the broker reports it; message is the portal's text, never the cloud's. */
+export interface Bucket {
+  namespace: string;
+  name: string;
+  bucketName: string;
+  status: Status;
+  reason?: string;
+  message?: string;
+  createdAt?: string;
+}
+
+export interface Grant {
+  namespace: string;
+  name: string;
+  workload: string;
+  bucket: string;
+  access: "reader" | "writer";
+  status: Status;
+  reason?: string;
+  message?: string;
+  createdAt?: string;
+}
+
+export interface BucketDetail extends Bucket {
+  grants: Grant[];
+}
+
+/** The namespaces the user may order buckets in; null when the Resources page is turned off (404). */
+export async function listResourceNamespaces(): Promise<ResourcesInfo | null> {
+  try {
+    return await call<ResourcesInfo>("/api/resources/namespaces");
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404) return null;
+    throw e;
+  }
+}
+
+export const listBuckets = async (ns: string) =>
+  (await call<{ buckets: Bucket[] }>(`/api/buckets?namespace=${seg(ns)}`)).buckets;
+
+export const getBucket = (ns: string, name: string) => call<BucketDetail>(`/api/buckets/${seg(ns)}/${seg(name)}`);
+
+export const placeBucket = (namespace: string, name: string) =>
+  call<Bucket>("/api/orders/buckets", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ namespace, name }),
+  });
+
+export const placeGrant = (namespace: string, workload: string, bucket: string, access: string) =>
+  call<Grant>("/api/orders/grants", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ namespace, workload, bucket, access }),
+  });
+
+/** Revokes a grant (204). There is no way to delete a bucket from the portal. */
+export async function revokeGrant(ns: string, name: string): Promise<void> {
+  const res = await fetch(`/api/grants/${seg(ns)}/${seg(name)}`, { method: "DELETE", credentials: "same-origin" });
+  if (!res.ok) {
+    let msg = `request failed (${res.status})`;
+    try {
+      msg = ((await res.json()) as { error?: string }).error ?? msg;
+    } catch {
+      /* keep the generic message */
+    }
+    throw new ApiError(res.status, msg);
+  }
+}
