@@ -60,6 +60,10 @@ func main() {
 	zapOpts.BindFlags(flag.CommandLine)
 	flag.Parse()
 
+	// controller-runtime allows the signal handler to be installed ONCE (a second call panics with
+	// "close of closed channel"): the Google client and the manager share this context.
+	ctx := ctrl.SetupSignalHandler()
+
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&zapOpts)))
 	log := ctrl.Log.WithName("setup")
 
@@ -90,7 +94,7 @@ func main() {
 	}
 
 	if enabled {
-		cloud, err := broker.NewGCS(ctrl.SetupSignalHandler(), projectID, projectNum, location)
+		cloud, err := broker.NewGCS(ctx, projectID, projectNum, location)
 		if err != nil {
 			log.Error(err, "unable to create the Google Cloud client")
 			os.Exit(1)
@@ -122,7 +126,7 @@ func main() {
 		os.Exit(1)
 	}
 	log.Info("starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(ctx); err != nil {
 		log.Error(err, "manager exited with error")
 		os.Exit(1)
 	}
