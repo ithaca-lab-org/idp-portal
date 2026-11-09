@@ -39,6 +39,10 @@ export function OrderForm({ units, onPlaced }: { units: string[]; onPlaced: (o: 
         Name
         <input value={name} onChange={(e) => setName(e.target.value)} maxLength={40} required />
       </label>
+      <p className="hint">
+        Namespace names are public: they appear in workload hostnames (&lt;workload&gt;.&lt;namespace&gt;.apps.ithaca-idp.com) and
+        in public Certificate Transparency logs. Do not use customer or confidential project names.
+      </p>
       <label>
         Business unit
         <select value={unit} onChange={(e) => setUnit(e.target.value)}>

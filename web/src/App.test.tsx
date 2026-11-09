@@ -42,6 +42,21 @@ test("the form offers only the user's business units", async () => {
   expect(await screen.findByText("No orders yet.")).toBeInTheDocument();
 });
 
+test("the order form warns that namespace names are public", async () => {
+  mockFetch({
+    "GET /auth/me": () => ({ body: user }),
+    "GET /api/business-units": () => ({ body: { businessUnits: user.groups } }),
+    "GET /api/orders": () => ({ body: { orders: [] } }),
+  });
+  render(<App />);
+  await screen.findByLabelText("Name");
+  expect(
+    screen.getByText(
+      "Namespace names are public: they appear in workload hostnames (<workload>.<namespace>.apps.ithaca-idp.com) and in public Certificate Transparency logs. Do not use customer or confidential project names.",
+    ),
+  ).toHaveClass("hint");
+});
+
 test("placing an order posts JSON and refreshes the history", async () => {
   let orders: object[] = [];
   const f = mockFetch({

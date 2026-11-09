@@ -114,6 +114,21 @@ spec:
         object.metadata.labels[?'pod-security.kubernetes.io/enforce'].orValue('') in ['baseline', 'restricted']
       reason: Forbidden
       message: "idp-operator must keep pod-security.kubernetes.io/enforce at baseline or restricted"
+    # Namespace labels are exactly the keys namespaceLabels() writes
+    # (internal/controller/resources.go) plus the one the apiserver adds. istio.io/dataplane-mode=ambient
+    # keeps ztunnel mTLS and AuthorizationPolicy enforcement on, gateway-access=allowed is
+    # what the allow-ingress-gateway and allowedRoutes selectors see; any other key
+    # (istio.io/use-waypoint, istio.io/rev, istio-injection, a label another
+    # namespace's selector matches) is denied. Keep in step with namespaceLabels().
+    - expression: >-
+        !variables.isNamespace || request.operation == 'DELETE' ||
+        (object.metadata.labels[?'istio.io/dataplane-mode'] == optional.of('ambient') &&
+         object.metadata.labels[?'ithaca.idp/gateway-access'] == optional.of('allowed') &&
+         object.metadata.labels.all(k, k in ['app.kubernetes.io/managed-by', 'idp.ithaca-idp.com/team-namespace',
+           'idp.ithaca-idp.com/business-unit', 'istio.io/dataplane-mode', 'ithaca.idp/gateway-access',
+           'pod-security.kubernetes.io/enforce', 'pod-security.kubernetes.io/warn', 'kubernetes.io/metadata.name']))
+      reason: Forbidden
+      message: "idp-operator namespace labels must include istio.io/dataplane-mode=ambient and ithaca.idp/gateway-access=allowed and only the label keys the controller writes"
     - expression: "variables.isNamespace || variables.isCert || variables.parentOwned"
       reason: Forbidden
       messageExpression: >-
@@ -344,7 +359,7 @@ spec:
     # istio-ingress AND pods gateway-name=ingress), only TCP 15008 (HBONE). An extra peer, an
     # empty peer (allow all), an ipBlock or any other selector is denied. The
     # literals are the --gateway-namespace/--gateway-name defaults; change both
-    # together. Other NetworkPolicy specs are not constrained here.
+    # together. The other two managed policies are pinned below.
     - expression: >-
         request.resource.resource != 'networkpolicies' || request.operation == 'DELETE' ||
         request.name != 'idp-allow-ingress-gateway' ||
@@ -360,6 +375,44 @@ spec:
              f.podSelector.?matchLabels.orValue({}) == {'gateway.networking.k8s.io/gateway-name': 'ingress'})))
       reason: Forbidden
       message: "idp-operator may write idp-allow-ingress-gateway only as: all pods, Ingress, one peer admitting pods labelled gateway.networking.k8s.io/gateway-name=ingress in namespace istio-ingress, only TCP 15008"
+    # idp-default-deny-ingress is exactly desiredDenyIngressSpec: all pods,
+    # Ingress, no ingress rule at all and no egress. Any rule would open ingress
+    # and break tenant isolation.
+    - expression: >-
+        request.resource.resource != 'networkpolicies' || request.operation == 'DELETE' ||
+        request.name != 'idp-default-deny-ingress' ||
+        (has(object.spec) && size(object.spec.?podSelector.orValue({})) == 0 &&
+         object.spec.?policyTypes.orValue([]) == ['Ingress'] && !has(object.spec.egress) &&
+         size(object.spec.?ingress.orValue([])) == 0)
+      reason: Forbidden
+      message: "idp-operator may write idp-default-deny-ingress only as: all pods, Ingress, no ingress rules, no egress"
+    # idp-allow-same-namespace is exactly desiredSameNamespaceSpec: all pods,
+    # Ingress, one rule with no ports and ONE peer that is an empty podSelector
+    # (pods of this namespace only; no namespaceSelector, which would reach other
+    # namespaces, and no ipBlock). An empty rule or peer (allow all) is denied.
+    - expression: >-
+        request.resource.resource != 'networkpolicies' || request.operation == 'DELETE' ||
+        request.name != 'idp-allow-same-namespace' ||
+        (has(object.spec) && size(object.spec.?podSelector.orValue({})) == 0 &&
+         object.spec.?policyTypes.orValue([]) == ['Ingress'] && !has(object.spec.egress) &&
+         has(object.spec.ingress) && size(object.spec.ingress) == 1 &&
+         object.spec.ingress.all(r, size(r.?ports.orValue([])) == 0 && has(r.from) && size(r.from) == 1 &&
+           r.from.all(f, !has(f.ipBlock) && !has(f.namespaceSelector) &&
+             has(f.podSelector) && size(f.?podSelector.orValue({})) == 0)))
+      reason: Forbidden
+      message: "idp-operator may write idp-allow-same-namespace only as: all pods, Ingress, one rule with one peer that is an empty podSelector (same namespace), no ports"
+    # Metadata of the three managed NetworkPolicies (childLabels(): managed-by and
+    # team-namespace only). CREATE: exactly those labels, no annotations. UPDATE:
+    # labels and annotations unchanged, except that labels may be reset to exactly
+    # the child labels (drift repair); no annotation can be added.
+    - expression: >-
+        request.resource.resource != 'networkpolicies' || request.operation == 'DELETE' ||
+        (object.metadata.?labels.orValue({}) == {'app.kubernetes.io/managed-by': 'idp-operator', 'idp.ithaca-idp.com/team-namespace': request.namespace} ||
+         (request.operation == 'UPDATE' && object.metadata.?labels.orValue({}) == oldObject.metadata.?labels.orValue({}))) &&
+        (request.operation == 'CREATE' ? size(object.metadata.?annotations.orValue({})) == 0 :
+         object.metadata.?annotations.orValue({}) == oldObject.metadata.?annotations.orValue({}))
+      reason: Forbidden
+      message: "idp-operator NetworkPolicy metadata: labels must be the managed-by and team-namespace child labels (or unchanged on update) and annotations none (unchanged on update)"
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
