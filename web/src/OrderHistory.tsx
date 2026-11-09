@@ -4,11 +4,13 @@ import { listOrders, type Order } from "./api";
 const POLL_MS = 5000;
 
 /** Lists the user's orders and polls while any is still PENDING. `fresh` is an order just placed. */
-export function OrderHistory({ fresh }: { fresh: Order | null }) {
+export function OrderHistory({ fresh, active }: { fresh: Order | null; active: boolean }) {
   const [orders, setOrders] = useState<Order[] | null>(null);
   const [error, setError] = useState("");
 
+  // reloads when the page is shown again; the polling stops while it is hidden
   useEffect(() => {
+    if (!active) return;
     let stop = false;
     let timer: ReturnType<typeof setTimeout>;
     async function load() {
@@ -29,7 +31,7 @@ export function OrderHistory({ fresh }: { fresh: Order | null }) {
       stop = true;
       clearTimeout(timer);
     };
-  }, [fresh]);
+  }, [fresh, active]);
 
   return (
     <section>

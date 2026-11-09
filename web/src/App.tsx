@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   businessUnits,
   listNamespaces,
@@ -12,6 +12,7 @@ import {
   type User,
 } from "./api";
 import { OrderForm } from "./OrderForm";
+import { rememberedNs, rememberNs } from "./namespaces";
 import { OrderHistory } from "./OrderHistory";
 import { ResourcesPage } from "./ResourcesPage";
 import { SecretsPage } from "./SecretsPage";
@@ -53,11 +54,52 @@ async function resourceNamespaces(): Promise<ResourcesInfo | null> {
   }
 }
 
+type Page = "orders" | "secrets" | "workloads" | "resources";
+const REFRESH_MS = 30_000;
+
 export function App() {
   const [session, setSession] = useState<Session>({ state: "loading" });
   const [fresh, setFresh] = useState<Order | null>(null);
   const [signOutError, setSignOutError] = useState(false);
-  const [page, setPage] = useState<"orders" | "secrets" | "workloads" | "resources">("orders");
+  const [page, setPage] = useState<Page>("orders");
+  // a page is mounted the first time it is visited and stays mounted (hidden) afterwards
+  const [visited, setVisited] = useState<Page[]>(["orders"]);
+  const [ns, setNs] = useState(rememberedNs);
+  const lastRefresh = useRef(0);
+
+  function chooseNs(next: string) {
+    setNs(next);
+    rememberNs(next);
+  }
+
+  /** Reloads one namespace list in the background. A failure keeps the old value; an unchanged list keeps the state. */
+  const refresh = useCallback(async (key: "secrets" | "workloads" | "resources") => {
+    lastRefresh.current = Date.now();
+    try {
+      const next = await (key === "secrets" ? listNamespaces : key === "workloads" ? listWorkloadNamespaces : listResourceNamespaces)();
+      if (!next) return;
+      setSession((s) => (s.state === "in" && JSON.stringify(s[key]) !== JSON.stringify(next) ? ({ ...s, [key]: next } as Session) : s));
+    } catch {
+      // keep what we have
+    }
+  }, []);
+
+  function go(p: Page) {
+    setPage(p);
+    setVisited((v) => (v.includes(p) ? v : [...v, p]));
+    if (p !== "orders") refresh(p);
+  }
+
+  // coming back to the browser tab refreshes the current page's namespaces, at most every 30 s
+  const signedIn = session.state === "in";
+  useEffect(() => {
+    if (!signedIn || page === "orders") return;
+    const onVisible = () => {
+      if (document.visibilityState === "visible" && Date.now() - lastRefresh.current >= REFRESH_MS) refresh(page);
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  }, [signedIn, page, refresh]);
 
   useEffect(() => {
     (async () => {
@@ -108,39 +150,46 @@ export function App() {
       </header>
       {(session.secrets !== null || session.workloads !== null || session.resources !== null) && (
         <nav aria-label="Pages">
-          <button aria-current={page === "orders" ? "page" : undefined} onClick={() => setPage("orders")}>
+          <button aria-current={page === "orders" ? "page" : undefined} onClick={() => go("orders")}>
             Orders
           </button>
           {session.secrets !== null && (
-            <button aria-current={page === "secrets" ? "page" : undefined} onClick={() => setPage("secrets")}>
+            <button aria-current={page === "secrets" ? "page" : undefined} onClick={() => go("secrets")}>
               Secrets
             </button>
           )}
           {session.workloads !== null && (
-            <button aria-current={page === "workloads" ? "page" : undefined} onClick={() => setPage("workloads")}>
+            <button aria-current={page === "workloads" ? "page" : undefined} onClick={() => go("workloads")}>
               Workloads
             </button>
           )}
           {session.resources !== null && (
-            <button aria-current={page === "resources" ? "page" : undefined} onClick={() => setPage("resources")}>
+            <button aria-current={page === "resources" ? "page" : undefined} onClick={() => go("resources")}>
               Resources
             </button>
           )}
         </nav>
       )}
       {signOutError && <p role="alert">Sign out failed. You are still signed in; try again.</p>}
-      {page === "secrets" && session.secrets !== null ? (
-        <SecretsPage namespaces={session.secrets.namespaces} rules={session.secrets} />
-      ) : page === "workloads" && session.workloads !== null ? (
-        <WorkloadsPage namespaces={session.workloads.namespaces} rules={session.workloads} />
-      ) : page === "resources" && session.resources !== null ? (
-        <ResourcesPage info={session.resources} />
-      ) : (
-        <>
-          <OrderForm units={session.units} onPlaced={setFresh} />
-          <OrderHistory fresh={fresh} />
-        </>
+      {session.secrets !== null && visited.includes("secrets") && (
+        <div hidden={page !== "secrets"}>
+          <SecretsPage namespaces={session.secrets.namespaces} rules={session.secrets} active={page === "secrets"} ns={ns} onNs={chooseNs} />
+        </div>
       )}
+      {session.workloads !== null && visited.includes("workloads") && (
+        <div hidden={page !== "workloads"}>
+          <WorkloadsPage namespaces={session.workloads.namespaces} rules={session.workloads} active={page === "workloads"} ns={ns} onNs={chooseNs} />
+        </div>
+      )}
+      {session.resources !== null && visited.includes("resources") && (
+        <div hidden={page !== "resources"}>
+          <ResourcesPage info={session.resources} active={page === "resources"} ns={ns} onNs={chooseNs} />
+        </div>
+      )}
+      <div hidden={page !== "orders"}>
+        <OrderForm units={session.units} onPlaced={setFresh} />
+        <OrderHistory fresh={fresh} active={page === "orders"} />
+      </div>
     </main>
   );
 }
