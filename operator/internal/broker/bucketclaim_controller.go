@@ -33,6 +33,8 @@ import (
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=coordination.k8s.io,namespace=idp-system,resources=leases,verbs=get;create;update
+// Leader election also records a CORE event (API group "") in idp-system; without this it is rejected (log noise only).
+// +kubebuilder:rbac:groups="",namespace=idp-system,resources=events,verbs=create;patch
 
 // adoptSkew is the clock difference tolerated between the apiserver and Cloud
 // Storage when checking that a bucket was created after its claim.
