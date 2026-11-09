@@ -158,6 +158,20 @@ func wantPolicyDenial(t *testing.T, what string, err error) {
 	}
 }
 
+// wantRuleDenial requires a denial by this policy whose message names the
+// specific rule, so a denial by another rule cannot satisfy the test.
+func wantRuleDenial(t *testing.T, what, fragment string, err error) {
+	t.Helper()
+	if !isPolicyDenial(err) || !strings.Contains(err.Error(), fragment) {
+		t.Errorf("%s: want denial by %s containing %q, got %v", what, policyName, fragment, err)
+	}
+}
+
+func childMeta(name, ns string) metav1.ObjectMeta {
+	return metav1.ObjectMeta{Name: name, Namespace: ns, Labels: map[string]string{
+		LabelManagedBy: ManagedByValue, LabelTeamNamespace: ns}}
+}
+
 func wantForbidden(t *testing.T, what string, err error) {
 	t.Helper()
 	if !apierrors.IsForbidden(err) {
@@ -311,9 +325,39 @@ func TestPolicyDeniesOperatorOutsideManagedNamespaces(t *testing.T) {
 			wantPolicyDenial(t, what, op.Update(ctx, ns, dry))
 		}
 		ns := get(t, &corev1.Namespace{}, "", managed)
-		ns.Labels["team/extra"] = "ok"
 		if err := op.Update(ctx, ns, dry); err != nil {
-			t.Errorf("benign update of managed namespace: %v", err)
+			t.Errorf("update of managed namespace with its exact labels: %v", err)
+		}
+		const nsRule = "only the label keys the controller writes"
+		for what, mutate := range map[string]func(*corev1.Namespace){
+			"ambient removed":      func(n *corev1.Namespace) { delete(n.Labels, LabelDataplaneMode) },
+			"ambient set to none":  func(n *corev1.Namespace) { n.Labels[LabelDataplaneMode] = "none" },
+			"use-waypoint added":   func(n *corev1.Namespace) { n.Labels["istio.io/use-waypoint"] = "waypoint" },
+			"istio-injection":      func(n *corev1.Namespace) { n.Labels["istio-injection"] = "enabled" },
+			"istio.io/rev":         func(n *corev1.Namespace) { n.Labels["istio.io/rev"] = "x" },
+			"gateway-access gone":  func(n *corev1.Namespace) { delete(n.Labels, LabelGatewayAccess) },
+			"gateway-access other": func(n *corev1.Namespace) { n.Labels[LabelGatewayAccess] = "denied" },
+			"arbitrary label":      func(n *corev1.Namespace) { n.Labels["team/extra"] = "ok" },
+		} {
+			ns := get(t, &corev1.Namespace{}, "", managed)
+			mutate(ns)
+			wantRuleDenial(t, "update namespace: "+what, nsRule, op.Update(ctx, ns, dry))
+		}
+		// The same label rules apply on create (the rest of the labels are valid).
+		for what, mutate := range map[string]func(map[string]string){
+			"no ambient":   func(l map[string]string) { delete(l, LabelDataplaneMode) },
+			"use-waypoint": func(l map[string]string) { l["istio.io/use-waypoint"] = "waypoint" },
+			"no gateway":   func(l map[string]string) { delete(l, LabelGatewayAccess) },
+			"arbitrary":    func(l map[string]string) { l["team/extra"] = "ok" },
+		} {
+			l := namespaceLabels(newTN("team-labels"))
+			mutate(l)
+			ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "team-labels", Labels: l}}
+			wantRuleDenial(t, "create namespace: "+what, nsRule, op.Create(ctx, ns, dry))
+		}
+		okNS := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "team-labels", Labels: namespaceLabels(newTN("team-labels"))}}
+		if err := op.Create(ctx, okNS, dry); err != nil {
+			t.Errorf("create namespace with the exact controller labels: %v", err)
 		}
 	})
 
@@ -360,7 +404,7 @@ func TestPolicyDeniesOperatorOutsideManagedNamespaces(t *testing.T) {
 
 	t.Run("gateway networkpolicy", func(t *testing.T) {
 		mk := func(name string, mut func(*networkingv1.NetworkPolicySpec)) *networkingv1.NetworkPolicy {
-			np := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: managed},
+			np := &networkingv1.NetworkPolicy{ObjectMeta: childMeta(name, managed),
 				Spec: desiredAllowIngressGatewaySpec(GatewayOptions{})}
 			if mut != nil {
 				mut(&np.Spec)
@@ -439,10 +483,163 @@ func TestPolicyDeniesOperatorOutsideManagedNamespaces(t *testing.T) {
 			},
 		}
 		for what, mut := range cases {
-			wantPolicyDenial(t, "create gateway policy with "+what, op.Create(ctx, mk("idp-allow-ingress-gateway", mut), dry))
+			wantRuleDenial(t, "create gateway policy with "+what, "idp-allow-ingress-gateway only as", op.Create(ctx, mk("idp-allow-ingress-gateway", mut), dry))
 			bad := get(t, &networkingv1.NetworkPolicy{}, managed, GatewayPolicyName)
 			bad.Spec = mk(GatewayPolicyName, mut).Spec
-			wantPolicyDenial(t, "update gateway policy with "+what, op.Update(ctx, bad, dry))
+			wantRuleDenial(t, "update gateway policy with "+what, "idp-allow-ingress-gateway only as", op.Update(ctx, bad, dry))
+		}
+	})
+
+	// The two other managed policies are pinned to their exact specs too.
+	// Shapes the built-in NetworkPolicy validation rejects before admission
+	// (a peer with no field set, an ipBlock combined with selectors) never reach
+	// the policy, so they are not listed; the shapes below pass validation.
+	t.Run("deny-ingress and same-namespace networkpolicy", func(t *testing.T) {
+		sel := func(k, v string) *metav1.LabelSelector {
+			return &metav1.LabelSelector{MatchLabels: map[string]string{k: v}}
+		}
+		type pin struct {
+			name  string
+			spec  func() networkingv1.NetworkPolicySpec
+			cases map[string]func(*networkingv1.NetworkPolicySpec)
+		}
+		common := map[string]func(*networkingv1.NetworkPolicySpec){
+			"egress type": func(s *networkingv1.NetworkPolicySpec) {
+				s.PolicyTypes = append(s.PolicyTypes, networkingv1.PolicyTypeEgress)
+			},
+			"egress only": func(s *networkingv1.NetworkPolicySpec) {
+				s.PolicyTypes = []networkingv1.PolicyType{networkingv1.PolicyTypeEgress}
+			},
+			// Empty policyTypes is not listed: the API server defaults it to [Ingress]
+			// before admission, which is the pinned value.
+			"narrowed target pods": func(s *networkingv1.NetworkPolicySpec) { s.PodSelector = *sel("a", "b") },
+			"matchExpressions target pods": func(s *networkingv1.NetworkPolicySpec) {
+				s.PodSelector = metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{
+					{Key: "a", Operator: metav1.LabelSelectorOpExists}}}
+			},
+			"egress rule": func(s *networkingv1.NetworkPolicySpec) {
+				s.Egress = []networkingv1.NetworkPolicyEgressRule{{}}
+			},
+			"empty ingress rule (allow all)": func(s *networkingv1.NetworkPolicySpec) {
+				s.Ingress = []networkingv1.NetworkPolicyIngressRule{{}}
+			},
+			"ipBlock 0.0.0.0/0": func(s *networkingv1.NetworkPolicySpec) {
+				s.Ingress = []networkingv1.NetworkPolicyIngressRule{{
+					From: []networkingv1.NetworkPolicyPeer{{IPBlock: &networkingv1.IPBlock{CIDR: "0.0.0.0/0"}}}}}
+			},
+			"empty namespaceSelector peer": func(s *networkingv1.NetworkPolicySpec) {
+				s.Ingress = []networkingv1.NetworkPolicyIngressRule{{
+					From: []networkingv1.NetworkPolicyPeer{{NamespaceSelector: &metav1.LabelSelector{}}}}}
+			},
+			"empty ns and pod selectors": func(s *networkingv1.NetworkPolicySpec) {
+				s.Ingress = []networkingv1.NetworkPolicyIngressRule{{
+					From: []networkingv1.NetworkPolicyPeer{{
+						NamespaceSelector: &metav1.LabelSelector{}, PodSelector: &metav1.LabelSelector{}}}}}
+			},
+			"port list only": func(s *networkingv1.NetworkPolicySpec) {
+				p := intstr.FromInt32(8080)
+				s.Ingress = []networkingv1.NetworkPolicyIngressRule{{
+					Ports: []networkingv1.NetworkPolicyPort{{Port: &p}}}}
+			},
+		}
+		pins := []pin{
+			{DenyIngressPolicyName, desiredDenyIngressSpec, map[string]func(*networkingv1.NetworkPolicySpec){
+				"same-namespace rule": func(s *networkingv1.NetworkPolicySpec) {
+					*s = desiredSameNamespaceSpec()
+				},
+			}},
+			{SameNamespacePolicy, desiredSameNamespaceSpec, map[string]func(*networkingv1.NetworkPolicySpec){
+				"no ingress rule": func(s *networkingv1.NetworkPolicySpec) { s.Ingress = nil },
+				"extra peer": func(s *networkingv1.NetworkPolicySpec) {
+					s.Ingress[0].From = append(s.Ingress[0].From, networkingv1.NetworkPolicyPeer{PodSelector: sel("a", "b")})
+				},
+				"no from (allow all)": func(s *networkingv1.NetworkPolicySpec) { s.Ingress[0].From = nil },
+				"ipBlock peer": func(s *networkingv1.NetworkPolicySpec) {
+					s.Ingress[0].From = []networkingv1.NetworkPolicyPeer{{IPBlock: &networkingv1.IPBlock{CIDR: "0.0.0.0/0"}}}
+				},
+				"namespaceSelector added": func(s *networkingv1.NetworkPolicySpec) {
+					s.Ingress[0].From[0].NamespaceSelector = &metav1.LabelSelector{}
+				},
+				"namespace peer only": func(s *networkingv1.NetworkPolicySpec) {
+					s.Ingress[0].From = []networkingv1.NetworkPolicyPeer{{NamespaceSelector: sel("kubernetes.io/metadata.name", "kube-system")}}
+				},
+				"narrowed peer pods": func(s *networkingv1.NetworkPolicySpec) {
+					s.Ingress[0].From[0].PodSelector = sel("a", "b")
+				},
+				"matchExpressions peer pods": func(s *networkingv1.NetworkPolicySpec) {
+					s.Ingress[0].From[0].PodSelector = &metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{
+						{Key: "a", Operator: metav1.LabelSelectorOpExists}}}
+				},
+				"ports added": func(s *networkingv1.NetworkPolicySpec) {
+					p := intstr.FromInt32(8080)
+					s.Ingress[0].Ports = []networkingv1.NetworkPolicyPort{{Port: &p}}
+				},
+				"second rule": func(s *networkingv1.NetworkPolicySpec) {
+					s.Ingress = append(s.Ingress, desiredSameNamespaceSpec().Ingress[0])
+				},
+			}},
+		}
+		for _, p := range pins {
+			existing := get(t, &networkingv1.NetworkPolicy{}, managed, p.name)
+			existing.Spec = p.spec()
+			if err := op.Update(ctx, existing, dry); err != nil {
+				t.Errorf("exact %s spec update denied: %v", p.name, err)
+			}
+			okCreate := &networkingv1.NetworkPolicy{ObjectMeta: childMeta(p.name, managed), Spec: p.spec()}
+			// Already exists: AlreadyExists, not a policy denial, proves the spec passed.
+			if err := op.Create(ctx, okCreate, dry); isPolicyDenial(err) {
+				t.Errorf("exact %s spec create denied: %v", p.name, err)
+			}
+			all := map[string]func(*networkingv1.NetworkPolicySpec){}
+			for k, v := range common {
+				all[k] = v
+			}
+			for k, v := range p.cases {
+				all[k] = v
+			}
+			for what, mut := range all {
+				spec := p.spec()
+				mut(&spec)
+				create := &networkingv1.NetworkPolicy{ObjectMeta: childMeta(p.name, managed), Spec: spec}
+				wantRuleDenial(t, "create "+p.name+" with "+what, p.name+" only as", op.Create(ctx, create, dry))
+				bad := get(t, &networkingv1.NetworkPolicy{}, managed, p.name)
+				bad.Spec = spec
+				wantRuleDenial(t, "update "+p.name+" with "+what, p.name+" only as", op.Update(ctx, bad, dry))
+			}
+		}
+	})
+
+	t.Run("managed networkpolicy metadata", func(t *testing.T) {
+		const metaRule = "NetworkPolicy metadata"
+		for _, name := range []string{DenyIngressPolicyName, SameNamespacePolicy, GatewayPolicyName} {
+			spec := desiredDenyIngressSpec()
+			switch name {
+			case SameNamespacePolicy:
+				spec = desiredSameNamespaceSpec()
+			case GatewayPolicyName:
+				spec = desiredAllowIngressGatewaySpec(GatewayOptions{})
+			}
+			for what, mut := range map[string]func(*metav1.ObjectMeta){
+				"no labels":        func(m *metav1.ObjectMeta) { m.Labels = nil },
+				"extra label":      func(m *metav1.ObjectMeta) { m.Labels["x"] = "y" },
+				"annotation":       func(m *metav1.ObjectMeta) { m.Annotations = map[string]string{"x": "y"} },
+				"wrong team label": func(m *metav1.ObjectMeta) { m.Labels[LabelTeamNamespace] = "other" },
+			} {
+				m := childMeta(name, managed)
+				mut(&m)
+				wantRuleDenial(t, "create "+name+" with "+what, metaRule, op.Create(ctx, &networkingv1.NetworkPolicy{ObjectMeta: m, Spec: spec}, dry))
+			}
+			// Update: an added label or annotation is denied; unchanged metadata passes.
+			cur := get(t, &networkingv1.NetworkPolicy{}, managed, name)
+			if err := op.Update(ctx, cur, dry); err != nil {
+				t.Errorf("update %s with unchanged metadata: %v", name, err)
+			}
+			cur = get(t, &networkingv1.NetworkPolicy{}, managed, name)
+			cur.Labels["x"] = "y"
+			wantRuleDenial(t, "update "+name+" adding a label", metaRule, op.Update(ctx, cur, dry))
+			cur = get(t, &networkingv1.NetworkPolicy{}, managed, name)
+			cur.Annotations = map[string]string{"x": "y"}
+			wantRuleDenial(t, "update "+name+" adding an annotation", metaRule, op.Update(ctx, cur, dry))
 		}
 	})
 }
