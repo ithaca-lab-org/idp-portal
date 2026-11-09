@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiError, listBuckets, placeBucket, type Bucket, type ResourcesInfo } from "./api";
 import { BucketDetail } from "./BucketDetail";
+import { pickNs } from "./namespaces";
 
 const NAME_RE = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/;
 
@@ -11,10 +12,10 @@ function check(name: string, max: number): string {
   return "";
 }
 
-export function ResourcesPage({ info }: { info: ResourcesInfo }) {
+export function ResourcesPage({ info, active, ns: wanted, onNs }: { info: ResourcesInfo; active: boolean; ns: string; onNs: (ns: string) => void }) {
   const { namespaces, maxNamespaceLength: maxNs, maxNameLength: maxName } = info;
   const usable = namespaces.filter((n) => n.name.length <= maxNs && !n.name.startsWith("goog") && !n.name.includes("google"));
-  const [ns, setNs] = useState(usable[0]?.name ?? "");
+  const ns = pickNs(usable.map((n) => n.name), wanted);
   const [name, setName] = useState("");
   const [list, setList] = useState<Bucket[] | null>(null);
   const [open, setOpen] = useState<string | null>(null);
@@ -23,22 +24,36 @@ export function ResourcesPage({ info }: { info: ResourcesInfo }) {
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
 
+  // only the latest request counts: a slow answer for a namespace we left (or an older request) is ignored
+  const latest = useRef(0);
   const load = useCallback(async () => {
     if (!ns) return;
+    const id = ++latest.current;
     try {
-      setList(await listBuckets(ns));
+      const r = await listBuckets(ns);
+      if (id !== latest.current) return;
+      setList(r);
       setError("");
     } catch (e) {
+      if (id !== latest.current) return;
       setError(e instanceof ApiError ? e.message : "Could not load buckets.");
     }
   }, [ns]);
 
+  // a new namespace starts from "Loading…"; coming back to the page reloads silently
   useEffect(() => {
+    latest.current++;
     setList(null);
     setOpen(null);
     setNotice("");
-    load();
-  }, [load]);
+    return () => {
+      latest.current++;
+    };
+  }, [ns]);
+
+  useEffect(() => {
+    if (active) load();
+  }, [load, active]);
 
   if (namespaces.length === 0) {
     return <p>None of your business units has a ready namespace yet. Order one first.</p>;
@@ -68,7 +83,7 @@ export function ResourcesPage({ info }: { info: ResourcesInfo }) {
       <h2>Resources</h2>
       <label>
         Namespace
-        <select value={ns} onChange={(e) => setNs(e.target.value)}>
+        <select value={ns} onChange={(e) => onNs(e.target.value)}>
           {namespaces.map((n) => {
             const ok = usable.includes(n);
             return (

@@ -1,33 +1,60 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiError, deleteSecret, listSecrets, type NameRules, type Namespace, type SecretMeta } from "./api";
+import { pickNs } from "./namespaces";
 import { SecretForm } from "./SecretForm";
 
 type Mode = { kind: "none" } | { kind: "new" } | { kind: "replace"; secret: SecretMeta } | { kind: "delete"; secret: SecretMeta };
 
-export function SecretsPage({ namespaces, rules }: { namespaces: Namespace[]; rules: NameRules }) {
-  const [ns, setNs] = useState(namespaces[0]?.name ?? "");
+export function SecretsPage({
+  namespaces,
+  rules,
+  active,
+  ns: wanted,
+  onNs,
+}: {
+  namespaces: Namespace[];
+  rules: NameRules;
+  active: boolean;
+  ns: string;
+  onNs: (ns: string) => void;
+}) {
+  const ns = pickNs(namespaces.map((n) => n.name), wanted);
   const [secrets, setSecrets] = useState<SecretMeta[] | null>(null);
   const [mode, setMode] = useState<Mode>({ kind: "none" });
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
 
+  // only the latest request counts: a slow answer for a namespace we left (or an older request) is ignored
+  const latest = useRef(0);
   const load = useCallback(async () => {
     if (!ns) return;
+    const id = ++latest.current;
     try {
-      setSecrets(await listSecrets(ns));
+      const r = await listSecrets(ns);
+      if (id !== latest.current) return;
+      setSecrets(r);
       setError("");
     } catch (e) {
+      if (id !== latest.current) return;
       setError(e instanceof ApiError ? e.message : "Could not load secrets.");
     }
   }, [ns]);
 
+  // a new namespace starts from "Loading…"; coming back to the page reloads silently
   useEffect(() => {
+    latest.current++;
     setSecrets(null);
     setMode({ kind: "none" });
     setNotice("");
-    load();
-  }, [load]);
+    return () => {
+      latest.current++;
+    };
+  }, [ns]);
+
+  useEffect(() => {
+    if (active) load();
+  }, [load, active]);
 
   if (namespaces.length === 0) {
     return <p>None of your business units has a ready namespace yet. Order one first.</p>;
@@ -54,7 +81,7 @@ export function SecretsPage({ namespaces, rules }: { namespaces: Namespace[]; ru
       <h2>Secrets</h2>
       <label>
         Namespace
-        <select value={ns} onChange={(e) => setNs(e.target.value)}>
+        <select value={ns} onChange={(e) => onNs(e.target.value)}>
           {namespaces.map((n) => (
             <option key={n.name} value={n.name}>
               {n.name} ({n.businessUnit})

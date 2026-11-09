@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ApiError,
   getBucket,
@@ -23,11 +23,16 @@ export function BucketDetail({ info, namespace, name, onBack }: { info: Resource
   const [confirming, setConfirming] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
+  const latest = useRef(0); // only the latest request counts
   const load = useCallback(async () => {
+    const id = ++latest.current;
     try {
-      setB(await getBucket(namespace, name));
+      const r = await getBucket(namespace, name);
+      if (id !== latest.current) return;
+      setB(r);
       setError("");
     } catch (e) {
+      if (id !== latest.current) return;
       setError(e instanceof ApiError ? e.message : "Could not load the bucket.");
     }
   }, [namespace, name]);
@@ -35,6 +40,9 @@ export function BucketDetail({ info, namespace, name, onBack }: { info: Resource
   useEffect(() => {
     setB(null);
     load();
+    return () => {
+      latest.current++;
+    };
   }, [load]);
 
   // the workloads come from the Workloads page's API; when that page is off, none are offered
