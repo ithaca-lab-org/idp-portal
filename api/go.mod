@@ -5,11 +5,11 @@ go 1.26.10
 require (
 	cloud.google.com/go/pubsub/v2 v2.8.0
 	github.com/coreos/go-oidc/v3 v3.21.0
-	go.mongodb.org/mongo-driver/v2 v2.9.2
+	go.mongodb.org/mongo-driver/v2 v2.9.3
 	golang.org/x/oauth2 v0.37.0
-	golang.org/x/sync v0.24.0
-	k8s.io/apimachinery v0.37.1
-	k8s.io/client-go v0.37.1
+	golang.org/x/sync v0.25.0
+	k8s.io/apimachinery v0.37.2
+	k8s.io/client-go v0.37.2
 	sigs.k8s.io/yaml v1.6.0
 )
 
