@@ -20,6 +20,7 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -936,7 +937,14 @@ func TestSpinnakerDeployerBinding(t *testing.T) {
 	if rb := get(t, &rbacv1.RoleBinding{}, name, SpinnakerDeployerBindingName); rb.RoleRef.Name != "cluster-admin" || len(rb.OwnerReferences) != 0 {
 		t.Errorf("uncontrolled binding was touched: %+v owners %+v", rb.RoleRef, rb.OwnerReferences)
 	}
+	assertSpinnakerConflict(t, name, true)
 	if err := k8s.Delete(ctx, foreign); err != nil {
+		t.Fatal(err)
+	}
+
+	reconcileOnceWith(t, op, name, true)
+	assertSpinnakerConflict(t, name, false)
+	if err := k8s.Delete(ctx, &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: SpinnakerDeployerBindingName, Namespace: name}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -960,11 +968,17 @@ func TestSpinnakerDeployerBinding(t *testing.T) {
 	absent("flag turned off")
 	assertStatus(t, getTN(t, name), idpv1alpha1.PhaseReady, ReasonReconciled)
 
-	// A binding of that name the TeamNamespace does not control is left alone.
+	// A binding of that name the TeamNamespace does not control is left alone
+	// (no conflict is reported with the flag off).
 	if err := k8s.Create(ctx, spinnakerRB(name)); err != nil {
 		t.Fatal(err)
 	}
 	reconcileOnceWith(t, op, name, false)
+	assertSpinnakerConflict(t, name, false)
+	reconcileOnceWith(t, op, name, true)
+	assertSpinnakerConflict(t, name, true)
+	reconcileOnceWith(t, op, name, false)
+	assertSpinnakerConflict(t, name, false)
 	get(t, &rbacv1.RoleBinding{}, name, SpinnakerDeployerBindingName)
 }
 
@@ -1046,4 +1060,19 @@ func TestTenantServicesPolicy(t *testing.T) {
 	}), dry); err != nil {
 		t.Errorf("create ExternalName in unmanaged ns: %v", err)
 	}
+}
+
+// assertSpinnakerConflict checks the SpinnakerDeployerConflict condition, and
+// that the TeamNamespace stays Ready either way.
+func assertSpinnakerConflict(t *testing.T, name string, want bool) {
+	t.Helper()
+	tn := getTN(t, name)
+	c := meta.FindStatusCondition(tn.Status.Conditions, ConditionSpinnakerDeployerConflict)
+	if want && (c == nil || c.Status != metav1.ConditionTrue || c.Reason != ReasonNameConflict) {
+		t.Errorf("want SpinnakerDeployerConflict=True/NameConflict, got %+v", c)
+	}
+	if !want && c != nil {
+		t.Errorf("want no SpinnakerDeployerConflict condition, got %+v", c)
+	}
+	assertStatus(t, tn, idpv1alpha1.PhaseReady, ReasonReconciled)
 }

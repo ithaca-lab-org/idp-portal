@@ -31,6 +31,12 @@ const (
 	ReasonNamespaceConflict    = "NamespaceConflict"
 	ReasonNamespaceTerminating = "NamespaceTerminating"
 	ReasonReconcileError       = "ReconcileError"
+
+	// ConditionSpinnakerDeployerConflict is True while a RoleBinding
+	// spinnaker-deployer that the TeamNamespace does not control blocks the
+	// operator's own; it does not affect Ready. The condition is absent
+	// otherwise.
+	ConditionSpinnakerDeployerConflict = "SpinnakerDeployerConflict"
 )
 
 type TeamNamespaceReconciler struct {
@@ -134,11 +140,31 @@ func (r *TeamNamespaceReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		extra = append(extra, vaultCondition(metav1.ConditionTrue, ReasonVaultAccessReady,
 			"ServiceAccount vault-reader and VaultAuth vault-reader are in place", tn))
 	}
+	if r.spinnakerConflict(ctx, tn) {
+		extra = append(extra, metav1.Condition{
+			Type: ConditionSpinnakerDeployerConflict, Status: metav1.ConditionTrue, Reason: ReasonNameConflict,
+			Message:            "RoleBinding " + SpinnakerDeployerBindingName + " exists and is not controlled by this TeamNamespace; the operator leaves it alone, so Spinnaker may lack deploy rights here",
+			ObservedGeneration: tn.Generation,
+		})
+	}
 	if requeue {
 		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 	return ctrl.Result{}, r.setStatus(ctx, tn, idpv1alpha1.PhaseReady, metav1.ConditionTrue, ReasonReconciled,
 		"namespace and guardrails are in place", tn.Name, extra...)
+}
+
+// spinnakerConflict reports whether the flag is on and an uncontrolled
+// RoleBinding spinnaker-deployer is in the way.
+func (r *TeamNamespaceReconciler) spinnakerConflict(ctx context.Context, tn *idpv1alpha1.TeamNamespace) bool {
+	if !r.SpinnakerDeployer {
+		return false
+	}
+	rb := &rbacv1.RoleBinding{}
+	if err := r.Get(ctx, types.NamespacedName{Name: SpinnakerDeployerBindingName, Namespace: tn.Name}, rb); err != nil {
+		return false
+	}
+	return !metav1.IsControlledBy(rb, tn)
 }
 
 func managedBy(ns *corev1.Namespace, tn *idpv1alpha1.TeamNamespace) bool {
@@ -335,6 +361,13 @@ func (r *TeamNamespaceReconciler) setStatus(ctx context.Context, tn *idpv1alpha1
 	tn.Status.Phase = phase
 	tn.Status.ObservedGeneration = tn.Generation
 	tn.Status.Namespace = namespace
+	hasConflict := false
+	for _, c := range extra {
+		hasConflict = hasConflict || c.Type == ConditionSpinnakerDeployerConflict
+	}
+	if !hasConflict {
+		meta.RemoveStatusCondition(&tn.Status.Conditions, ConditionSpinnakerDeployerConflict)
+	}
 	meta.SetStatusCondition(&tn.Status.Conditions, metav1.Condition{
 		Type:               idpv1alpha1.ConditionReady,
 		Status:             cond,

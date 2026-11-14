@@ -144,7 +144,7 @@ func TestReservedListMatchesCRDAndPolicy(t *testing.T) {
 				got = append(got, m[1])
 			}
 			sort.Strings(got)
-			// the policy copy for namespaces and certificates also lists the prefix 'vault-'
+			// every copy lists the same names and the same four prefixes
 			if strings.Join(got, ",") != strings.Join(want, ",") {
 				t.Errorf("%s copy %d: reserved names drifted:\n got %v\nwant %v", f, i, got, want)
 			}
