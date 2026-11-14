@@ -23,7 +23,7 @@ func TestIsReserved(t *testing.T) {
 	for name, want := range map[string]bool{
 		"default": true, "kube-system": true, "kube-public": true, "istio-system": true,
 		"gke-managed-system": true, "argocd": true, "cert-manager": true, "tailscale": true,
-		"identity": true, "idp-system": true, "echo": true, "vault": true, "vault-demo": true, "vault-secrets-operator": true,
+		"identity": true, "idp-system": true, "echo": true, "vault": true, "vault-demo": true, "vault-secrets-operator": true, "spinnaker": true, "keycloak": true,
 		"payments": false, "kubeflow": false, "echo-team": false, "my-istio-app": false, "vaulted": false, "my-vault": false, "vproof-a": false, "vproof": false,
 	} {
 		if got := IsReserved(name); got != want {

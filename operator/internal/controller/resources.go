@@ -51,7 +51,7 @@ const (
 
 var reservedNames = map[string]bool{
 	"default": true, "argocd": true, "cert-manager": true, "tailscale": true,
-	"identity": true, "idp-system": true, "echo": true, "vault": true,
+	"identity": true, "idp-system": true, "echo": true, "vault": true, "spinnaker": true, "keycloak": true,
 }
 
 var reservedPrefixes = []string{"kube-", "istio-", "gke-", "vault-"}

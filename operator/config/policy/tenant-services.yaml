@@ -1,0 +1,40 @@
+# Services in operator-managed (tenant) namespaces may only be plain ClusterIP.
+# The workload HTTPRoute (operator) forwards <name>.<ns>.apps... to the Service
+# named <name> in the same namespace, so a Service of that name that is an
+# ExternalName, LoadBalancer, NodePort or has externalIPs could redirect the
+# route to another namespace's service or to an external address. Applies to
+# EVERY user (tenant admins, Spinnaker's Clouddriver, the operator): there is no
+# matchCondition. Headless Services (clusterIP None) are ClusterIP and allowed.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: idp-tenant-services
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchLabels:
+        app.kubernetes.io/managed-by: idp-operator
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["services"]
+  validations:
+    - expression: "object.spec.?type.orValue('') in ['', 'ClusterIP']"
+      reason: Forbidden
+      message: "Services in managed namespaces must be of type ClusterIP (no ExternalName, NodePort or LoadBalancer)"
+    - expression: "size(object.spec.?externalIPs.orValue([])) == 0"
+      reason: Forbidden
+      message: "Services in managed namespaces may not set externalIPs"
+    - expression: "!has(object.spec.externalName)"
+      reason: Forbidden
+      message: "Services in managed namespaces may not set externalName"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: idp-tenant-services
+spec:
+  policyName: idp-tenant-services
+  validationActions: ["Deny"]

@@ -104,7 +104,7 @@ spec:
     # will later deploy into.
     - expression: >-
         !variables.isNamespace || request.operation != 'CREATE' ||
-        (!(request.name in ['default', 'argocd', 'cert-manager', 'tailscale', 'identity', 'idp-system', 'echo', 'vault']) &&
+        (!(request.name in ['default', 'argocd', 'cert-manager', 'tailscale', 'identity', 'idp-system', 'echo', 'vault', 'spinnaker', 'keycloak']) &&
          !['kube-', 'istio-', 'gke-', 'vault-'].exists(p, request.name.startsWith(p)))
       reason: Forbidden
       messageExpression: "'idp-operator may not create reserved namespace ' + request.name"
@@ -186,7 +186,7 @@ spec:
          object.spec.dnsNames.all(n, n == '*.apps.ithaca-idp.com' ||
            (n.matches('^[*][.][a-z0-9]([-a-z0-9]*[a-z0-9])?[.]apps[.]ithaca-idp[.]com$') &&
             [n.substring(2, n.size() - '.apps.ithaca-idp.com'.size())].all(l, l.size() <= 40 &&
-              !(l in ['default', 'argocd', 'cert-manager', 'tailscale', 'identity', 'idp-system', 'echo', 'vault']) &&
+              !(l in ['default', 'argocd', 'cert-manager', 'tailscale', 'identity', 'idp-system', 'echo', 'vault', 'spinnaker', 'keycloak']) &&
               !['kube-', 'istio-', 'gke-', 'vault-'].exists(p, l.startsWith(p))))))
       reason: Forbidden
       message: "idp-operator Certificate dnsNames must be *.apps.ithaca-idp.com first, then only *.<namespace>.apps.ithaca-idp.com for non-reserved single labels of at most 40 characters, no duplicates, at most 100 names"

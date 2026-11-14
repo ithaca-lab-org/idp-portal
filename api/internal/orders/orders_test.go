@@ -72,7 +72,7 @@ func newSvc() (*Service, *MemStore, *fakeCluster) {
 func TestValidateName(t *testing.T) {
 	good := []string{"a", "payments-team", "team1", strings.Repeat("a", 40)}
 	bad := []string{"", "Upper", "-lead", "trail-", "has_underscore", "has.dot", strings.Repeat("a", 41),
-		"default", "argocd", "cert-manager", "tailscale", "identity", "idp-system", "echo", "vault", "vault-demo", "vault-secrets-operator",
+		"default", "argocd", "cert-manager", "tailscale", "identity", "idp-system", "echo", "vault", "vault-demo", "vault-secrets-operator", "spinnaker", "keycloak",
 		"kube-system", "kube-x", "istio-system", "istio-ingress", "gke-managed", "vproof-a", "vproof-b"}
 	for _, n := range good {
 		if err := ValidateName(n); err != nil {
@@ -115,6 +115,40 @@ func TestReservedListMatchesOperator(t *testing.T) {
 	sort.Strings(gotP)
 	if strings.Join(names, ",") != strings.Join(gotN, ",") || strings.Join(prefixes, ",") != strings.Join(gotP, ",") {
 		t.Fatalf("reserved lists drifted from the operator: operator names=%v prefixes=%v, api names=%v prefixes=%v", names, prefixes, gotN, gotP)
+	}
+}
+
+// The CRD rule and the operator admission policy (three copies) carry the same
+// reserved names and prefixes as the Go list.
+func TestReservedListMatchesCRDAndPolicy(t *testing.T) {
+	want := append(append([]string(nil), ReservedNames...), ReservedPrefixes...)
+	sort.Strings(want)
+	for _, f := range []string{
+		"../../../operator/api/v1alpha1/teamnamespace_types.go",
+		"../../../operator/config/crd/bases/idp.ithaca-idp.com_teamnamespaces.yaml",
+		"../../../operator/config/policy/operator-scope.yaml",
+	} {
+		src, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := strings.ReplaceAll(string(src), "''", "'")
+		lists := regexp.MustCompile(`\[('default'[^\]]*)\]`).FindAllStringSubmatch(text, -1)
+		prefs := regexp.MustCompile(`\[('kube-'[^\]]*)\]`).FindAllStringSubmatch(text, -1)
+		if len(lists) == 0 || len(lists) != len(prefs) {
+			t.Fatalf("%s: found %d name lists and %d prefix lists", f, len(lists), len(prefs))
+		}
+		for i := range lists {
+			var got []string
+			for _, m := range regexp.MustCompile(`'([^']+)'`).FindAllStringSubmatch(lists[i][1]+","+prefs[i][1], -1) {
+				got = append(got, m[1])
+			}
+			sort.Strings(got)
+			// the policy copy for namespaces and certificates also lists the prefix 'vault-'
+			if strings.Join(got, ",") != strings.Join(want, ",") {
+				t.Errorf("%s copy %d: reserved names drifted:\n got %v\nwant %v", f, i, got, want)
+			}
+		}
 	}
 }
 

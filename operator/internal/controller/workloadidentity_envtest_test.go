@@ -541,6 +541,11 @@ func TestOperatorWorkloadIdentityUnderRBACAndPolicy(t *testing.T) {
 	} {
 		u := mustGetU(t, tc.gvk, managed, name)
 		tc.mutate(u)
+		if strings.HasPrefix(what, "route backend") || strings.HasPrefix(what, "route second") ||
+			what == "route no backend" || what == "route rule filter" {
+			wantRuleDenial(t, "update "+what, "idp-operator HTTPRoutes must attach", op.Update(ctx, u, dry))
+			continue
+		}
 		wantPolicyDenial(t, "update "+what, op.Update(ctx, u, dry))
 	}
 

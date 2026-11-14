@@ -183,14 +183,14 @@ func (r *TeamNamespaceReconciler) converge(ctx context.Context, tn *idpv1alpha1.
 		}
 	}
 
-	requeue, err := r.ensureRoleBinding(ctx, tn, AdminRoleBindingName, desiredRoleRef(), desiredSubjects(tn))
+	requeue, err := r.ensureRoleBinding(ctx, tn, AdminRoleBindingName, desiredRoleRef(), desiredSubjects(tn), true)
 	if err != nil || requeue {
 		return requeue, err
 	}
 	if !r.SpinnakerDeployer {
 		return false, r.removeSpinnakerBinding(ctx, tn)
 	}
-	return r.ensureRoleBinding(ctx, tn, SpinnakerDeployerBindingName, spinnakerRoleRef(), spinnakerSubjects())
+	return r.ensureRoleBinding(ctx, tn, SpinnakerDeployerBindingName, spinnakerRoleRef(), spinnakerSubjects(), false)
 }
 
 // removeSpinnakerBinding deletes a spinnaker-deployer binding that this
@@ -264,9 +264,15 @@ func (r *TeamNamespaceReconciler) ensureChild(ctx context.Context, tn *idpv1alph
 // ensureRoleBinding reports true when it had to delete a binding whose immutable
 // roleRef drifted; the replacement is created on the next pass.
 func (r *TeamNamespaceReconciler) ensureRoleBinding(ctx context.Context, tn *idpv1alpha1.TeamNamespace,
-	name string, roleRef rbacv1.RoleRef, subjects []rbacv1.Subject) (bool, error) {
+	name string, roleRef rbacv1.RoleRef, subjects []rbacv1.Subject, adoptForeign bool) (bool, error) {
 	rb := &rbacv1.RoleBinding{}
 	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: tn.Name}, rb)
+	if err == nil && !adoptForeign && !metav1.IsControlledBy(rb, tn) {
+		// A binding of this name that the TeamNamespace does not control is
+		// neither repaired nor deleted nor overwritten.
+		logf.FromContext(ctx).Info("not touching existing RoleBinding", "name", name, "namespace", tn.Name, "reason", "NameConflict")
+		return false, nil
+	}
 	switch {
 	case err == nil && rb.RoleRef != roleRef:
 		uid := rb.UID
