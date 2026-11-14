@@ -1,6 +1,6 @@
 module github.com/ithaca-lab-org/idp-portal/operator
 
-go 1.26.10
+go 1.26.11
 
 require (
 	cloud.google.com/go/iam v1.12.0
