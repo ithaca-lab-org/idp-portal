@@ -131,6 +131,7 @@ rules:
   - rbac.authorization.k8s.io
   resourceNames:
   - admin
+  - idp-spinnaker-deployer
   resources:
   - clusterroles
   verbs:
@@ -148,6 +149,7 @@ rules:
   - rbac.authorization.k8s.io
   resourceNames:
   - idp-namespace-admin
+  - spinnaker-deployer
   resources:
   - rolebindings
   verbs:

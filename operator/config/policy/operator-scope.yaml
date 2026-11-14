@@ -104,7 +104,7 @@ spec:
     # will later deploy into.
     - expression: >-
         !variables.isNamespace || request.operation != 'CREATE' ||
-        (!(request.name in ['default', 'argocd', 'cert-manager', 'tailscale', 'identity', 'idp-system', 'echo', 'vault']) &&
+        (!(request.name in ['default', 'argocd', 'cert-manager', 'tailscale', 'identity', 'idp-system', 'echo', 'vault', 'spinnaker', 'keycloak']) &&
          !['kube-', 'istio-', 'gke-', 'vault-'].exists(p, request.name.startsWith(p)))
       reason: Forbidden
       messageExpression: "'idp-operator may not create reserved namespace ' + request.name"
@@ -141,7 +141,7 @@ spec:
           'resourcequotas': ['idp-quota'],
           'limitranges': ['idp-limits'],
           'networkpolicies': ['idp-default-deny-ingress', 'idp-allow-same-namespace', 'idp-allow-ingress-gateway'],
-          'rolebindings': ['idp-namespace-admin'],
+          'rolebindings': ['idp-namespace-admin', 'spinnaker-deployer'],
           'serviceaccounts': ['vault-reader'],
           'vaultauths': ['vault-reader']
         }[request.resource.resource]
@@ -186,21 +186,30 @@ spec:
          object.spec.dnsNames.all(n, n == '*.apps.ithaca-idp.com' ||
            (n.matches('^[*][.][a-z0-9]([-a-z0-9]*[a-z0-9])?[.]apps[.]ithaca-idp[.]com$') &&
             [n.substring(2, n.size() - '.apps.ithaca-idp.com'.size())].all(l, l.size() <= 40 &&
-              !(l in ['default', 'argocd', 'cert-manager', 'tailscale', 'identity', 'idp-system', 'echo', 'vault']) &&
+              !(l in ['default', 'argocd', 'cert-manager', 'tailscale', 'identity', 'idp-system', 'echo', 'vault', 'spinnaker', 'keycloak']) &&
               !['kube-', 'istio-', 'gke-', 'vault-'].exists(p, l.startsWith(p))))))
       reason: Forbidden
       message: "idp-operator Certificate dnsNames must be *.apps.ithaca-idp.com first, then only *.<namespace>.apps.ithaca-idp.com for non-reserved single labels of at most 40 characters, no duplicates, at most 100 names"
-    # One User subject that looks like an email: no Groups, no ServiceAccounts,
-    # and no 'system:' users (a ServiceAccount can also be named as a User
-    # system:serviceaccount:<ns>:<name>).
+    # idp-namespace-admin: one User subject that looks like an email: no Groups,
+    # no ServiceAccounts, and no 'system:' users (a ServiceAccount can also be
+    # named as a User system:serviceaccount:<ns>:<name>).
+    # spinnaker-deployer (SPINNAKER_DEPLOYER_ENABLED): exactly ClusterRole
+    # idp-spinnaker-deployer for the one ServiceAccount spinnaker/clouddriver,
+    # nothing else (no other roleRef or subject, and the admin name cannot carry it).
     - expression: >-
         request.resource.resource != 'rolebindings' || request.operation == 'DELETE' ||
-        (object.roleRef.apiGroup == 'rbac.authorization.k8s.io' &&
-         object.roleRef.kind == 'ClusterRole' && object.roleRef.name == 'admin' &&
-         has(object.subjects) && size(object.subjects) == 1 &&
-         object.subjects.all(s, s.kind == 'User' && !s.name.startsWith('system:') && s.name.contains('@')))
+        (request.name == 'spinnaker-deployer' ?
+          (object.roleRef.apiGroup == 'rbac.authorization.k8s.io' &&
+           object.roleRef.kind == 'ClusterRole' && object.roleRef.name == 'idp-spinnaker-deployer' &&
+           has(object.subjects) && size(object.subjects) == 1 &&
+           object.subjects.all(s, s.kind == 'ServiceAccount' && s.name == 'clouddriver' &&
+             s.?namespace.orValue('') == 'spinnaker' && s.?apiGroup.orValue('') == '')) :
+          (object.roleRef.apiGroup == 'rbac.authorization.k8s.io' &&
+           object.roleRef.kind == 'ClusterRole' && object.roleRef.name == 'admin' &&
+           has(object.subjects) && size(object.subjects) == 1 &&
+           object.subjects.all(s, s.kind == 'User' && !s.name.startsWith('system:') && s.name.contains('@'))))
       reason: Forbidden
-      message: "idp-operator RoleBindings must bind ClusterRole admin to exactly one User subject (no groups, service accounts or system: users)"
+      message: "idp-operator RoleBindings must bind ClusterRole admin to exactly one User subject (no groups, service accounts or system: users), or (spinnaker-deployer) ClusterRole idp-spinnaker-deployer to exactly ServiceAccount spinnaker/clouddriver"
     # The VaultAuth is pinned to exactly the spec the controller writes
     # (vaultAuthSpec): vault-reader can only log in as the namespace's own
     # vault-reader with role ns-reader, and a WorkloadIdentity's VaultAuth <name>
@@ -313,9 +322,12 @@ spec:
     # The HTTPRoute is exactly desiredHTTPRouteSpec in substance: one parentRef,
     # the https listener of Gateway istio-ingress/ingress; one hostname
     # <name>.<namespace>.apps.ithaca-idp.com (the operator flag
-    # --workload-hostname-suffix must match; change both together); and no rule with backendRefs or filters, so the route
-    # cannot forward or redirect anywhere. Field names are those of Gateway API
-    # v1 (standard channel) HTTPRoute.
+    # --workload-hostname-suffix must match; change both together); and exactly
+    # one rule, with no filters (no redirect or rewrite) and exactly one
+    # backendRef: group core, kind Service, name = the HTTPRoute's own name
+    # (the workload), port 80, no namespace (same namespace), so a route can
+    # only forward to the Service of its own workload. Field names are those of
+    # Gateway API v1 (standard channel) HTTPRoute.
     - expression: >-
         request.resource.resource != 'httproutes' || request.operation == 'DELETE' ||
         (has(object.spec) && has(object.spec.parentRefs) && size(object.spec.parentRefs) == 1 &&
@@ -325,9 +337,14 @@ spec:
            p.?namespace.orValue('') == 'istio-ingress' && p.name == 'ingress' &&
            p.?sectionName.orValue('') == 'https' && !has(p.port)) &&
          object.spec.?hostnames.orValue([]) == [object.metadata.name + '.' + request.namespace + '.apps.ithaca-idp.com'] &&
-         object.spec.?rules.orValue([]).all(r, !has(r.backendRefs) && !has(r.filters)))
+         has(object.spec.rules) && size(object.spec.rules) == 1 &&
+         object.spec.rules.all(r, !has(r.filters) &&
+           has(r.backendRefs) && size(r.backendRefs) == 1 &&
+           r.backendRefs.all(b, b.?group.orValue('') == '' && b.?kind.orValue('Service') == 'Service' &&
+             b.name == object.metadata.name && !has(b.namespace) && b.?port.orValue(0) == 80 &&
+             !has(b.filters))))
       reason: Forbidden
-      message: "idp-operator HTTPRoutes must attach only to istio-ingress/ingress section https, carry exactly the hostname <name>.<namespace>.apps.ithaca-idp.com, and have no backendRefs or filters"
+      message: "idp-operator HTTPRoutes must attach only to istio-ingress/ingress section https, carry exactly the hostname <name>.<namespace>.apps.ithaca-idp.com, and have one rule with no filters and one backendRef to the Service <name> (core, port 80, same namespace)"
     # The AuthorizationPolicy is exactly desiredAuthorizationPolicySpec: ALLOW for
     # pods labelled idp.ithaca-idp.com/workload=<name>, one rule whose two
     # sources are the request namespace and the principal

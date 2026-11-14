@@ -35,7 +35,7 @@ All routes need a signed-in session (401 JSON otherwise). The caller's email and
 
 Rules enforced on `POST`:
 - the business unit must be exactly one of the caller's `groups` (403 otherwise); the owner is always the session email, and unknown JSON fields (for example a forged `owner`) are rejected;
-- the name must be a lowercase DNS label of at most 40 characters and not reserved (`default`, `kube-*`, `istio-*`, `gke-*`, `argocd`, `cert-manager`, `tailscale`, `identity`, `idp-system`, `echo`, `vault`, `vault-*`); a test fails if this list drifts from the operator's;
+- the name must be a lowercase DNS label of at most 40 characters and not reserved (`default`, `kube-*`, `istio-*`, `gke-*`, `argocd`, `cert-manager`, `tailscale`, `identity`, `idp-system`, `echo`, `vault`, `vault-*`, `spinnaker`, `keycloak`); a test fails if this list drifts from the operator's;
 - size is `small` or `medium`; at most 10 active orders per business unit and 5 per user (`ORDER_CAP_PER_BU`, `ORDER_CAP_PER_USER`). The count and the insert happen under one lock, so a burst cannot exceed a cap (single replica; more replicas need a database-side reservation). Users are identified by their Keycloak subject, not their email, which is editable in the directory and unverified; the email is lowercased and used only as the namespace owner. At most 10 order attempts per user per minute (429 with `Retry-After`);
 - JSON only (`Content-Type: application/json`), 8 KB limit, same-origin only (cross-site requests get 403).
 

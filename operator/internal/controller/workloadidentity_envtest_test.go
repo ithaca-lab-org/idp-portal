@@ -123,8 +123,12 @@ func TestWorkloadIdentityCreatesChildren(t *testing.T) {
 		"parentRefs": []any{map[string]any{"group": "gateway.networking.k8s.io", "kind": "Gateway",
 			"namespace": "istio-ingress", "name": "ingress", "sectionName": "https"}},
 		"hostnames": []any{"payments-api.team-wi.apps.ithaca-idp.com"},
-		"rules": []any{map[string]any{"matches": []any{map[string]any{
-			"path": map[string]any{"type": "PathPrefix", "value": "/"}}}}},
+		"rules": []any{map[string]any{
+			"matches": []any{map[string]any{
+				"path": map[string]any{"type": "PathPrefix", "value": "/"}}},
+			"backendRefs": []any{map[string]any{"group": "", "kind": "Service", "name": name,
+				"port": int64(80), "weight": int64(1)}},
+		}},
 	}
 	if got := route.Object["spec"]; !equality.Semantic.DeepEqual(got, wantRoute) {
 		t.Errorf("HTTPRoute spec = %#v\nwant %#v", got, wantRoute)
@@ -457,9 +461,37 @@ func TestOperatorWorkloadIdentityUnderRBACAndPolicy(t *testing.T) {
 			p["namespace"], p["name"] = "keycloak", "internal"
 			_ = unstructured.SetNestedSlice(u.Object, []any{p}, "spec", "parentRefs")
 		}},
-		"route backend": {HTTPRouteGVK, func(u *unstructured.Unstructured) {
-			_ = unstructured.SetNestedSlice(u.Object, []any{map[string]any{"backendRefs": []any{
-				map[string]any{"name": "portal-api", "namespace": "idp-system", "port": int64(80)}}}}, "spec", "rules")
+		"route backend other service":              {HTTPRouteGVK, routeBackend(map[string]any{"name": "portal-api"})},
+		"route backend other kind":                 {HTTPRouteGVK, routeBackend(map[string]any{"kind": "ServiceImport", "group": "multicluster.x-k8s.io"})},
+		"route backend other group":                {HTTPRouteGVK, routeBackend(map[string]any{"group": "example.com"})},
+		"route backend cross-namespace":            {HTTPRouteGVK, routeBackend(map[string]any{"namespace": "idp-system"})},
+		"route backend same namespace spelled out": {HTTPRouteGVK, routeBackend(map[string]any{"namespace": managed})},
+		"route backend other port":                 {HTTPRouteGVK, routeBackend(map[string]any{"port": int64(8080)})},
+		"route backend filter": {HTTPRouteGVK, routeBackend(map[string]any{"filters": []any{map[string]any{
+			"type": "RequestHeaderModifier", "requestHeaderModifier": map[string]any{"set": []any{map[string]any{"name": "x", "value": "y"}}}}}})},
+		"route second backend": {HTTPRouteGVK, func(u *unstructured.Unstructured) {
+			routeBackend(nil)(u)
+			rules, _, _ := unstructured.NestedSlice(u.Object, "spec", "rules")
+			r := rules[0].(map[string]any)
+			r["backendRefs"] = append(r["backendRefs"].([]any), map[string]any{"name": "portal-api", "port": int64(80)})
+			_ = unstructured.SetNestedSlice(u.Object, rules, "spec", "rules")
+		}},
+		"route no backend": {HTTPRouteGVK, func(u *unstructured.Unstructured) {
+			_ = unstructured.SetNestedSlice(u.Object, []any{map[string]any{"matches": []any{map[string]any{
+				"path": map[string]any{"type": "PathPrefix", "value": "/"}}}}}, "spec", "rules")
+		}},
+		"route second rule": {HTTPRouteGVK, func(u *unstructured.Unstructured) {
+			routeBackend(nil)(u)
+			rules, _, _ := unstructured.NestedSlice(u.Object, "spec", "rules")
+			rules = append(rules, rules[0])
+			_ = unstructured.SetNestedSlice(u.Object, rules, "spec", "rules")
+		}},
+		"route rule filter": {HTTPRouteGVK, func(u *unstructured.Unstructured) {
+			routeBackend(nil)(u)
+			rules, _, _ := unstructured.NestedSlice(u.Object, "spec", "rules")
+			rules[0].(map[string]any)["filters"] = []any{map[string]any{"type": "RequestHeaderModifier",
+				"requestHeaderModifier": map[string]any{"set": []any{map[string]any{"name": "x", "value": "y"}}}}}
+			_ = unstructured.SetNestedSlice(u.Object, rules, "spec", "rules")
 		}},
 		"route redirect filter": {HTTPRouteGVK, func(u *unstructured.Unstructured) {
 			_ = unstructured.SetNestedSlice(u.Object, []any{map[string]any{"filters": []any{map[string]any{
@@ -509,6 +541,11 @@ func TestOperatorWorkloadIdentityUnderRBACAndPolicy(t *testing.T) {
 	} {
 		u := mustGetU(t, tc.gvk, managed, name)
 		tc.mutate(u)
+		if strings.HasPrefix(what, "route backend") || strings.HasPrefix(what, "route second") ||
+			what == "route no backend" || what == "route rule filter" {
+			wantRuleDenial(t, "update "+what, "idp-operator HTTPRoutes must attach", op.Update(ctx, u, dry))
+			continue
+		}
 		wantPolicyDenial(t, "update "+what, op.Update(ctx, u, dry))
 	}
 
@@ -664,5 +701,19 @@ func TestWorkloadIdentityVaultPurgeOnDeletion(t *testing.T) {
 		if len(p) != 2 || p[0] != ns {
 			t.Errorf("purge outside kv/%s/<workload>/: %v", ns, p)
 		}
+	}
+}
+
+// routeBackend overrides fields of the first backendRef of the route's first
+// rule (a nil map leaves the controller's backendRef as it is).
+func routeBackend(over map[string]any) func(u *unstructured.Unstructured) {
+	return func(u *unstructured.Unstructured) {
+		rules, _, _ := unstructured.NestedSlice(u.Object, "spec", "rules")
+		r := rules[0].(map[string]any)
+		b := r["backendRefs"].([]any)[0].(map[string]any)
+		for k, v := range over {
+			b[k] = v
+		}
+		_ = unstructured.SetNestedSlice(u.Object, rules, "spec", "rules")
 	}
 }

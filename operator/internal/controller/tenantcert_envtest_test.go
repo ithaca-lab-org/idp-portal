@@ -589,6 +589,8 @@ func TestPolicyTenantCertDenials(t *testing.T) {
 		"bare base":             dns(w, testBase),
 		"bare namespace":        dns(w, "team-a."+testBase),
 		"reserved vault":        dns(w, tenantName("vault")),
+		"reserved spinnaker":    dns(w, tenantName("spinnaker")),
+		"reserved keycloak":     dns(w, tenantName("keycloak")),
 		"reserved vault prefix": dns(w, tenantName("vault-x")),
 		"reserved kube prefix":  dns(w, tenantName("kube-system")),
 		"reserved istio prefix": dns(w, tenantName("istio-system")),

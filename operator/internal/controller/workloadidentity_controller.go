@@ -103,14 +103,13 @@ func newUnstructured(gvk schema.GroupVersionKind, namespace, name string) *unstr
 	return u
 }
 
-// desiredHTTPRouteSpec reserves the hostname on the https listener of the
-// shared Gateway. The single rule has no backendRefs and no filters, so it
-// cannot forward anywhere: the Gateway API spec requires a 500 for traffic
-// matching a rule whose backendRefs are all invalid (vacuously true here) and
-// that has no filters; Istio is expected to answer with a direct 500 (not yet
-// observed on the cluster). Defaulted fields (parentRef group/kind, the
-// PathPrefix "/" match) are written explicitly so the stored object compares
-// equal.
+// desiredHTTPRouteSpec routes the hostname on the https listener of the shared
+// Gateway to the Service named like the workload (port 80, same namespace).
+// The Service itself is not created here: until the tenant ships one, the
+// backendRef is invalid and the Gateway answers 500 (Gateway API). There are
+// no filters. Defaulted fields (parentRef group/kind, the PathPrefix "/" match,
+// backendRef group/kind/weight) are written explicitly so the stored object
+// compares equal. Numbers are int64 as the API server decodes them.
 func desiredHTTPRouteSpec(o WorkloadIdentityOptions, ns, name string) map[string]any {
 	return map[string]any{
 		"parentRefs": []any{map[string]any{
@@ -124,6 +123,13 @@ func desiredHTTPRouteSpec(o WorkloadIdentityOptions, ns, name string) map[string
 		"rules": []any{map[string]any{
 			"matches": []any{map[string]any{
 				"path": map[string]any{"type": "PathPrefix", "value": "/"},
+			}},
+			"backendRefs": []any{map[string]any{
+				"group":  "",
+				"kind":   "Service",
+				"name":   name,
+				"port":   int64(80),
+				"weight": int64(1),
 			}},
 		}},
 	}

@@ -18,7 +18,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -27,6 +29,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	idpv1alpha1 "github.com/ithaca-lab-org/idp-portal/operator/api/v1alpha1"
 )
@@ -66,6 +69,7 @@ func setupOperatorIdentity() (client.Client, error) {
 		filepath.Join("..", "..", "config", "rbac", "role.yaml"),
 		filepath.Join("..", "..", "config", "policy", "operator-scope.yaml"),
 		filepath.Join("..", "..", "config", "policy", "portal-scope.yaml"),
+		filepath.Join("..", "..", "config", "policy", "tenant-services.yaml"),
 	} {
 		if err := applyFile(f); err != nil {
 			return nil, err
@@ -184,6 +188,14 @@ func adminRB(ns string) *rbacv1.RoleBinding {
 		ObjectMeta: metav1.ObjectMeta{Name: AdminRoleBindingName, Namespace: ns},
 		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: AdminClusterRole},
 		Subjects:   []rbacv1.Subject{{APIGroup: rbacv1.GroupName, Kind: rbacv1.UserKind, Name: "attacker@example.com"}},
+	}
+}
+
+func spinnakerRB(ns string) *rbacv1.RoleBinding {
+	return &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: SpinnakerDeployerBindingName, Namespace: ns},
+		RoleRef:    spinnakerRoleRef(),
+		Subjects:   spinnakerSubjects(),
 	}
 }
 
@@ -388,6 +400,45 @@ func TestPolicyDeniesOperatorOutsideManagedNamespaces(t *testing.T) {
 		other := adminRB(managed)
 		other.Name = "second-admin"
 		wantPolicyDenial(t, "admin RB with a foreign name", op.Create(ctx, other, dry))
+		// The Spinnaker deployer binding: exactly one roleRef and subject.
+		if err := op.Create(ctx, spinnakerRB(managed), dry); err != nil {
+			t.Errorf("exact spinnaker-deployer binding: %v", err)
+		}
+		wantRuleDenial(t, "spinnaker RB in kube-system", "may only write rolebindings", op.Create(ctx, spinnakerRB("kube-system"), dry))
+		wantRuleDenial(t, "spinnaker RB in unlabelled ns", "may only write rolebindings", op.Create(ctx, spinnakerRB(plain), dry))
+		for what, mut := range map[string]func(*rbacv1.RoleBinding){
+			"roleRef admin":        func(b *rbacv1.RoleBinding) { b.RoleRef.Name = AdminClusterRole },
+			"other serviceaccount": func(b *rbacv1.RoleBinding) { b.Subjects[0].Name = "orca" },
+			"other sa namespace":   func(b *rbacv1.RoleBinding) { b.Subjects[0].Namespace = managed },
+			"user subject": func(b *rbacv1.RoleBinding) {
+				b.Subjects = []rbacv1.Subject{{APIGroup: rbacv1.GroupName, Kind: rbacv1.UserKind, Name: "a@example.com"}}
+			},
+			"group subject": func(b *rbacv1.RoleBinding) {
+				b.Subjects = []rbacv1.Subject{{APIGroup: rbacv1.GroupName, Kind: rbacv1.GroupKind, Name: "system:authenticated"}}
+			},
+			"extra subject": func(b *rbacv1.RoleBinding) {
+				b.Subjects = append(b.Subjects, rbacv1.Subject{Kind: rbacv1.ServiceAccountKind, Name: "default", Namespace: managed})
+			},
+			"no subjects": func(b *rbacv1.RoleBinding) { b.Subjects = nil },
+		} {
+			b := spinnakerRB(managed)
+			mut(b)
+			wantRuleDenial(t, "spinnaker RB with "+what, "exactly ServiceAccount spinnaker/clouddriver", op.Create(ctx, b, dry))
+		}
+		// The admin name cannot carry the Spinnaker grant, nor the reverse.
+		swap := adminRB(managed)
+		swap.RoleRef.Name, swap.Subjects = SpinnakerDeployerClusterRole, spinnakerSubjects()
+		wantRuleDenial(t, "idp-namespace-admin to the deployer role", "must bind ClusterRole admin", op.Create(ctx, swap, dry))
+		// UPDATE of an existing deployer binding may not add a second subject.
+		if err := k8s.Create(ctx, spinnakerRB(managed)); err != nil {
+			t.Fatal(err)
+		}
+		cur := get(t, &rbacv1.RoleBinding{}, managed, SpinnakerDeployerBindingName)
+		cur.Subjects = append(cur.Subjects, rbacv1.Subject{Kind: rbacv1.ServiceAccountKind, Name: "default", Namespace: managed})
+		wantRuleDenial(t, "update spinnaker RB adding a subject", "exactly ServiceAccount spinnaker/clouddriver", op.Update(ctx, cur, dry))
+		if err := k8s.Delete(ctx, cur); err != nil {
+			t.Fatal(err)
+		}
 		wantForbidden(t, "deletecollection rolebindings", op.DeleteAllOf(ctx, &rbacv1.RoleBinding{}, client.InNamespace(managed), dry))
 	})
 
@@ -821,4 +872,207 @@ func TestOperatorVaultAccessUnderRBACAndPolicy(t *testing.T) {
 	if !slices.Equal(purged, []string{managed, managed}) {
 		t.Errorf("purged = %v", purged)
 	}
+}
+
+// TestSpinnakerDeployerBinding runs the real reconciler as the operator
+// ServiceAccount: the binding is absent while the flag is off, created with the
+// exact roleRef and subject when on, repaired on subject and roleRef drift, and
+// removed again when the flag goes off.
+func TestSpinnakerDeployerBinding(t *testing.T) {
+	op := operatorClient(t)
+	name := "team-spinnaker"
+	if err := k8s.Create(ctx, newTN(name)); err != nil {
+		t.Fatal(err)
+	}
+	key := types.NamespacedName{Namespace: name, Name: SpinnakerDeployerBindingName}
+	absent := func(what string) {
+		t.Helper()
+		if err := k8s.Get(ctx, key, &rbacv1.RoleBinding{}); !apierrors.IsNotFound(err) {
+			t.Errorf("%s: spinnaker-deployer binding present or error: %v", what, err)
+		}
+	}
+
+	reconcileOnceWith(t, op, name, false)
+	absent("flag off")
+
+	reconcileOnceWith(t, op, name, true)
+	rb := get(t, &rbacv1.RoleBinding{}, name, SpinnakerDeployerBindingName)
+	if rb.RoleRef != spinnakerRoleRef() || !equality.Semantic.DeepEqual(rb.Subjects, spinnakerSubjects()) {
+		t.Fatalf("binding = %+v / %+v", rb.RoleRef, rb.Subjects)
+	}
+	if !metav1.IsControlledBy(rb, getTN(t, name)) {
+		t.Errorf("binding is not controlled by the TeamNamespace: %+v", rb.OwnerReferences)
+	}
+	if get(t, &rbacv1.RoleBinding{}, name, AdminRoleBindingName).RoleRef.Name != AdminClusterRole {
+		t.Error("admin binding changed")
+	}
+	rv := rb.ResourceVersion
+	reconcileOnceWith(t, op, name, true)
+	if got := get(t, &rbacv1.RoleBinding{}, name, SpinnakerDeployerBindingName).ResourceVersion; got != rv {
+		t.Error("second reconcile rewrote the binding")
+	}
+
+	// Subject drift is corrected in place.
+	rb.Subjects = append(rb.Subjects, rbacv1.Subject{Kind: rbacv1.ServiceAccountKind, Name: "default", Namespace: name})
+	if err := k8s.Update(ctx, rb); err != nil {
+		t.Fatal(err)
+	}
+	reconcileOnceWith(t, op, name, true)
+	if rb := get(t, &rbacv1.RoleBinding{}, name, SpinnakerDeployerBindingName); !equality.Semantic.DeepEqual(rb.Subjects, spinnakerSubjects()) {
+		t.Errorf("subject drift not corrected: %+v", rb.Subjects)
+	}
+
+	// A binding of that name the TeamNamespace does not control is left alone
+	// (not repaired, deleted or overwritten), whatever its roleRef.
+	if err := k8s.Delete(ctx, &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: SpinnakerDeployerBindingName, Namespace: name}}); err != nil {
+		t.Fatal(err)
+	}
+	foreign := spinnakerRB(name)
+	foreign.RoleRef.Name = "cluster-admin"
+	if err := k8s.Create(ctx, foreign); err != nil {
+		t.Fatal(err)
+	}
+	reconcileOnceWith(t, op, name, true)
+	reconcileOnceWith(t, op, name, true)
+	if rb := get(t, &rbacv1.RoleBinding{}, name, SpinnakerDeployerBindingName); rb.RoleRef.Name != "cluster-admin" || len(rb.OwnerReferences) != 0 {
+		t.Errorf("uncontrolled binding was touched: %+v owners %+v", rb.RoleRef, rb.OwnerReferences)
+	}
+	assertSpinnakerConflict(t, name, true)
+	if err := k8s.Delete(ctx, foreign); err != nil {
+		t.Fatal(err)
+	}
+
+	reconcileOnceWith(t, op, name, true)
+	assertSpinnakerConflict(t, name, false)
+	if err := k8s.Delete(ctx, &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: SpinnakerDeployerBindingName, Namespace: name}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A controlled binding with a foreign roleRef (immutable) is deleted and recreated.
+	controlled := spinnakerRB(name)
+	controlled.RoleRef.Name = "cluster-admin"
+	if err := controllerutil.SetControllerReference(getTN(t, name), controlled, testScheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := k8s.Create(ctx, controlled); err != nil {
+		t.Fatal(err)
+	}
+	reconcileOnceWith(t, op, name, true)
+	reconcileOnceWith(t, op, name, true)
+	if rb := get(t, &rbacv1.RoleBinding{}, name, SpinnakerDeployerBindingName); rb.RoleRef != spinnakerRoleRef() {
+		t.Errorf("roleRef not repaired: %+v", rb.RoleRef)
+	}
+
+	// Flag off again: the controlled binding is removed.
+	reconcileOnceWith(t, op, name, false)
+	absent("flag turned off")
+	assertStatus(t, getTN(t, name), idpv1alpha1.PhaseReady, ReasonReconciled)
+
+	// A binding of that name the TeamNamespace does not control is left alone
+	// (no conflict is reported with the flag off).
+	if err := k8s.Create(ctx, spinnakerRB(name)); err != nil {
+		t.Fatal(err)
+	}
+	reconcileOnceWith(t, op, name, false)
+	assertSpinnakerConflict(t, name, false)
+	reconcileOnceWith(t, op, name, true)
+	assertSpinnakerConflict(t, name, true)
+	reconcileOnceWith(t, op, name, false)
+	assertSpinnakerConflict(t, name, false)
+	get(t, &rbacv1.RoleBinding{}, name, SpinnakerDeployerBindingName)
+}
+
+// TestTenantServicesPolicy: in operator-managed namespaces any user may create
+// only plain ClusterIP Services (the workload HTTPRoute forwards to the Service
+// named like the workload); other namespaces are untouched.
+func TestTenantServicesPolicy(t *testing.T) {
+	_ = operatorClient(t)
+	managed, plain := "team-svc-guard", "plain-svc-ns"
+	if err := k8s.Create(ctx, newTN(managed)); err != nil {
+		t.Fatal(err)
+	}
+	reconcileOnce(t, k8s, managed)
+	ensurePlainNamespace(t, plain)
+	dry := client.DryRunAll
+	svc := func(ns string, mut func(*corev1.Service)) *corev1.Service {
+		s := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: ns},
+			Spec: corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: 80}}}}
+		if mut != nil {
+			mut(s)
+		}
+		return s
+	}
+	denied := func(err error) bool {
+		return apierrors.IsForbidden(err) && strings.Contains(err.Error(), "idp-tenant-services")
+	}
+	eventually(t, "tenant services policy active", func() error {
+		if err := k8s.Create(ctx, svc(managed, func(s *corev1.Service) { s.Spec.Type = corev1.ServiceTypeLoadBalancer }), dry); !denied(err) {
+			return fmt.Errorf("probe: %v", err)
+		}
+		return nil
+	})
+	for what, mut := range map[string]func(*corev1.Service){
+		"ExternalName": func(s *corev1.Service) {
+			s.Spec.Type, s.Spec.ExternalName, s.Spec.Ports = corev1.ServiceTypeExternalName, "keycloak.keycloak.svc.cluster.local", nil
+		},
+		"LoadBalancer": func(s *corev1.Service) { s.Spec.Type = corev1.ServiceTypeLoadBalancer },
+		"NodePort":     func(s *corev1.Service) { s.Spec.Type = corev1.ServiceTypeNodePort },
+		"externalIPs":  func(s *corev1.Service) { s.Spec.ExternalIPs = []string{"10.1.2.3"} },
+		"ClusterIP+extIP": func(s *corev1.Service) {
+			s.Spec.Type, s.Spec.ExternalIPs = corev1.ServiceTypeClusterIP, []string{"10.1.2.3"}
+		},
+	} {
+		if err := k8s.Create(ctx, svc(managed, mut), dry); !denied(err) {
+			t.Errorf("create %s in managed ns: want denial, got %v", what, err)
+		}
+	}
+	for what, mut := range map[string]func(*corev1.Service){
+		"no type":   nil,
+		"ClusterIP": func(s *corev1.Service) { s.Spec.Type = corev1.ServiceTypeClusterIP },
+		"headless":  func(s *corev1.Service) { s.Spec.ClusterIP = corev1.ClusterIPNone },
+	} {
+		if err := k8s.Create(ctx, svc(managed, mut), dry); err != nil {
+			t.Errorf("create %s in managed ns: %v", what, err)
+		}
+	}
+	// UPDATE: a stored ClusterIP Service cannot be turned into an ExternalName/LoadBalancer.
+	if err := k8s.Create(ctx, svc(managed, nil)); err != nil {
+		t.Fatal(err)
+	}
+	cur := get(t, &corev1.Service{}, managed, "web")
+	cur.Spec.Type = corev1.ServiceTypeLoadBalancer
+	if err := k8s.Update(ctx, cur, dry); !denied(err) {
+		t.Errorf("update to LoadBalancer: want denial, got %v", err)
+	}
+	cur = get(t, &corev1.Service{}, managed, "web")
+	cur.Spec.ExternalIPs = []string{"10.1.2.3"}
+	if err := k8s.Update(ctx, cur, dry); !denied(err) {
+		t.Errorf("update with externalIPs: want denial, got %v", err)
+	}
+	// Unmanaged namespaces: any type.
+	for _, typ := range []corev1.ServiceType{corev1.ServiceTypeLoadBalancer, corev1.ServiceTypeNodePort} {
+		if err := k8s.Create(ctx, svc(plain, func(s *corev1.Service) { s.Spec.Type = typ }), dry); err != nil {
+			t.Errorf("create %s in unmanaged ns: %v", typ, err)
+		}
+	}
+	if err := k8s.Create(ctx, svc(plain, func(s *corev1.Service) {
+		s.Spec.Type, s.Spec.ExternalName, s.Spec.Ports = corev1.ServiceTypeExternalName, "example.com", nil
+	}), dry); err != nil {
+		t.Errorf("create ExternalName in unmanaged ns: %v", err)
+	}
+}
+
+// assertSpinnakerConflict checks the SpinnakerDeployerConflict condition, and
+// that the TeamNamespace stays Ready either way.
+func assertSpinnakerConflict(t *testing.T, name string, want bool) {
+	t.Helper()
+	tn := getTN(t, name)
+	c := meta.FindStatusCondition(tn.Status.Conditions, ConditionSpinnakerDeployerConflict)
+	if want && (c == nil || c.Status != metav1.ConditionTrue || c.Reason != ReasonNameConflict) {
+		t.Errorf("want SpinnakerDeployerConflict=True/NameConflict, got %+v", c)
+	}
+	if !want && c != nil {
+		t.Errorf("want no SpinnakerDeployerConflict condition, got %+v", c)
+	}
+	assertStatus(t, tn, idpv1alpha1.PhaseReady, ReasonReconciled)
 }

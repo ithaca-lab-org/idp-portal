@@ -98,7 +98,12 @@ func newTN(name string) *idpv1alpha1.TeamNamespace {
 
 func reconcileOnce(t *testing.T, c client.Client, name string) ctrl.Result {
 	t.Helper()
-	r := &TeamNamespaceReconciler{Client: c, Scheme: testScheme}
+	return reconcileOnceWith(t, c, name, false)
+}
+
+func reconcileOnceWith(t *testing.T, c client.Client, name string, spinnaker bool) ctrl.Result {
+	t.Helper()
+	r := &TeamNamespaceReconciler{Client: c, Scheme: testScheme, SpinnakerDeployer: spinnaker}
 	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: name}})
 	if err != nil {
 		t.Fatalf("reconcile %s: %v", name, err)

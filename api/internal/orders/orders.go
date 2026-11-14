@@ -57,7 +57,7 @@ var (
 	dnsLabel = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
 	emailRe  = regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9-]+([.][a-zA-Z0-9-]+)+$`)
 	// ReservedNames and ReservedPrefixes must match operator/internal/controller/resources.go.
-	ReservedNames    = []string{"default", "argocd", "cert-manager", "tailscale", "identity", "idp-system", "echo", "vault"}
+	ReservedNames    = []string{"default", "argocd", "cert-manager", "tailscale", "identity", "idp-system", "echo", "vault", "spinnaker", "keycloak"}
 	ReservedPrefixes = []string{"kube-", "istio-", "gke-", "vault-"}
 	// apiOnlyPrefixes are refused here only: the idp-infra proof script (an admin) creates
 	// vproof-a/b as TeamNamespaces directly, so the operator must accept them, while tenants
