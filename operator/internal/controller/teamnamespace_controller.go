@@ -41,12 +41,17 @@ type TeamNamespaceReconciler struct {
 	// Gateway is the ingress Gateway admitted by idp-allow-ingress-gateway
 	// (zero value: istio-ingress/ingress).
 	Gateway GatewayOptions
+	// SpinnakerDeployer (SPINNAKER_DEPLOYER_ENABLED) adds the RoleBinding
+	// spinnaker-deployer. When false, a leftover one is removed.
+	SpinnakerDeployer bool
 }
 
 // The child objects live in namespaces created at runtime, so their rules must be
 // cluster-wide; update/delete are pinned to the deterministic child names.
 // The operator gets "bind" on the admin ClusterRole only (no "escalate"), which is
-// what the API server requires to create RoleBindings that reference it.
+// what the API server requires to create RoleBindings that reference it. For the
+// Spinnaker deployer binding it also gets "bind" on ClusterRole
+// idp-spinnaker-deployer only (never "escalate", never a Role of its own).
 //
 // +kubebuilder:rbac:groups=idp.ithaca-idp.com,resources=teamnamespaces,verbs=get;list;watch;update
 // +kubebuilder:rbac:groups=idp.ithaca-idp.com,resources=teamnamespaces/status,verbs=get;update
@@ -58,8 +63,8 @@ type TeamNamespaceReconciler struct {
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=update,resourceNames=idp-default-deny-ingress;idp-allow-same-namespace;idp-allow-ingress-gateway
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=get;list;watch;create
-// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=update;delete,resourceNames=idp-namespace-admin
-// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,verbs=bind,resourceNames=admin
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=update;delete,resourceNames=idp-namespace-admin;spinnaker-deployer
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,verbs=bind,resourceNames=admin;idp-spinnaker-deployer
 // +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=update;delete,resourceNames=vault-reader
 // +kubebuilder:rbac:groups=secrets.hashicorp.com,resources=vaultauths,verbs=get;list;watch;create
@@ -178,7 +183,36 @@ func (r *TeamNamespaceReconciler) converge(ctx context.Context, tn *idpv1alpha1.
 		}
 	}
 
-	return r.ensureRoleBinding(ctx, tn)
+	requeue, err := r.ensureRoleBinding(ctx, tn, AdminRoleBindingName, desiredRoleRef(), desiredSubjects(tn))
+	if err != nil || requeue {
+		return requeue, err
+	}
+	if !r.SpinnakerDeployer {
+		return false, r.removeSpinnakerBinding(ctx, tn)
+	}
+	return r.ensureRoleBinding(ctx, tn, SpinnakerDeployerBindingName, spinnakerRoleRef(), spinnakerSubjects())
+}
+
+// removeSpinnakerBinding deletes a spinnaker-deployer binding that this
+// TeamNamespace controls (flag turned off: the grant is revoked, not left
+// behind). One it does not control is left alone.
+func (r *TeamNamespaceReconciler) removeSpinnakerBinding(ctx context.Context, tn *idpv1alpha1.TeamNamespace) error {
+	rb := &rbacv1.RoleBinding{}
+	err := r.Get(ctx, types.NamespacedName{Name: SpinnakerDeployerBindingName, Namespace: tn.Name}, rb)
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("rolebinding %s: %w", SpinnakerDeployerBindingName, err)
+	}
+	if !metav1.IsControlledBy(rb, tn) {
+		return nil
+	}
+	uid := rb.UID
+	if err := r.Delete(ctx, rb, client.Preconditions{UID: &uid}); client.IgnoreNotFound(err) != nil {
+		return fmt.Errorf("rolebinding %s: %w", SpinnakerDeployerBindingName, err)
+	}
+	return nil
 }
 
 func (r *TeamNamespaceReconciler) ensureNamespace(ctx context.Context, tn *idpv1alpha1.TeamNamespace, ns *corev1.Namespace) error {
@@ -229,29 +263,30 @@ func (r *TeamNamespaceReconciler) ensureChild(ctx context.Context, tn *idpv1alph
 
 // ensureRoleBinding reports true when it had to delete a binding whose immutable
 // roleRef drifted; the replacement is created on the next pass.
-func (r *TeamNamespaceReconciler) ensureRoleBinding(ctx context.Context, tn *idpv1alpha1.TeamNamespace) (bool, error) {
+func (r *TeamNamespaceReconciler) ensureRoleBinding(ctx context.Context, tn *idpv1alpha1.TeamNamespace,
+	name string, roleRef rbacv1.RoleRef, subjects []rbacv1.Subject) (bool, error) {
 	rb := &rbacv1.RoleBinding{}
-	err := r.Get(ctx, types.NamespacedName{Name: AdminRoleBindingName, Namespace: tn.Name}, rb)
+	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: tn.Name}, rb)
 	switch {
-	case err == nil && rb.RoleRef != desiredRoleRef():
+	case err == nil && rb.RoleRef != roleRef:
 		uid := rb.UID
 		if err := r.Delete(ctx, rb, client.Preconditions{UID: &uid}); client.IgnoreNotFound(err) != nil {
-			return false, fmt.Errorf("rolebinding: %w", err)
+			return false, fmt.Errorf("rolebinding %s: %w", name, err)
 		}
 		return true, nil
 	case err != nil && !apierrors.IsNotFound(err):
-		return false, fmt.Errorf("rolebinding: %w", err)
+		return false, fmt.Errorf("rolebinding %s: %w", name, err)
 	}
 
-	rb = &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: AdminRoleBindingName, Namespace: tn.Name}}
+	rb = &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: tn.Name}}
 	err = r.ensureChild(ctx, tn, rb, func() {
-		rb.RoleRef = desiredRoleRef()
-		if want := desiredSubjects(tn); !equality.Semantic.DeepEqual(rb.Subjects, want) {
-			rb.Subjects = want
+		rb.RoleRef = roleRef
+		if !equality.Semantic.DeepEqual(rb.Subjects, subjects) {
+			rb.Subjects = subjects
 		}
 	})
 	if err != nil {
-		return false, fmt.Errorf("rolebinding: %w", err)
+		return false, fmt.Errorf("rolebinding %s: %w", name, err)
 	}
 	return false, nil
 }

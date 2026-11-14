@@ -43,6 +43,7 @@ func main() {
 		gwOpts        controller.GatewayOptions
 		tcOpts        controller.TenantCertOptions
 		tcEnabled     bool
+		sdEnabled     bool
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8443", "Metrics endpoint address; \"0\" disables it.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "Health and readiness probe address.")
@@ -67,6 +68,13 @@ func main() {
 		"Namespace of the Certificate whose dnsNames are managed (env TENANT_CERT_NAMESPACE).")
 	flag.StringVar(&tcOpts.Name, "tenant-cert-name", envOr("TENANT_CERT_NAME", controller.DefaultTenantCertName),
 		"Name of the Certificate whose dnsNames are managed (env TENANT_CERT_NAME).")
+	sdEnabledDefault, err := strconv.ParseBool(envOr("SPINNAKER_DEPLOYER_ENABLED", "false"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "invalid SPINNAKER_DEPLOYER_ENABLED:", err)
+		os.Exit(1)
+	}
+	flag.BoolVar(&sdEnabled, "spinnaker-deployer-enabled", sdEnabledDefault,
+		"Create RoleBinding spinnaker-deployer (ClusterRole idp-spinnaker-deployer for ServiceAccount spinnaker/clouddriver) in each tenant namespace (env SPINNAKER_DEPLOYER_ENABLED).")
 	zapOpts := zap.Options{Development: false}
 	zapOpts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -163,6 +171,8 @@ func main() {
 		Scheme:  mgr.GetScheme(),
 		Vault:   vaultOpts,
 		Gateway: gwOpts,
+
+		SpinnakerDeployer: sdEnabled,
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to set up controller", "controller", "TeamNamespace")
 		os.Exit(1)

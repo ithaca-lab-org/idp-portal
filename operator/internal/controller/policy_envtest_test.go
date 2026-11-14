@@ -18,6 +18,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -184,6 +185,14 @@ func adminRB(ns string) *rbacv1.RoleBinding {
 		ObjectMeta: metav1.ObjectMeta{Name: AdminRoleBindingName, Namespace: ns},
 		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: AdminClusterRole},
 		Subjects:   []rbacv1.Subject{{APIGroup: rbacv1.GroupName, Kind: rbacv1.UserKind, Name: "attacker@example.com"}},
+	}
+}
+
+func spinnakerRB(ns string) *rbacv1.RoleBinding {
+	return &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: SpinnakerDeployerBindingName, Namespace: ns},
+		RoleRef:    spinnakerRoleRef(),
+		Subjects:   spinnakerSubjects(),
 	}
 }
 
@@ -388,6 +397,42 @@ func TestPolicyDeniesOperatorOutsideManagedNamespaces(t *testing.T) {
 		other := adminRB(managed)
 		other.Name = "second-admin"
 		wantPolicyDenial(t, "admin RB with a foreign name", op.Create(ctx, other, dry))
+		// The Spinnaker deployer binding: exactly one roleRef and subject.
+		if err := op.Create(ctx, spinnakerRB(managed), dry); err != nil {
+			t.Errorf("exact spinnaker-deployer binding: %v", err)
+		}
+		wantPolicyDenial(t, "spinnaker RB in kube-system", op.Create(ctx, spinnakerRB("kube-system"), dry))
+		wantPolicyDenial(t, "spinnaker RB in unlabelled ns", op.Create(ctx, spinnakerRB(plain), dry))
+		for what, mut := range map[string]func(*rbacv1.RoleBinding){
+			"roleRef admin":        func(b *rbacv1.RoleBinding) { b.RoleRef.Name = AdminClusterRole },
+			"roleRef Role kind":    func(b *rbacv1.RoleBinding) { b.RoleRef.Kind = "Role" },
+			"other serviceaccount": func(b *rbacv1.RoleBinding) { b.Subjects[0].Name = "orca" },
+			"other sa namespace":   func(b *rbacv1.RoleBinding) { b.Subjects[0].Namespace = managed },
+			"user subject": func(b *rbacv1.RoleBinding) {
+				b.Subjects = []rbacv1.Subject{{APIGroup: rbacv1.GroupName, Kind: rbacv1.UserKind, Name: "a@example.com"}}
+			},
+			"group subject": func(b *rbacv1.RoleBinding) {
+				b.Subjects = []rbacv1.Subject{{APIGroup: rbacv1.GroupName, Kind: rbacv1.GroupKind, Name: "system:authenticated"}}
+			},
+			"extra subject": func(b *rbacv1.RoleBinding) {
+				b.Subjects = append(b.Subjects, rbacv1.Subject{Kind: rbacv1.ServiceAccountKind, Name: "default", Namespace: managed})
+			},
+			"no subjects": func(b *rbacv1.RoleBinding) { b.Subjects = nil },
+		} {
+			b := spinnakerRB(managed)
+			mut(b)
+			if what == "roleRef Role kind" {
+				if err := op.Create(ctx, b, dry); err == nil {
+					t.Errorf("spinnaker RB with %s: created", what)
+				}
+				continue
+			}
+			wantPolicyDenial(t, "spinnaker RB with "+what, op.Create(ctx, b, dry))
+		}
+		// The admin name cannot carry the Spinnaker grant, nor the reverse.
+		swap := adminRB(managed)
+		swap.RoleRef.Name, swap.Subjects = SpinnakerDeployerClusterRole, spinnakerSubjects()
+		wantPolicyDenial(t, "idp-namespace-admin to the deployer role", op.Create(ctx, swap, dry))
 		wantForbidden(t, "deletecollection rolebindings", op.DeleteAllOf(ctx, &rbacv1.RoleBinding{}, client.InNamespace(managed), dry))
 	})
 
@@ -821,4 +866,80 @@ func TestOperatorVaultAccessUnderRBACAndPolicy(t *testing.T) {
 	if !slices.Equal(purged, []string{managed, managed}) {
 		t.Errorf("purged = %v", purged)
 	}
+}
+
+// TestSpinnakerDeployerBinding runs the real reconciler as the operator
+// ServiceAccount: the binding is absent while the flag is off, created with the
+// exact roleRef and subject when on, repaired on subject and roleRef drift, and
+// removed again when the flag goes off.
+func TestSpinnakerDeployerBinding(t *testing.T) {
+	op := operatorClient(t)
+	name := "team-spinnaker"
+	if err := k8s.Create(ctx, newTN(name)); err != nil {
+		t.Fatal(err)
+	}
+	key := types.NamespacedName{Namespace: name, Name: SpinnakerDeployerBindingName}
+	absent := func(what string) {
+		t.Helper()
+		if err := k8s.Get(ctx, key, &rbacv1.RoleBinding{}); !apierrors.IsNotFound(err) {
+			t.Errorf("%s: spinnaker-deployer binding present or error: %v", what, err)
+		}
+	}
+
+	reconcileOnceWith(t, op, name, false)
+	absent("flag off")
+
+	reconcileOnceWith(t, op, name, true)
+	rb := get(t, &rbacv1.RoleBinding{}, name, SpinnakerDeployerBindingName)
+	if rb.RoleRef != spinnakerRoleRef() || !equality.Semantic.DeepEqual(rb.Subjects, spinnakerSubjects()) {
+		t.Fatalf("binding = %+v / %+v", rb.RoleRef, rb.Subjects)
+	}
+	if !metav1.IsControlledBy(rb, getTN(t, name)) {
+		t.Errorf("binding is not controlled by the TeamNamespace: %+v", rb.OwnerReferences)
+	}
+	if get(t, &rbacv1.RoleBinding{}, name, AdminRoleBindingName).RoleRef.Name != AdminClusterRole {
+		t.Error("admin binding changed")
+	}
+	rv := rb.ResourceVersion
+	reconcileOnceWith(t, op, name, true)
+	if got := get(t, &rbacv1.RoleBinding{}, name, SpinnakerDeployerBindingName).ResourceVersion; got != rv {
+		t.Error("second reconcile rewrote the binding")
+	}
+
+	// Subject drift is corrected in place.
+	rb.Subjects = append(rb.Subjects, rbacv1.Subject{Kind: rbacv1.ServiceAccountKind, Name: "default", Namespace: name})
+	if err := k8s.Update(ctx, rb); err != nil {
+		t.Fatal(err)
+	}
+	reconcileOnceWith(t, op, name, true)
+	if rb := get(t, &rbacv1.RoleBinding{}, name, SpinnakerDeployerBindingName); !equality.Semantic.DeepEqual(rb.Subjects, spinnakerSubjects()) {
+		t.Errorf("subject drift not corrected: %+v", rb.Subjects)
+	}
+
+	// roleRef is immutable: a foreign binding is deleted and recreated.
+	if err := k8s.Delete(ctx, &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: SpinnakerDeployerBindingName, Namespace: name}}); err != nil {
+		t.Fatal(err)
+	}
+	foreign := spinnakerRB(name)
+	foreign.RoleRef.Name = "cluster-admin"
+	if err := k8s.Create(ctx, foreign); err != nil {
+		t.Fatal(err)
+	}
+	reconcileOnceWith(t, op, name, true)
+	reconcileOnceWith(t, op, name, true)
+	if rb := get(t, &rbacv1.RoleBinding{}, name, SpinnakerDeployerBindingName); rb.RoleRef != spinnakerRoleRef() {
+		t.Errorf("roleRef not repaired: %+v", rb.RoleRef)
+	}
+
+	// Flag off again: the controlled binding is removed.
+	reconcileOnceWith(t, op, name, false)
+	absent("flag turned off")
+	assertStatus(t, getTN(t, name), idpv1alpha1.PhaseReady, ReasonReconciled)
+
+	// A binding of that name the TeamNamespace does not control is left alone.
+	if err := k8s.Create(ctx, spinnakerRB(name)); err != nil {
+		t.Fatal(err)
+	}
+	reconcileOnceWith(t, op, name, false)
+	get(t, &rbacv1.RoleBinding{}, name, SpinnakerDeployerBindingName)
 }

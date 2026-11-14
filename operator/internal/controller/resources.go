@@ -39,6 +39,14 @@ const (
 	GatewayPolicyName    = "idp-allow-ingress-gateway"
 	AdminRoleBindingName = "idp-namespace-admin"
 	AdminClusterRole     = "admin"
+
+	// SpinnakerDeployerBindingName is the RoleBinding (SPINNAKER_DEPLOYER_ENABLED)
+	// that gives Spinnaker's Clouddriver deploy rights in a tenant namespace
+	// through the ClusterRole idp-spinnaker-deployer (shipped by idp-gitops).
+	SpinnakerDeployerBindingName = "spinnaker-deployer"
+	SpinnakerDeployerClusterRole = "idp-spinnaker-deployer"
+	SpinnakerNamespace           = "spinnaker"
+	SpinnakerServiceAccount      = "clouddriver"
 )
 
 var reservedNames = map[string]bool{
@@ -246,4 +254,12 @@ func desiredRoleRef() rbacv1.RoleRef {
 
 func desiredSubjects(tn *idpv1alpha1.TeamNamespace) []rbacv1.Subject {
 	return []rbacv1.Subject{{APIGroup: rbacv1.GroupName, Kind: rbacv1.UserKind, Name: tn.Spec.Owner}}
+}
+
+func spinnakerRoleRef() rbacv1.RoleRef {
+	return rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: SpinnakerDeployerClusterRole}
+}
+
+func spinnakerSubjects() []rbacv1.Subject {
+	return []rbacv1.Subject{{Kind: rbacv1.ServiceAccountKind, Name: SpinnakerServiceAccount, Namespace: SpinnakerNamespace}}
 }
