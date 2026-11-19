@@ -140,7 +140,7 @@ spec:
         request.name in {
           'resourcequotas': ['idp-quota'],
           'limitranges': ['idp-limits'],
-          'networkpolicies': ['idp-default-deny-ingress', 'idp-allow-same-namespace', 'idp-allow-ingress-gateway'],
+          'networkpolicies': ['idp-default-deny-ingress', 'idp-allow-same-namespace', 'idp-allow-ingress-gateway', 'idp-allow-kubelet-probes'],
           'rolebindings': ['idp-namespace-admin', 'spinnaker-deployer'],
           'serviceaccounts': ['vault-reader'],
           'vaultauths': ['vault-reader']
@@ -392,6 +392,26 @@ spec:
              f.podSelector.?matchLabels.orValue({}) == {'gateway.networking.k8s.io/gateway-name': 'ingress'})))
       reason: Forbidden
       message: "idp-operator may write idp-allow-ingress-gateway only as: all pods, Ingress, one peer admitting pods labelled gateway.networking.k8s.io/gateway-name=ingress in namespace istio-ingress, only TCP 15008"
+    # idp-allow-kubelet-probes is exactly desiredKubeletProbesSpec: all pods,
+    # Ingress, no egress, one rule with no ports (probe ports are arbitrary) and
+    # ONE peer that is the ipBlock 169.254.7.127/32 with no except: the address
+    # kubelet probes are source-NATed to in an Istio ambient namespace
+    # (HOST_PROBE_SNAT_IP default of the Istio CNI). Any other CIDR (a /24 or
+    # /0 would admit more than the host), an except list, ports, a selector peer
+    # or a second rule or peer is denied. The literal is
+    # KubeletProbeSNATAddress in internal/controller/resources.go; change both
+    # together.
+    - expression: >-
+        request.resource.resource != 'networkpolicies' || request.operation == 'DELETE' ||
+        request.name != 'idp-allow-kubelet-probes' ||
+        (has(object.spec) && size(object.spec.?podSelector.orValue({})) == 0 &&
+         object.spec.?policyTypes.orValue([]) == ['Ingress'] && !has(object.spec.egress) &&
+         has(object.spec.ingress) && size(object.spec.ingress) == 1 &&
+         object.spec.ingress.all(r, size(r.?ports.orValue([])) == 0 && has(r.from) && size(r.from) == 1 &&
+           r.from.all(f, has(f.ipBlock) && !has(f.namespaceSelector) && !has(f.podSelector) &&
+             f.ipBlock.?cidr.orValue('') == '169.254.7.127/32' && size(f.ipBlock.?except.orValue([])) == 0)))
+      reason: Forbidden
+      message: "idp-operator may write idp-allow-kubelet-probes only as: all pods, Ingress, one rule with no ports and one peer, the ipBlock 169.254.7.127/32 without except"
     # idp-default-deny-ingress is exactly desiredDenyIngressSpec: all pods,
     # Ingress, no ingress rule at all and no egress. Any rule would open ingress
     # and break tenant isolation.

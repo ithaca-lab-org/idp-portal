@@ -593,7 +593,37 @@ func TestPolicyDeniesOperatorOutsideManagedNamespaces(t *testing.T) {
 					Ports: []networkingv1.NetworkPolicyPort{{Port: &p}}}}
 			},
 		}
+		cidr := func(c string, except ...string) func(*networkingv1.NetworkPolicySpec) {
+			return func(s *networkingv1.NetworkPolicySpec) {
+				s.Ingress[0].From = []networkingv1.NetworkPolicyPeer{{IPBlock: &networkingv1.IPBlock{CIDR: c, Except: except}}}
+			}
+		}
 		pins := []pin{
+			{KubeletProbePolicyName, desiredKubeletProbesSpec, map[string]func(*networkingv1.NetworkPolicySpec){
+				"other host":      cidr("169.254.7.128/32"),
+				"/24":             cidr("169.254.7.0/24"),
+				"/16":             cidr("169.254.0.0/16"),
+				"/0":              cidr("0.0.0.0/0"),
+				"node CIDR host":  cidr("10.0.0.1/32"),
+				"except":          cidr("169.254.7.0/24", "169.254.7.1/32"),
+				"no ingress rule": func(s *networkingv1.NetworkPolicySpec) { s.Ingress = nil },
+				"port 8080": func(s *networkingv1.NetworkPolicySpec) {
+					p := intstr.FromInt32(8080)
+					s.Ingress[0].Ports = []networkingv1.NetworkPolicyPort{{Port: &p}}
+				},
+				"extra peer": func(s *networkingv1.NetworkPolicySpec) {
+					s.Ingress[0].From = append(s.Ingress[0].From, networkingv1.NetworkPolicyPeer{PodSelector: sel("a", "b")})
+				},
+				"second ipBlock peer": func(s *networkingv1.NetworkPolicySpec) {
+					s.Ingress[0].From = append(s.Ingress[0].From, networkingv1.NetworkPolicyPeer{IPBlock: &networkingv1.IPBlock{CIDR: "10.0.0.1/32"}})
+				},
+				"selector peer instead": func(s *networkingv1.NetworkPolicySpec) {
+					s.Ingress[0].From = []networkingv1.NetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{}}}
+				},
+				"second rule": func(s *networkingv1.NetworkPolicySpec) {
+					s.Ingress = append(s.Ingress, desiredKubeletProbesSpec().Ingress[0])
+				},
+			}},
 			{DenyIngressPolicyName, desiredDenyIngressSpec, map[string]func(*networkingv1.NetworkPolicySpec){
 				"same-namespace rule": func(s *networkingv1.NetworkPolicySpec) {
 					*s = desiredSameNamespaceSpec()
@@ -662,13 +692,15 @@ func TestPolicyDeniesOperatorOutsideManagedNamespaces(t *testing.T) {
 
 	t.Run("managed networkpolicy metadata", func(t *testing.T) {
 		const metaRule = "NetworkPolicy metadata"
-		for _, name := range []string{DenyIngressPolicyName, SameNamespacePolicy, GatewayPolicyName} {
+		for _, name := range []string{DenyIngressPolicyName, SameNamespacePolicy, GatewayPolicyName, KubeletProbePolicyName} {
 			spec := desiredDenyIngressSpec()
 			switch name {
 			case SameNamespacePolicy:
 				spec = desiredSameNamespaceSpec()
 			case GatewayPolicyName:
 				spec = desiredAllowIngressGatewaySpec(GatewayOptions{})
+			case KubeletProbePolicyName:
+				spec = desiredKubeletProbesSpec()
 			}
 			for what, mut := range map[string]func(*metav1.ObjectMeta){
 				"no labels":        func(m *metav1.ObjectMeta) { m.Labels = nil },

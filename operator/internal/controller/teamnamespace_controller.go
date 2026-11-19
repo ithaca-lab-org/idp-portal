@@ -67,7 +67,7 @@ type TeamNamespaceReconciler struct {
 // +kubebuilder:rbac:groups="",resources=resourcequotas,verbs=update,resourceNames=idp-quota
 // +kubebuilder:rbac:groups="",resources=limitranges,verbs=update,resourceNames=idp-limits
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create
-// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=update,resourceNames=idp-default-deny-ingress;idp-allow-same-namespace;idp-allow-ingress-gateway
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=update,resourceNames=idp-default-deny-ingress;idp-allow-same-namespace;idp-allow-ingress-gateway;idp-allow-kubelet-probes
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=update;delete,resourceNames=idp-namespace-admin;spinnaker-deployer
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,verbs=bind,resourceNames=admin;idp-spinnaker-deployer
@@ -195,9 +195,10 @@ func (r *TeamNamespaceReconciler) converge(ctx context.Context, tn *idpv1alpha1.
 	}
 
 	for name, want := range map[string]networkingv1.NetworkPolicySpec{
-		DenyIngressPolicyName: desiredDenyIngressSpec(),
-		SameNamespacePolicy:   desiredSameNamespaceSpec(),
-		GatewayPolicyName:     desiredAllowIngressGatewaySpec(r.Gateway),
+		DenyIngressPolicyName:  desiredDenyIngressSpec(),
+		SameNamespacePolicy:    desiredSameNamespaceSpec(),
+		GatewayPolicyName:      desiredAllowIngressGatewaySpec(r.Gateway),
+		KubeletProbePolicyName: desiredKubeletProbesSpec(),
 	} {
 		np := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: tn.Name}}
 		if err := r.ensureChild(ctx, tn, np, func() {

@@ -36,9 +36,20 @@ const (
 	DenyIngressPolicyName = "idp-default-deny-ingress"
 	SameNamespacePolicy   = "idp-allow-same-namespace"
 	// GatewayPolicyName admits the ingress Gateway pods (see GatewayOptions).
-	GatewayPolicyName    = "idp-allow-ingress-gateway"
-	AdminRoleBindingName = "idp-namespace-admin"
-	AdminClusterRole     = "admin"
+	GatewayPolicyName = "idp-allow-ingress-gateway"
+	// KubeletProbePolicyName admits kubelet health probes in the ambient mesh.
+	KubeletProbePolicyName = "idp-allow-kubelet-probes"
+	// KubeletProbeSNATAddress is the address kubelet probes arrive from in an
+	// Istio ambient namespace: the Istio CNI source-NATs host probe traffic to
+	// the link-local HOST_PROBE_SNAT_IP (default 169.254.7.127, see
+	// cni/README.md in istio/istio) so ztunnel lets it through. Without an
+	// ingress rule for it the deny-by-default policies time out every
+	// liveness/readiness probe. The admission policy
+	// (config/policy/operator-scope.yaml) pins this literal; change both
+	// together.
+	KubeletProbeSNATAddress = "169.254.7.127"
+	AdminRoleBindingName    = "idp-namespace-admin"
+	AdminClusterRole        = "admin"
 
 	// SpinnakerDeployerBindingName is the RoleBinding (SPINNAKER_DEPLOYER_ENABLED)
 	// that gives Spinnaker's Clouddriver deploy rights in a tenant namespace
@@ -182,6 +193,20 @@ func desiredSameNamespaceSpec() networkingv1.NetworkPolicySpec {
 		PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
 		Ingress: []networkingv1.NetworkPolicyIngressRule{{
 			From: []networkingv1.NetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{}}},
+		}},
+	}
+}
+
+// desiredKubeletProbesSpec allows ingress from the ambient kubelet probe SNAT
+// address (KubeletProbeSNATAddress, a /32) to all pods on any port: probe ports
+// are whatever the tenant container declares, so there is no port restriction.
+// Only that single host address is admitted, no other source.
+func desiredKubeletProbesSpec() networkingv1.NetworkPolicySpec {
+	return networkingv1.NetworkPolicySpec{
+		PodSelector: metav1.LabelSelector{},
+		PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
+		Ingress: []networkingv1.NetworkPolicyIngressRule{{
+			From: []networkingv1.NetworkPolicyPeer{{IPBlock: &networkingv1.IPBlock{CIDR: KubeletProbeSNATAddress + "/32"}}},
 		}},
 	}
 }

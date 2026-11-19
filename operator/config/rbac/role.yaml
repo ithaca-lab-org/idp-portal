@@ -121,6 +121,7 @@ rules:
   - networking.k8s.io
   resourceNames:
   - idp-allow-ingress-gateway
+  - idp-allow-kubelet-probes
   - idp-allow-same-namespace
   - idp-default-deny-ingress
   resources:

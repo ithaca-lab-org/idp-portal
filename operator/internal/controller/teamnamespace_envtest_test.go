@@ -18,6 +18,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -125,6 +126,19 @@ func TestCreatesNamespaceAndGuardrails(t *testing.T) {
 		t.Errorf("gateway policy owner = %+v", ref)
 	}
 
+	kp := get(t, &networkingv1.NetworkPolicy{}, name, KubeletProbePolicyName)
+	if !equality.Semantic.DeepEqual(kp.Spec, desiredKubeletProbesSpec()) {
+		t.Errorf("kubelet probe policy = %+v", kp.Spec)
+	}
+	if len(kp.Spec.Ingress) != 1 || len(kp.Spec.Ingress[0].Ports) != 0 || len(kp.Spec.Ingress[0].From) != 1 ||
+		kp.Spec.Ingress[0].From[0].IPBlock == nil || kp.Spec.Ingress[0].From[0].IPBlock.CIDR != "169.254.7.127/32" ||
+		len(kp.Spec.Ingress[0].From[0].IPBlock.Except) != 0 {
+		t.Errorf("kubelet probe policy must admit exactly 169.254.7.127/32 on all ports: %+v", kp.Spec)
+	}
+	if ref := metav1.GetControllerOf(kp); ref == nil || ref.Kind != "TeamNamespace" || ref.Name != name {
+		t.Errorf("kubelet probe policy owner = %+v", ref)
+	}
+
 	rb := get(t, &rbacv1.RoleBinding{}, name, AdminRoleBindingName)
 	if rb.RoleRef != (rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: "admin"}) {
 		t.Errorf("roleRef = %+v", rb.RoleRef)
@@ -172,6 +186,7 @@ func resourceVersions(t *testing.T, name string) map[string]string {
 		"deny": &networkingv1.NetworkPolicy{},
 		"same": &networkingv1.NetworkPolicy{},
 		"gw":   &networkingv1.NetworkPolicy{},
+		"kp":   &networkingv1.NetworkPolicy{},
 		"rb":   &rbacv1.RoleBinding{},
 	}
 	keys := map[string]types.NamespacedName{
@@ -181,6 +196,7 @@ func resourceVersions(t *testing.T, name string) map[string]string {
 		"deny": {Namespace: name, Name: DenyIngressPolicyName},
 		"same": {Namespace: name, Name: SameNamespacePolicy},
 		"gw":   {Namespace: name, Name: GatewayPolicyName},
+		"kp":   {Namespace: name, Name: KubeletProbePolicyName},
 		"rb":   {Namespace: name, Name: AdminRoleBindingName},
 	}
 	out := map[string]string{}
@@ -297,6 +313,40 @@ func TestDriftIsCorrected(t *testing.T) {
 	}
 	if ns.Labels["team/extra"] != "kept" {
 		t.Error("foreign namespace labels should be preserved")
+	}
+}
+
+// A namespace from before the probe policy existed gets it on the next
+// reconcile, and a widened or emptied one is repaired.
+func TestKubeletProbePolicyIsAddedAndRepaired(t *testing.T) {
+	requireEnvtest(t)
+	name := "team-kp-drift"
+	createAndReconcile(t, newTN(name))
+
+	if err := k8s.Delete(ctx, &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: KubeletProbePolicyName, Namespace: name}}); err != nil {
+		t.Fatal(err)
+	}
+	reconcileOnce(t, k8s, name)
+	kp := get(t, &networkingv1.NetworkPolicy{}, name, KubeletProbePolicyName)
+	if !equality.Semantic.DeepEqual(kp.Spec, desiredKubeletProbesSpec()) {
+		t.Fatalf("not recreated: %+v", kp.Spec)
+	}
+
+	kp.Spec.Ingress[0].From[0].IPBlock.CIDR = "169.254.0.0/16"
+	p := intstr.FromInt32(8080)
+	kp.Spec.Ingress[0].Ports = []networkingv1.NetworkPolicyPort{{Port: &p}}
+	if err := k8s.Update(ctx, kp); err != nil {
+		t.Fatal(err)
+	}
+	reconcileOnce(t, k8s, name)
+	kp = get(t, &networkingv1.NetworkPolicy{}, name, KubeletProbePolicyName)
+	if !equality.Semantic.DeepEqual(kp.Spec, desiredKubeletProbesSpec()) {
+		t.Errorf("not repaired: %+v", kp.Spec)
+	}
+	rv := kp.ResourceVersion
+	reconcileOnce(t, k8s, name)
+	if get(t, &networkingv1.NetworkPolicy{}, name, KubeletProbePolicyName).ResourceVersion != rv {
+		t.Error("a second reconcile rewrote the policy")
 	}
 }
 
