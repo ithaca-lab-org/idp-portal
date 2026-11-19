@@ -28,6 +28,7 @@ import (
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/rest"
 	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
@@ -593,7 +594,56 @@ func TestPolicyDeniesOperatorOutsideManagedNamespaces(t *testing.T) {
 					Ports: []networkingv1.NetworkPolicyPort{{Port: &p}}}}
 			},
 		}
+		cidr := func(c string, except ...string) func(*networkingv1.NetworkPolicySpec) {
+			return func(s *networkingv1.NetworkPolicySpec) {
+				s.Ingress[0].From = []networkingv1.NetworkPolicyPeer{{IPBlock: &networkingv1.IPBlock{CIDR: c, Except: except}}}
+			}
+		}
 		pins := []pin{
+			{KubeletProbePolicyName, desiredKubeletProbesSpec, map[string]func(*networkingv1.NetworkPolicySpec){
+				"other host":     cidr("169.254.7.128/32"),
+				"/24":            cidr("169.254.7.0/24"),
+				"/16":            cidr("169.254.0.0/16"),
+				"/0":             cidr("0.0.0.0/0"),
+				"node CIDR host": cidr("10.0.0.1/32"),
+				// An except on the /32 is refused by the API server itself (it
+				// must be a strict subset), so only the CIDR check is reachable.
+				"no ingress rule":          func(s *networkingv1.NetworkPolicySpec) { s.Ingress = nil },
+				"no ports (all protocols)": func(s *networkingv1.NetworkPolicySpec) { s.Ingress[0].Ports = nil },
+				"port 8080": func(s *networkingv1.NetworkPolicySpec) {
+					p := intstr.FromInt32(8080)
+					s.Ingress[0].Ports = []networkingv1.NetworkPolicyPort{{Port: &p}}
+				},
+				"UDP": func(s *networkingv1.NetworkPolicySpec) {
+					s.Ingress[0].Ports = []networkingv1.NetworkPolicyPort{{Protocol: ptr.To(corev1.ProtocolUDP)}}
+				},
+				"SCTP": func(s *networkingv1.NetworkPolicySpec) {
+					s.Ingress[0].Ports = []networkingv1.NetworkPolicyPort{{Protocol: ptr.To(corev1.ProtocolSCTP)}}
+				},
+				"TCP with a port": func(s *networkingv1.NetworkPolicySpec) {
+					p := intstr.FromInt32(8080)
+					s.Ingress[0].Ports = []networkingv1.NetworkPolicyPort{{Protocol: ptr.To(corev1.ProtocolTCP), Port: &p}}
+				},
+				"TCP with a port range": func(s *networkingv1.NetworkPolicySpec) {
+					p, e := intstr.FromInt32(8000), int32(9000)
+					s.Ingress[0].Ports = []networkingv1.NetworkPolicyPort{{Protocol: ptr.To(corev1.ProtocolTCP), Port: &p, EndPort: &e}}
+				},
+				"two ports entries": func(s *networkingv1.NetworkPolicySpec) {
+					s.Ingress[0].Ports = append(s.Ingress[0].Ports, networkingv1.NetworkPolicyPort{Protocol: ptr.To(corev1.ProtocolUDP)})
+				},
+				"extra peer": func(s *networkingv1.NetworkPolicySpec) {
+					s.Ingress[0].From = append(s.Ingress[0].From, networkingv1.NetworkPolicyPeer{PodSelector: sel("a", "b")})
+				},
+				"second ipBlock peer": func(s *networkingv1.NetworkPolicySpec) {
+					s.Ingress[0].From = append(s.Ingress[0].From, networkingv1.NetworkPolicyPeer{IPBlock: &networkingv1.IPBlock{CIDR: "10.0.0.1/32"}})
+				},
+				"selector peer instead": func(s *networkingv1.NetworkPolicySpec) {
+					s.Ingress[0].From = []networkingv1.NetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{}}}
+				},
+				"second rule": func(s *networkingv1.NetworkPolicySpec) {
+					s.Ingress = append(s.Ingress, desiredKubeletProbesSpec().Ingress[0])
+				},
+			}},
 			{DenyIngressPolicyName, desiredDenyIngressSpec, map[string]func(*networkingv1.NetworkPolicySpec){
 				"same-namespace rule": func(s *networkingv1.NetworkPolicySpec) {
 					*s = desiredSameNamespaceSpec()
@@ -662,13 +712,15 @@ func TestPolicyDeniesOperatorOutsideManagedNamespaces(t *testing.T) {
 
 	t.Run("managed networkpolicy metadata", func(t *testing.T) {
 		const metaRule = "NetworkPolicy metadata"
-		for _, name := range []string{DenyIngressPolicyName, SameNamespacePolicy, GatewayPolicyName} {
+		for _, name := range []string{DenyIngressPolicyName, SameNamespacePolicy, GatewayPolicyName, KubeletProbePolicyName} {
 			spec := desiredDenyIngressSpec()
 			switch name {
 			case SameNamespacePolicy:
 				spec = desiredSameNamespaceSpec()
 			case GatewayPolicyName:
 				spec = desiredAllowIngressGatewaySpec(GatewayOptions{})
+			case KubeletProbePolicyName:
+				spec = desiredKubeletProbesSpec()
 			}
 			for what, mut := range map[string]func(*metav1.ObjectMeta){
 				"no labels":        func(m *metav1.ObjectMeta) { m.Labels = nil },
@@ -1075,4 +1127,39 @@ func assertSpinnakerConflict(t *testing.T, name string, want bool) {
 		t.Errorf("want no SpinnakerDeployerConflict condition, got %+v", c)
 	}
 	assertStatus(t, tn, idpv1alpha1.PhaseReady, ReasonReconciled)
+}
+
+// A tenant admin who pre-creates a NetworkPolicy of a managed name with extra
+// labels makes the operator's write to it fail (admission metadata rule); that
+// must not keep the admin RoleBinding from being reconciled (an ownership
+// transfer has to revoke the old owner).
+func TestBlockedNetworkPolicyDoesNotBlockRoleBindings(t *testing.T) {
+	op := operatorClient(t)
+	name := "team-np-wedge"
+	if err := k8s.Create(ctx, newTN(name)); err != nil {
+		t.Fatal(err)
+	}
+	reconcileOnce(t, op, name)
+	if err := k8s.Delete(ctx, &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: KubeletProbePolicyName, Namespace: name}}); err != nil {
+		t.Fatal(err)
+	}
+	foreign := &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: KubeletProbePolicyName, Namespace: name, Labels: map[string]string{"x": "y"}},
+		Spec:       desiredKubeletProbesSpec(),
+	}
+	if err := k8s.Create(ctx, foreign); err != nil {
+		t.Fatal(err)
+	}
+	tn := getTN(t, name)
+	tn.Spec.Owner = "new-owner@example.com"
+	if err := k8s.Update(ctx, tn); err != nil {
+		t.Fatal(err)
+	}
+	r := &TeamNamespaceReconciler{Client: op, Scheme: testScheme}
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: name}}); err == nil {
+		t.Fatal("reconcile should report the blocked NetworkPolicy")
+	}
+	if rb := get(t, &rbacv1.RoleBinding{}, name, AdminRoleBindingName); len(rb.Subjects) != 1 || rb.Subjects[0].Name != "new-owner@example.com" {
+		t.Errorf("admin binding not transferred despite the blocked policy: %+v", rb.Subjects)
+	}
 }

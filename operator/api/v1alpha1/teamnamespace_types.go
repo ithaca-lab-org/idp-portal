@@ -82,7 +82,9 @@ type TeamNamespaceStatus struct {
 // Ingress is denied by default (idp-default-deny-ingress); the operator adds
 // idp-allow-same-namespace and idp-allow-ingress-gateway, which admits the
 // ingress Gateway pods (istio-ingress, gateway-name=ingress) to all pods so
-// HTTPRoutes of WorkloadIdentities can reach their workloads.
+// HTTPRoutes of WorkloadIdentities can reach their workloads, and
+// idp-allow-kubelet-probes, which admits kubelet health probes (source
+// 169.254.7.127, the Istio ambient host probe SNAT address).
 // With VAULT_ENABLED=true the operator also adds the finalizer
 // idp.ithaca-idp.com/vault-purge, which deletes all Vault KV data under
 // kv/<name>/ before the resource goes away. If Vault is unreachable it retries
