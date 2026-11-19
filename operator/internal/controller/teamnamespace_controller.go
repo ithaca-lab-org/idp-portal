@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"time"
@@ -171,10 +172,18 @@ func managedBy(ns *corev1.Namespace, tn *idpv1alpha1.TeamNamespace) bool {
 	return ns.Labels[LabelManagedBy] == ManagedByValue && ns.Labels[LabelTeamNamespace] == tn.Name
 }
 
+// converge makes the namespace and its children match the TeamNamespace. The
+// RoleBindings come first and every later child is attempted even if an earlier
+// one failed (errors are joined and returned at the end): a refused or
+// blocked child (for example a NetworkPolicy of a managed name that a tenant
+// admin created first) must never keep an ownership transfer from revoking
+// the old owner's admin binding.
 func (r *TeamNamespaceReconciler) converge(ctx context.Context, tn *idpv1alpha1.TeamNamespace, ns *corev1.Namespace) (bool, error) {
 	if err := r.ensureNamespace(ctx, tn, ns); err != nil {
 		return false, fmt.Errorf("namespace: %w", err)
 	}
+
+	requeue, errs := r.ensureRoleBindings(ctx, tn)
 
 	quota := &corev1.ResourceQuota{ObjectMeta: metav1.ObjectMeta{Name: QuotaName, Namespace: tn.Name}}
 	if err := r.ensureChild(ctx, tn, quota, func() {
@@ -182,7 +191,7 @@ func (r *TeamNamespaceReconciler) converge(ctx context.Context, tn *idpv1alpha1.
 			quota.Spec = want
 		}
 	}); err != nil {
-		return false, fmt.Errorf("resourcequota: %w", err)
+		errs = append(errs, fmt.Errorf("resourcequota: %w", err))
 	}
 
 	lr := &corev1.LimitRange{ObjectMeta: metav1.ObjectMeta{Name: LimitRangeName, Namespace: tn.Name}}
@@ -191,7 +200,7 @@ func (r *TeamNamespaceReconciler) converge(ctx context.Context, tn *idpv1alpha1.
 			lr.Spec = want
 		}
 	}); err != nil {
-		return false, fmt.Errorf("limitrange: %w", err)
+		errs = append(errs, fmt.Errorf("limitrange: %w", err))
 	}
 
 	for name, want := range map[string]networkingv1.NetworkPolicySpec{
@@ -206,18 +215,34 @@ func (r *TeamNamespaceReconciler) converge(ctx context.Context, tn *idpv1alpha1.
 				np.Spec = want
 			}
 		}); err != nil {
-			return false, fmt.Errorf("networkpolicy %s: %w", name, err)
+			errs = append(errs, fmt.Errorf("networkpolicy %s: %w", name, err))
 		}
 	}
+	if len(errs) > 0 {
+		return false, errors.Join(errs...)
+	}
+	return requeue, nil
+}
 
+// ensureRoleBindings reconciles the admin binding and the Spinnaker deployer
+// binding. The bool is true when a binding was deleted to be recreated.
+func (r *TeamNamespaceReconciler) ensureRoleBindings(ctx context.Context, tn *idpv1alpha1.TeamNamespace) (bool, []error) {
+	var errs []error
 	requeue, err := r.ensureRoleBinding(ctx, tn, AdminRoleBindingName, desiredRoleRef(), desiredSubjects(tn), true)
-	if err != nil || requeue {
-		return requeue, err
+	if err != nil {
+		errs = append(errs, err)
 	}
 	if !r.SpinnakerDeployer {
-		return false, r.removeSpinnakerBinding(ctx, tn)
+		if err := r.removeSpinnakerBinding(ctx, tn); err != nil {
+			errs = append(errs, err)
+		}
+		return requeue, errs
 	}
-	return r.ensureRoleBinding(ctx, tn, SpinnakerDeployerBindingName, spinnakerRoleRef(), spinnakerSubjects(), false)
+	rq, err := r.ensureRoleBinding(ctx, tn, SpinnakerDeployerBindingName, spinnakerRoleRef(), spinnakerSubjects(), false)
+	if err != nil {
+		errs = append(errs, err)
+	}
+	return requeue || rq, errs
 }
 
 // removeSpinnakerBinding deletes a spinnaker-deployer binding that this

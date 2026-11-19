@@ -393,7 +393,8 @@ spec:
       reason: Forbidden
       message: "idp-operator may write idp-allow-ingress-gateway only as: all pods, Ingress, one peer admitting pods labelled gateway.networking.k8s.io/gateway-name=ingress in namespace istio-ingress, only TCP 15008"
     # idp-allow-kubelet-probes is exactly desiredKubeletProbesSpec: all pods,
-    # Ingress, no egress, one rule with no ports (probe ports are arbitrary) and
+    # Ingress, no egress, one rule with exactly one ports entry, protocol TCP and
+    # no port or endPort (probe ports are arbitrary, Istio SNATs only TCP) and
     # ONE peer that is the ipBlock 169.254.7.127/32 with no except: the address
     # kubelet probes are source-NATed to in an Istio ambient namespace
     # (HOST_PROBE_SNAT_IP default of the Istio CNI). Any other CIDR (a /24 or
@@ -407,11 +408,13 @@ spec:
         (has(object.spec) && size(object.spec.?podSelector.orValue({})) == 0 &&
          object.spec.?policyTypes.orValue([]) == ['Ingress'] && !has(object.spec.egress) &&
          has(object.spec.ingress) && size(object.spec.ingress) == 1 &&
-         object.spec.ingress.all(r, size(r.?ports.orValue([])) == 0 && has(r.from) && size(r.from) == 1 &&
+         object.spec.ingress.all(r, has(r.ports) && size(r.ports) == 1 &&
+           r.ports.all(p, p.?protocol.orValue('TCP') == 'TCP' && !has(p.port) && !has(p.endPort)) &&
+           has(r.from) && size(r.from) == 1 &&
            r.from.all(f, has(f.ipBlock) && !has(f.namespaceSelector) && !has(f.podSelector) &&
              f.ipBlock.?cidr.orValue('') == '169.254.7.127/32' && size(f.ipBlock.?except.orValue([])) == 0)))
       reason: Forbidden
-      message: "idp-operator may write idp-allow-kubelet-probes only as: all pods, Ingress, one rule with no ports and one peer, the ipBlock 169.254.7.127/32 without except"
+      message: "idp-operator may write idp-allow-kubelet-probes only as: all pods, Ingress, one rule with a single TCP ports entry without a port number and one peer, the ipBlock 169.254.7.127/32 without except"
     # idp-default-deny-ingress is exactly desiredDenyIngressSpec: all pods,
     # Ingress, no ingress rule at all and no egress. Any rule would open ingress
     # and break tenant isolation.

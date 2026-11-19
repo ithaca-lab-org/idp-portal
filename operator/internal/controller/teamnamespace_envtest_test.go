@@ -130,10 +130,11 @@ func TestCreatesNamespaceAndGuardrails(t *testing.T) {
 	if !equality.Semantic.DeepEqual(kp.Spec, desiredKubeletProbesSpec()) {
 		t.Errorf("kubelet probe policy = %+v", kp.Spec)
 	}
-	if len(kp.Spec.Ingress) != 1 || len(kp.Spec.Ingress[0].Ports) != 0 || len(kp.Spec.Ingress[0].From) != 1 ||
+	if len(kp.Spec.Ingress) != 1 || len(kp.Spec.Ingress[0].Ports) != 1 || kp.Spec.Ingress[0].Ports[0].Port != nil ||
+		*kp.Spec.Ingress[0].Ports[0].Protocol != corev1.ProtocolTCP || len(kp.Spec.Ingress[0].From) != 1 ||
 		kp.Spec.Ingress[0].From[0].IPBlock == nil || kp.Spec.Ingress[0].From[0].IPBlock.CIDR != "169.254.7.127/32" ||
 		len(kp.Spec.Ingress[0].From[0].IPBlock.Except) != 0 {
-		t.Errorf("kubelet probe policy must admit exactly 169.254.7.127/32 on all ports: %+v", kp.Spec)
+		t.Errorf("kubelet probe policy must admit exactly TCP from 169.254.7.127/32 on all ports: %+v", kp.Spec)
 	}
 	if ref := metav1.GetControllerOf(kp); ref == nil || ref.Kind != "TeamNamespace" || ref.Name != name {
 		t.Errorf("kubelet probe policy owner = %+v", ref)
