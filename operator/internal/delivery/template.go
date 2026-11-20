@@ -19,7 +19,11 @@ import (
 // the pod label idp.ithaca-idp.com/workload=<workload> come from the app repo's
 // Kustomize base, and the admission policy idp-spinnaker-scope refuses a
 // Deployment from Clouddriver that lacks them or lets them differ. The image is
-// named by digest in that base. All values go through the json function, so none
+// named by digest in that base. The Deploy stage skips SpEL evaluation, so
+// expressions inside the tenant's baked manifests are never evaluated by Orca
+// (they could call #fromUrl and make Orca send requests inside the cluster). The
+// Bake stage cannot skip it: it needs ${parameters.ref}; it only sees values this
+// template and the validated ref put there. All values go through the json function, so none
 // can break out of its string.
 const pipelineTmpl = `{
   "application": {{json .App}},
@@ -68,7 +72,7 @@ const pipelineTmpl = `{
       "manifestArtifactAccount": "embedded-artifact",
       "manifestArtifactId": "baked-app",
       "namespaceOverride": {{json .Namespace}},
-      "skipExpressionEvaluation": false
+      "skipExpressionEvaluation": true
     }
   ]
 }

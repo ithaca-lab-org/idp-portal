@@ -48,6 +48,13 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	if run.Status.ExecutionID != "" {
 		return r.poll(ctx, run)
 	}
+	if run.Status.Phase == idpv1alpha1.DeliveryRunRunning {
+		// RUNNING was written before the trigger and no execution id followed: the trigger may
+		// or may not have happened (a crash, or a Gate error after Gate accepted it). Never
+		// trigger again from here; a new DeliveryRun is the retry.
+		return ctrl.Result{}, r.finish(ctx, run, idpv1alpha1.DeliveryRunFailed,
+			"the start of the execution was interrupted and its outcome is unknown; check Spinnaker and create a new run if needed")
+	}
 
 	dp := &idpv1alpha1.DeliveryPipeline{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.Pipeline}, dp); err != nil {
@@ -79,18 +86,36 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		return ctrl.Result{}, r.finish(ctx, run, idpv1alpha1.DeliveryRunFailed, trunc(err.Error()))
 	}
 
-	id, err := r.Gate.Trigger(ctx, app, PipelineName, map[string]string{"ref": run.Spec.Ref})
+	// The application must be this pair's: an application stamped for another namespace and
+	// workload (the join is ambiguous) is never triggered. This read also keeps a Gate that is
+	// down away from the RUNNING write below, so a transient outage is a retry, not a failure.
+	exists, desc, err := r.Gate.Application(ctx, app)
 	if err != nil {
-		log.Info("trigger failed", "app", app, "reason", Safe(err))
+		log.Info("application check failed", "app", app, "reason", Safe(err))
 		if IsPermanent(err) || r.timedOut(run) {
-			r.event(run, corev1.EventTypeWarning, ReasonGateRejected, Safe(err))
 			return ctrl.Result{}, r.finish(ctx, run, idpv1alpha1.DeliveryRunFailed, "could not start the pipeline: "+Safe(err))
 		}
 		_ = r.setRun(ctx, run, idpv1alpha1.DeliveryRunPending, "", "could not start the pipeline yet: "+Safe(err))
 		return ctrl.Result{RequeueAfter: errorRetry}, nil
 	}
-	// The execution id is recorded straight away. A crash between the trigger and
-	// this write would trigger the run again (an at-least-once start).
+	if !exists || desc != AppDescription(dp.Namespace, dp.Spec.Workload) {
+		return ctrl.Result{}, r.finish(ctx, run, idpv1alpha1.DeliveryRunFailed,
+			fmt.Sprintf("Spinnaker application %s is missing or does not belong to this workload", app))
+	}
+
+	// RUNNING (no execution id) is written BEFORE the trigger, with the resourceVersion we read:
+	// a stale cached object, or a second reconcile that got there first, fails with a conflict
+	// and nothing is triggered. From RUNNING the controller never triggers (see above).
+	if err := r.setRun(ctx, run, idpv1alpha1.DeliveryRunRunning, "", "starting the pipeline execution"); err != nil {
+		return ctrl.Result{}, err
+	}
+	id, err := r.Gate.Trigger(ctx, app, PipelineName, map[string]string{"ref": run.Spec.Ref})
+	if err != nil {
+		log.Info("trigger failed", "app", app, "reason", Safe(err))
+		r.event(run, corev1.EventTypeWarning, ReasonGateRejected, Safe(err))
+		return ctrl.Result{}, r.finish(ctx, run, idpv1alpha1.DeliveryRunFailed, "could not start the pipeline (create a new run to retry): "+Safe(err))
+	}
+	// A crash before this write leaves RUNNING without an id: the run is then failed, not repeated.
 	if err := r.setRun(ctx, run, idpv1alpha1.DeliveryRunRunning, id, "pipeline execution started"); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -101,13 +126,17 @@ func (r *RunReconciler) poll(ctx context.Context, run *idpv1alpha1.DeliveryRun) 
 	if !ValidExecutionID(run.Status.ExecutionID) {
 		return ctrl.Result{}, r.finish(ctx, run, idpv1alpha1.DeliveryRunFailed, "status.executionId is not an execution id")
 	}
-	st, err := r.Gate.ExecutionStatus(ctx, run.Status.ExecutionID)
+	st, execApp, err := r.Gate.ExecutionStatus(ctx, run.Status.ExecutionID)
 	if err != nil {
 		logf.FromContext(ctx).Info("execution status unavailable", "reason", Safe(err))
 		if r.timedOut(run) {
 			return ctrl.Result{}, r.finish(ctx, run, idpv1alpha1.DeliveryRunFailed, "gave up waiting for the execution: "+Safe(err))
 		}
 		return ctrl.Result{RequeueAfter: errorRetry}, nil
+	}
+	// The id must belong to this run's application (the pipeline is named after its workload).
+	if want, aerr := AppName(run.Namespace, run.Spec.Pipeline); aerr != nil || execApp != want {
+		return ctrl.Result{}, r.finish(ctx, run, idpv1alpha1.DeliveryRunFailed, "the execution does not belong to this workload's application")
 	}
 	switch st {
 	case "SUCCEEDED":

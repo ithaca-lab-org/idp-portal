@@ -14,6 +14,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	idpv1alpha1 "github.com/ithaca-lab-org/idp-portal/operator/api/v1alpha1"
 )
@@ -267,13 +268,45 @@ func TestPipelineApplicationConflict(t *testing.T) {
 	if _, ok := g.Pipelines["demo-orders"]; ok {
 		t.Error("pipeline written into a foreign application")
 	}
-	// An application without a marker (the hand-made milestone 1 one) is adopted.
+	// An application without a marker (the hand-made milestone 1 one) is adopted only by
+	// stamping the marker first; the pipeline is saved after the stamp is visible.
 	g2 := newFakeGate()
 	g2.Apps["demo-orders"] = ""
 	c2 := newClient(t, pipelineObj(goodRepo), workload("demo", "orders"))
-	_, dp = reconcilePipeline(t, pipelineRec(c2, g2), c2)
+	r2 := pipelineRec(c2, g2)
+	_, dp = reconcilePipeline(t, r2, c2)
+	if dp.Status.Phase != idpv1alpha1.DeliveryPhaseBuilding || len(g2.Pipelines) != 0 || g2.pending["demo-orders"] != AppDescription("demo", "orders") {
+		t.Fatalf("unmarked application not stamped first: %+v pipelines=%d", dp.Status, len(g2.Pipelines))
+	}
+	_, dp = reconcilePipeline(t, r2, c2)
 	if dp.Status.Phase != idpv1alpha1.DeliveryPhaseReady {
-		t.Errorf("unmarked application not adopted: %+v", dp.Status)
+		t.Errorf("stamped application not adopted: %+v", dp.Status)
+	}
+	// Collision: namespace "a-b" + workload "c" and namespace "a" + workload "b-c" both want
+	// "a-b-c". Whichever stamped it first keeps it; the other pair is refused, never adopted.
+	g3 := newFakeGate()
+	g3.Apps["a-b-c"] = ""
+	first := collisionPipeline("a-b", "c")
+	c3 := newClient(t, first, workload("a-b", "c"))
+	r3 := pipelineRec(c3, g3)
+	reconcileOne(t, r3, "a-b", "c")
+	reconcileOne(t, r3, "a-b", "c")
+	if g3.Apps["a-b-c"] != AppDescription("a-b", "c") {
+		t.Fatalf("marker = %q", g3.Apps["a-b-c"])
+	}
+	second := collisionPipeline("a", "b-c")
+	if err := c3.Create(context.Background(), second); err != nil {
+		t.Fatal(err)
+	}
+	if err := c3.Create(context.Background(), workload("a", "b-c")); err != nil {
+		t.Fatal(err)
+	}
+	before := string(g3.Pipelines["a-b-c"])
+	reconcileOne(t, r3, "a", "b-c")
+	got := &idpv1alpha1.DeliveryPipeline{}
+	_ = c3.Get(context.Background(), types.NamespacedName{Namespace: "a", Name: "b-c"}, got)
+	if got.Status.Phase != idpv1alpha1.DeliveryPhaseFailed || got.Status.Conditions[0].Reason != ReasonAppConflict || string(g3.Pipelines["a-b-c"]) != before {
+		t.Errorf("second pair adopted the application: %+v", got.Status)
 	}
 }
 
@@ -297,7 +330,7 @@ func readyPipeline() *idpv1alpha1.DeliveryPipeline {
 
 func TestRunSuccess(t *testing.T) {
 	c := newClient(t, readyPipeline(), runObj("r1", goodSHA))
-	g := newFakeGate()
+	g := gateWithApp()
 	r := runRec(c, g)
 
 	res, run := reconcileRun(t, r, c, "r1")
@@ -328,7 +361,7 @@ func TestRunSuccess(t *testing.T) {
 func TestRunFailedExecution(t *testing.T) {
 	for _, st := range []string{"TERMINAL", "CANCELED", "STOPPED"} {
 		c := newClient(t, readyPipeline(), runObj("r1", goodSHA))
-		g := newFakeGate()
+		g := gateWithApp()
 		r := runRec(c, g)
 		reconcileRun(t, r, c, "r1")
 		g.Statuses["01EXECUTIONID"] = st
@@ -352,7 +385,7 @@ func TestRunBadSHA(t *testing.T) {
 
 func TestRunGateDown(t *testing.T) {
 	c := newClient(t, readyPipeline(), runObj("r1", goodSHA))
-	g := newFakeGate()
+	g := gateWithApp()
 	g.Err = secretErr
 	r := runRec(c, g)
 	res, run := reconcileRun(t, r, c, "r1")
@@ -382,7 +415,7 @@ func TestRunGateDown(t *testing.T) {
 
 func TestRunGateRejectsTrigger(t *testing.T) {
 	c := newClient(t, readyPipeline(), runObj("r1", goodSHA))
-	g := newFakeGate()
+	g := gateWithApp()
 	g.TriggerErr = &GateError{Status: 404, Reason: "Not Found"}
 	_, run := reconcileRun(t, runRec(c, g), c, "r1")
 	if run.Status.Phase != idpv1alpha1.DeliveryRunFailed || strings.Contains(run.Status.Message, "SECRET") {
@@ -433,5 +466,128 @@ func TestSafeStatusAndTruncation(t *testing.T) {
 	}
 	if Safe(errors.New("x")) != "gate: unexpected error" {
 		t.Error("Safe")
+	}
+}
+
+func collisionPipeline(ns, wl string) *idpv1alpha1.DeliveryPipeline {
+	return &idpv1alpha1.DeliveryPipeline{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: wl, Generation: 1},
+		Spec:       idpv1alpha1.DeliveryPipelineSpec{Workload: wl, Repo: goodRepo},
+	}
+}
+
+func reconcileOne(t *testing.T, r *PipelineReconciler, ns, name string) {
+	t.Helper()
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// gateWithApp is a Gate whose application carries the marker of namespace demo, workload orders.
+func gateWithApp() *fakeGate {
+	g := newFakeGate()
+	g.Apps["demo-orders"] = AppDescription("demo", "orders")
+	return g
+}
+
+func TestRunRefusesForeignApplication(t *testing.T) {
+	for name, desc := range map[string]string{"other pair": AppDescription("demo-orders", "x"), "unmarked": ""} {
+		c := newClient(t, readyPipeline(), runObj("r1", goodSHA))
+		g := newFakeGate()
+		g.Apps["demo-orders"] = desc
+		_, run := reconcileRun(t, runRec(c, g), c, "r1")
+		if run.Status.Phase != idpv1alpha1.DeliveryRunFailed || len(g.Triggers) != 0 {
+			t.Errorf("%s: %+v triggers=%d", name, run.Status, len(g.Triggers))
+		}
+	}
+	c := newClient(t, readyPipeline(), runObj("r1", goodSHA))
+	g := newFakeGate() // no application at all
+	if _, run := reconcileRun(t, runRec(c, g), c, "r1"); run.Status.Phase != idpv1alpha1.DeliveryRunFailed || len(g.Triggers) != 0 {
+		t.Errorf("missing application: %+v", run.Status)
+	}
+}
+
+// A crash after RUNNING was written and before the execution id was: the run fails, no re-trigger.
+func TestRunCrashAfterRunningIsNotRetriggered(t *testing.T) {
+	run := runObj("r1", goodSHA)
+	run.Status = idpv1alpha1.DeliveryRunStatus{Phase: idpv1alpha1.DeliveryRunRunning, Message: "starting the pipeline execution"}
+	c := newClient(t, readyPipeline(), run)
+	g := gateWithApp()
+	_, got := reconcileRun(t, runRec(c, g), c, "r1")
+	if got.Status.Phase != idpv1alpha1.DeliveryRunFailed || !strings.Contains(got.Status.Message, "interrupted") || len(g.Triggers) != 0 {
+		t.Errorf("status = %+v triggers=%d", got.Status, len(g.Triggers))
+	}
+}
+
+// RUNNING is written before the trigger, and a Gate error on the trigger fails the run instead of
+// leaving it to be retried.
+func TestRunTriggerErrorFailsAfterRunningWritten(t *testing.T) {
+	c := newClient(t, readyPipeline(), runObj("r1", goodSHA))
+	g := gateWithApp()
+	g.TriggerErr = secretErr // a 503 may have started the execution: not retried
+	r := runRec(c, g)
+	_, got := reconcileRun(t, r, c, "r1")
+	if got.Status.Phase != idpv1alpha1.DeliveryRunFailed || len(g.Triggers) != 0 {
+		t.Fatalf("status = %+v", got.Status)
+	}
+	reconcileRun(t, r, c, "r1")
+	if n := countCalls(g, "trigger:"); n != 1 {
+		t.Errorf("triggered %d times", n)
+	}
+}
+
+func countCalls(g *fakeGate, prefix string) int {
+	n := 0
+	for _, c := range g.Calls {
+		if strings.HasPrefix(c, prefix) {
+			n++
+		}
+	}
+	return n
+}
+
+// A reconcile working from a stale cached copy (still PENDING after another one wrote RUNNING)
+// conflicts on the RUNNING write and triggers nothing.
+func TestRunStaleCacheDoesNotRetrigger(t *testing.T) {
+	c := newClient(t, readyPipeline(), runObj("r1", goodSHA))
+	g := gateWithApp()
+	key := types.NamespacedName{Namespace: "demo", Name: "r1"}
+	stale := &idpv1alpha1.DeliveryRun{}
+	if err := c.Get(context.Background(), key, stale); err != nil {
+		t.Fatal(err)
+	}
+	r := runRec(c, g)
+	reconcileRun(t, r, c, "r1") // triggers once
+	if len(g.Triggers) != 1 {
+		t.Fatal("first reconcile did not trigger")
+	}
+	staleClient := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, cl client.WithWatch, k client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if run, ok := obj.(*idpv1alpha1.DeliveryRun); ok && k == key {
+				stale.DeepCopyInto(run)
+				return nil
+			}
+			return cl.Get(ctx, k, obj, opts...)
+		},
+	})
+	r2 := runRec(staleClient, g)
+	if _, err := r2.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err == nil {
+		t.Error("stale write did not conflict")
+	}
+	if len(g.Triggers) != 1 {
+		t.Errorf("triggered %d times", len(g.Triggers))
+	}
+}
+
+func TestRunExecutionOfAnotherApplicationFails(t *testing.T) {
+	run := runObj("r1", goodSHA)
+	run.Status = idpv1alpha1.DeliveryRunStatus{Phase: idpv1alpha1.DeliveryRunRunning, ExecutionID: "01OTHER"}
+	c := newClient(t, readyPipeline(), run)
+	g := gateWithApp()
+	g.ExecApp = "someone-else"
+	g.Statuses["01OTHER"] = "SUCCEEDED"
+	_, got := reconcileRun(t, runRec(c, g), c, "r1")
+	if got.Status.Phase != idpv1alpha1.DeliveryRunFailed || !strings.Contains(got.Status.Message, "does not belong") {
+		t.Errorf("status = %+v", got.Status)
 	}
 }

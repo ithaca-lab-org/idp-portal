@@ -28,7 +28,7 @@ func TestHTTPGate(t *testing.T) {
 		case r.URL.Path == "/api/v1/pipelines/demo-orders/deploy":
 			io.WriteString(w, `{"ref":"/pipelines/01EXEC"}`)
 		case r.URL.Path == "/api/v1/pipelines/01EXEC":
-			io.WriteString(w, `{"status":"SUCCEEDED","stages":[]}`)
+			io.WriteString(w, `{"status":"SUCCEEDED","application":"demo-orders","stages":[]}`)
 		case r.URL.Path == "/api/v1/tasks" || r.URL.Path == "/api/v1/pipelines" || r.URL.Path == "/api/v1/pipelines/p2":
 			w.WriteHeader(202)
 		case r.URL.Path == "/api/v1/applications/redir":
@@ -70,8 +70,11 @@ func TestHTTPGate(t *testing.T) {
 	if id, err := g.Trigger(ctx, "demo-orders", "deploy", map[string]string{"ref": "abc"}); err != nil || id != "01EXEC" || !strings.Contains(gotBody, `"ref":"abc"`) {
 		t.Errorf("Trigger = %q, %v, %s", id, err, gotBody)
 	}
-	if st, err := g.ExecutionStatus(ctx, "01EXEC"); err != nil || st != "SUCCEEDED" {
-		t.Errorf("ExecutionStatus = %q, %v", st, err)
+	if st, app, err := g.ExecutionStatus(ctx, "01EXEC"); err != nil || st != "SUCCEEDED" || app != "demo-orders" {
+		t.Errorf("ExecutionStatus = %q %q, %v", st, app, err)
+	}
+	if err := g.SetApplicationDescription(ctx, "demo-orders", "d"); err != nil || !strings.Contains(gotBody, `"updateApplication"`) {
+		t.Errorf("stamp: %v %s", err, gotBody)
 	}
 
 	// Failures: status code and a fixed reason, never the body.

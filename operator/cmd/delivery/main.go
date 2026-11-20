@@ -43,7 +43,7 @@ func main() {
 	flag.StringVar(&orgs, "allowed-repo-orgs", envOr("DELIVERY_ALLOWED_REPO_ORGS", delivery.DefaultAllowedOrgs), "Comma separated GitHub owners a DeliveryPipeline repository may belong to (env DELIVERY_ALLOWED_REPO_ORGS).")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", envOr("METRICS_BIND_ADDRESS", "0"), "Metrics endpoint address, plain HTTP, no authn; \"0\" disables it (env METRICS_BIND_ADDRESS).")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", envOr("HEALTH_PROBE_BIND_ADDRESS", ":8081"), "Health and readiness probe address (env HEALTH_PROBE_BIND_ADDRESS).")
-	flag.BoolVar(&leaderElect, "leader-elect", false, "Enable leader election for high availability.")
+	flag.BoolVar(&leaderElect, "leader-elect", true, "Enable leader election (default true: two controllers must never trigger the same run).")
 	zapOpts := zap.Options{Development: false}
 	zapOpts.BindFlags(flag.CommandLine)
 	flag.Parse()

@@ -45,7 +45,7 @@
       "manifestArtifactAccount": "embedded-artifact",
       "manifestArtifactId": "baked-app",
       "namespaceOverride": "demo",
-      "skipExpressionEvaluation": false
+      "skipExpressionEvaluation": true
     }
   ]
 }

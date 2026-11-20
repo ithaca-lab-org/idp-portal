@@ -21,6 +21,7 @@ type fakeGate struct {
 	// HidePipeline makes a saved pipeline invisible to PipelineID.
 	HidePipeline bool
 
+	ExecApp    string
 	Statuses   map[string]string
 	TriggerID  string
 	TriggerErr error
@@ -31,7 +32,7 @@ type fakeGate struct {
 
 func newFakeGate() *fakeGate {
 	return &fakeGate{Apps: map[string]string{}, Pipelines: map[string][]byte{}, pending: map[string]string{},
-		Statuses: map[string]string{}, TriggerID: "01EXECUTIONID"}
+		Statuses: map[string]string{}, TriggerID: "01EXECUTIONID", ExecApp: "demo-orders"}
 }
 
 func (g *fakeGate) call(s string) { g.Calls = append(g.Calls, s) }
@@ -107,15 +108,26 @@ func (g *fakeGate) Trigger(_ context.Context, app, pipeline string, params map[s
 	return g.TriggerID, nil
 }
 
-func (g *fakeGate) ExecutionStatus(_ context.Context, id string) (string, error) {
+func (g *fakeGate) SetApplicationDescription(_ context.Context, app, description string) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.call("stamp:" + app)
+	if g.Err != nil {
+		return g.Err
+	}
+	g.pending[app] = description
+	return nil
+}
+
+func (g *fakeGate) ExecutionStatus(_ context.Context, id string) (string, string, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.call("status:" + id)
 	if g.Err != nil {
-		return "", g.Err
+		return "", "", g.Err
 	}
 	if s, ok := g.Statuses[id]; ok {
-		return s, nil
+		return s, g.ExecApp, nil
 	}
-	return "RUNNING", nil
+	return "RUNNING", g.ExecApp, nil
 }

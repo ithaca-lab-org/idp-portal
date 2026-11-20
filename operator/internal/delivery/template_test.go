@@ -39,13 +39,14 @@ func TestRenderPipelineShape(t *testing.T) {
 		Application string `json:"application"`
 		Name        string `json:"name"`
 		Stages      []struct {
-			Type              string `json:"type"`
-			Account           string `json:"account"`
-			Namespace         string `json:"namespace"`
-			NamespaceOverride string `json:"namespaceOverride"`
-			KustomizeFilePath string `json:"kustomizeFilePath"`
-			Moniker           struct{ App string }
-			InputArtifact     struct {
+			Type                     string `json:"type"`
+			Account                  string `json:"account"`
+			Namespace                string `json:"namespace"`
+			NamespaceOverride        string `json:"namespaceOverride"`
+			KustomizeFilePath        string `json:"kustomizeFilePath"`
+			SkipExpressionEvaluation bool   `json:"skipExpressionEvaluation"`
+			Moniker                  struct{ App string }
+			InputArtifact            struct {
 				Artifact struct{ Reference, Version string }
 			} `json:"inputArtifact"`
 		} `json:"stages"`
@@ -60,6 +61,9 @@ func TestRenderPipelineShape(t *testing.T) {
 	if bake.Type != "bakeManifest" || bake.Namespace != "demo" || bake.KustomizeFilePath != "k8s/x/kustomization.yaml" ||
 		bake.InputArtifact.Artifact.Version != "${parameters.ref}" {
 		t.Errorf("bake = %+v", bake)
+	}
+	if !deploy.SkipExpressionEvaluation {
+		t.Error("the Deploy stage must skip SpEL evaluation (tenant manifests are not trusted)")
 	}
 	if deploy.Type != "deployManifest" || deploy.Account != "demo" || deploy.NamespaceOverride != "demo" || deploy.Moniker.App != "demo-orders" {
 		t.Errorf("deploy = %+v", deploy)

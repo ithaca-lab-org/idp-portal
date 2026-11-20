@@ -28,8 +28,12 @@ type Gate interface {
 	SavePipeline(ctx context.Context, id string, pipelineJSON []byte) error
 	// Trigger starts the pipeline with the parameters and returns the execution id.
 	Trigger(ctx context.Context, app, pipeline string, params map[string]string) (string, error)
-	// ExecutionStatus returns Spinnaker's status of the execution (RUNNING, SUCCEEDED, TERMINAL, ...).
-	ExecutionStatus(ctx context.Context, id string) (string, error)
+	// SetApplicationDescription stamps the ownership marker on an existing application
+	// (an asynchronous task; callers re-check with Application).
+	SetApplicationDescription(ctx context.Context, app, description string) error
+	// ExecutionStatus returns Spinnaker's status of the execution (RUNNING, SUCCEEDED,
+	// TERMINAL, ...) and the application the execution belongs to.
+	ExecutionStatus(ctx context.Context, id string) (status, application string, err error)
 }
 
 // GateError is a sanitised failure.
@@ -219,12 +223,25 @@ func (g *HTTPGate) Trigger(ctx context.Context, app, pipeline string, params map
 	return id, nil
 }
 
-func (g *HTTPGate) ExecutionStatus(ctx context.Context, id string) (string, error) {
+func (g *HTTPGate) SetApplicationDescription(ctx context.Context, app, description string) error {
+	task := map[string]any{
+		"application": app, "description": "stamp application owner",
+		"job": []any{map[string]any{
+			"type": "updateApplication", "user": gateUser,
+			"application": map[string]any{"name": app, "email": "platform@example.com", "cloudProviders": "kubernetes", "description": description},
+		}},
+	}
+	_, err := g.do(ctx, http.MethodPost, "/tasks", task, nil)
+	return err
+}
+
+func (g *HTTPGate) ExecutionStatus(ctx context.Context, id string) (string, string, error) {
 	var out struct {
-		Status string `json:"status"`
+		Status      string `json:"status"`
+		Application string `json:"application"`
 	}
 	if _, err := g.do(ctx, http.MethodGet, "/pipelines/"+url.PathEscape(id), nil, &out); err != nil {
-		return "", err
+		return "", "", err
 	}
-	return out.Status, nil
+	return out.Status, out.Application, nil
 }

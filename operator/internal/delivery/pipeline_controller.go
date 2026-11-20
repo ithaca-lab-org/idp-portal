@@ -14,7 +14,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"strings"
 
 	idpv1alpha1 "github.com/ithaca-lab-org/idp-portal/operator/api/v1alpha1"
 )
@@ -117,9 +116,17 @@ func (r *PipelineReconciler) sync(ctx context.Context, dp *idpv1alpha1.DeliveryP
 		return nil, err
 	}
 	want := AppDescription(dp.Namespace, dp.Spec.Workload)
-	if exists && strings.HasPrefix(desc, "idp-managed ") && desc != want {
-		msg := fmt.Sprintf("Spinnaker application %s belongs to another namespace and workload pair", app)
-		return &ctrl.Result{}, r.fail(ctx, dp, ReasonAppConflict, msg)
+	if exists && desc != want {
+		if desc != "" {
+			msg := fmt.Sprintf("Spinnaker application %s belongs to another namespace and workload pair", app)
+			return &ctrl.Result{}, r.fail(ctx, dp, ReasonAppConflict, msg)
+		}
+		// Unmarked (the hand-made milestone 1 application): adopt it by stamping the marker
+		// first, so that a second pair that joins to the same name is refused from now on.
+		if err := r.Gate.SetApplicationDescription(ctx, app, want); err != nil {
+			return nil, err
+		}
+		return &ctrl.Result{RequeueAfter: buildRetry}, nil
 	}
 	if !exists {
 		if err := r.Gate.CreateApplication(ctx, app, want); err != nil {
