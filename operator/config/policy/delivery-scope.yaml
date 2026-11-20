@@ -1,0 +1,95 @@
+# Confines who writes DeliveryPipelines and DeliveryRuns (ADR 0011). Two policies:
+#
+# idp-delivery-scope: the delivery controller's ServiceAccount (idp-system/idp-delivery)
+# may only UPDATE the status of these two kinds (never create or delete, no spec,
+# labels, annotations, ownerReferences or finalizers). Its RBAC
+# (config/rbac/delivery-role.yaml) already grants nothing else; this policy keeps
+# the writes narrow even if the role is widened by mistake. A pipeline reports only
+# the application <namespace>-<name> (the object is named after its workload).
+#
+# idp-delivery-writers: nobody but portal-api (create only, see portal-scope.yaml), the
+# delivery controller (status only, above) and system:masters (bootstrap, break glass)
+# may create or update these kinds or their status, so a tenant with a Role that
+# happens to cover the group still cannot order, edit or fake a pipeline or run.
+# Delete is left to RBAC (the namespace controller needs it).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: idp-delivery-scope
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    # Subresources are matched too, and DELETE also covers deletecollection.
+    resourceRules:
+      - apiGroups: ["idp.ithaca-idp.com"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["deliverypipelines", "deliverypipelines/*", "deliveryruns", "deliveryruns/*"]
+  matchConditions:
+    - name: is-idp-delivery
+      expression: "request.userInfo.username == 'system:serviceaccount:idp-system:idp-delivery'"
+  variables:
+    - name: subResource
+      expression: "request.?subResource.orValue('')"
+  validations:
+    - expression: "request.operation == 'UPDATE' && variables.subResource == 'status'"
+      reason: Forbidden
+      messageExpression: "'idp-delivery may only update the status of deliverypipelines and deliveryruns (not ' + request.operation + ' ' + request.resource.resource + '/' + variables.subResource + ')'"
+    - expression: "object.?spec.orValue({}) == oldObject.?spec.orValue({})"
+      reason: Forbidden
+      message: "idp-delivery may not change the spec"
+    - expression: >-
+        object.metadata.?labels.orValue({}) == oldObject.metadata.?labels.orValue({}) &&
+        object.metadata.?annotations.orValue({}) == oldObject.metadata.?annotations.orValue({}) &&
+        object.metadata.?ownerReferences.orValue([]) == oldObject.metadata.?ownerReferences.orValue([]) &&
+        object.metadata.?finalizers.orValue([]) == oldObject.metadata.?finalizers.orValue([])
+      reason: Forbidden
+      message: "idp-delivery may not change labels, annotations, ownerReferences or finalizers"
+    - expression: >-
+        request.resource.resource != 'deliverypipelines' ||
+        object.?status.applicationName.orValue('') in ['', request.namespace + '-' + object.metadata.name]
+      reason: Forbidden
+      message: "idp-delivery may only report status.applicationName <namespace>-<name>"
+    - expression: >-
+        request.resource.resource != 'deliveryruns' ||
+        object.?status.executionId.orValue('').matches('^[A-Za-z0-9]{0,64}$')
+      reason: Forbidden
+      message: "idp-delivery may only report an alphanumeric status.executionId"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: idp-delivery-scope
+spec:
+  policyName: idp-delivery-scope
+  validationActions: ["Deny"]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: idp-delivery-writers
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["idp.ithaca-idp.com"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["deliverypipelines", "deliverypipelines/*", "deliveryruns", "deliveryruns/*"]
+  matchConditions:
+    - name: not-a-known-writer
+      expression: >-
+        !(request.userInfo.username in ['system:serviceaccount:idp-system:portal-api', 'system:serviceaccount:idp-system:idp-delivery']) &&
+        !('system:masters' in request.userInfo.groups)
+  validations:
+    - expression: "false"
+      reason: Forbidden
+      messageExpression: "'only portal-api may create and only idp-delivery may write the status of deliverypipelines and deliveryruns (not ' + request.userInfo.username + ')'"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: idp-delivery-writers
+spec:
+  policyName: idp-delivery-writers
+  validationActions: ["Deny"]

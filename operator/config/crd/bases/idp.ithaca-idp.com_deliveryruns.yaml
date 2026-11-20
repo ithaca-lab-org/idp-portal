@@ -1,0 +1,106 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.23.0
+  name: deliveryruns.idp.ithaca-idp.com
+spec:
+  group: idp.ithaca-idp.com
+  names:
+    kind: DeliveryRun
+    listKind: DeliveryRunList
+    plural: deliveryruns
+    shortNames:
+    - drun
+    singular: deliveryrun
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.pipeline
+      name: Pipeline
+      type: string
+    - jsonPath: .spec.ref
+      name: Ref
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          DeliveryRun asks the delivery controller to run the pipeline of a
+          DeliveryPipeline for one commit. It is a one-shot request: once the phase is
+          SUCCEEDED or FAILED nothing more happens. Written by portal-api only.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            properties:
+              pipeline:
+                description: Pipeline is the name of a DeliveryPipeline in the same
+                  namespace.
+                maxLength: 40
+                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                type: string
+              ref:
+                description: Ref is the full 40-hex git commit SHA to bake and deploy.
+                pattern: ^[0-9a-f]{40}$
+                type: string
+              requestedBy:
+                description: |-
+                  RequestedBy is the Keycloak subject that asked for the deploy, set by the
+                  portal. Informational only: it grants nothing.
+                maxLength: 128
+                type: string
+            required:
+            - pipeline
+            - ref
+            type: object
+            x-kubernetes-validations:
+            - message: a DeliveryRun spec is immutable
+              rule: self == oldSelf
+          status:
+            properties:
+              executionId:
+                description: ExecutionID is the Spinnaker pipeline execution.
+                maxLength: 64
+                type: string
+              message:
+                description: 'Message is short and sanitised: never a raw Gate response.'
+                maxLength: 300
+                type: string
+              phase:
+                enum:
+                - PENDING
+                - RUNNING
+                - SUCCEEDED
+                - FAILED
+                type: string
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

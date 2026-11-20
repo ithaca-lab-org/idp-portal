@@ -1,5 +1,6 @@
 # Confines the portal's ServiceAccount (idp-system/portal-api) on ManagedSecrets,
-# WorkloadIdentities, BucketClaims and ResourceGrants. Its RBAC (ClusterRole
+# WorkloadIdentities, BucketClaims, ResourceGrants, DeliveryPipelines and DeliveryRuns
+# (the last two are create-only for the portal; ADR 0011, see delivery-scope.yaml). Its RBAC (ClusterRole
 # idp-portal-orders in idp-gitops workloads/portal) grants get, create and delete
 # on managedsecrets, get, list and create on workloadidentities and bucketclaims,
 # and get, list, create and delete on resourcegrants cluster-wide, because
@@ -26,7 +27,8 @@ spec:
         apiVersions: ["*"]
         operations: ["CREATE", "UPDATE", "DELETE"]
         resources: ["managedsecrets", "managedsecrets/*", "workloadidentities", "workloadidentities/*",
-                    "bucketclaims", "bucketclaims/*", "resourcegrants", "resourcegrants/*"]
+                    "bucketclaims", "bucketclaims/*", "resourcegrants", "resourcegrants/*",
+                    "deliverypipelines", "deliverypipelines/*", "deliveryruns", "deliveryruns/*"]
   matchConditions:
     - name: is-portal-api
       expression: "request.userInfo.username == 'system:serviceaccount:idp-system:portal-api'"
@@ -124,6 +126,27 @@ spec:
         (!has(object.metadata.labels) && !has(object.metadata.annotations))
       reason: Forbidden
       message: "portal-api may not set labels or annotations on bucketclaims or resourcegrants"
+    # DeliveryPipelines and DeliveryRuns are create-only: the delivery controller owns
+    # their status and the Spinnaker side, and a run is a one-shot request.
+    - expression: "!(request.resource.resource in ['deliverypipelines', 'deliveryruns']) || request.operation == 'CREATE'"
+      reason: Forbidden
+      message: "portal-api may only create deliverypipelines and deliveryruns"
+    # One pipeline per workload: named after it (the CRD says the same).
+    - expression: >-
+        request.resource.resource != 'deliverypipelines' || request.operation != 'CREATE' ||
+        object.metadata.name == object.spec.workload
+      reason: Forbidden
+      message: "portal-api may only create a deliverypipeline named after its workload"
+    - expression: >-
+        request.resource.resource != 'deliveryruns' || request.operation != 'CREATE' ||
+        object.spec.ref.matches('^[0-9a-f]{40}$')
+      reason: Forbidden
+      message: "portal-api may only create a deliveryrun for a full 40-hex commit SHA"
+    - expression: >-
+        !(request.resource.resource in ['deliverypipelines', 'deliveryruns']) || request.operation != 'CREATE' ||
+        (!has(object.metadata.labels) && !has(object.metadata.annotations))
+      reason: Forbidden
+      message: "portal-api may not set labels or annotations on deliverypipelines or deliveryruns"
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding

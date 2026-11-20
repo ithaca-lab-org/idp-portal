@@ -16,10 +16,11 @@ generate: ## deepcopy code
 	$(CONTROLLER_GEN) object paths=./...
 
 .PHONY: manifests
-manifests: ## CRD and RBAC YAML under config/ (the broker gets its own ClusterRole file)
+manifests: ## CRD and RBAC YAML under config/ (the broker and the delivery controller get their own ClusterRole files)
 	$(CONTROLLER_GEN) crd paths=./api/... output:crd:artifacts:config=config/crd/bases
 	$(CONTROLLER_GEN) rbac:roleName=idp-operator paths=./cmd paths=./internal/controller/... output:rbac:artifacts:config=config/rbac
 	$(CONTROLLER_GEN) rbac:roleName=idp-broker paths=./cmd/broker paths=./internal/broker/... output:rbac:stdout > config/rbac/broker-role.yaml
+	$(CONTROLLER_GEN) rbac:roleName=idp-delivery paths=./cmd/delivery paths=./internal/delivery/... output:rbac:stdout > config/rbac/delivery-role.yaml
 
 .PHONY: fmt
 fmt: ## fail if gofmt would change anything
@@ -48,3 +49,4 @@ check: fmt vet test vuln ## everything CI should run
 build:
 	go build -o $(LOCALBIN)/manager ./cmd
 	go build -o $(LOCALBIN)/broker ./cmd/broker
+	go build -o $(LOCALBIN)/delivery ./cmd/delivery

@@ -197,6 +197,34 @@ The cache is cluster-wide for BucketClaims, ResourceGrants, WorkloadIdentities, 
 
 **Admission policy** (`config/policy/broker-scope.yaml`, `idp-broker-scope`): the broker may only UPDATE bucketclaims and resourcegrants and their status; `spec`, labels, annotations and ownerReferences must be unchanged, the finalizers it adds or removes may only be the kind's own (`bucket-release` on claims, `grant-release` on grants; foreign ones such as `foregroundDeletion` may be present and stay), status writes leave finalizers alone, and a claim reports only `status.bucketName` = `idp-<namespace>-<name>-<8 hex>`. portal-api's own policy and RBAC for the two kinds are a later step.
 
+## Delivery controller (ADR 0011, Order #04 milestone 2)
+
+A third binary, `cmd/delivery` (image `idp-delivery`, `Dockerfile.delivery`, Deployment `idp-system/idp-delivery` with its own ServiceAccount), the only caller of Spinnaker's Gate. It shares nothing with the manager or the broker but the API types. Gate is protected by the network and has no login (Fiat off), so the controller sends no credentials.
+
+| Kind | Short | Meaning |
+|---|---|---|
+| `DeliveryPipeline` | `dpipe` | `spec.workload` (a WorkloadIdentity in the same namespace; immutable; the object must be named like it), `spec.repo` (`https://github.com/<org>/<repo>`, owner on `DELIVERY_ALLOWED_REPO_ORGS`), `spec.path` (relative Kustomize directory, default `deploy/base`, no `..`). Status `phase` PENDING, BUILDING, READY or FAILED, `message` (sanitised), `applicationName`, `conditions[Ready]` |
+| `DeliveryRun` | `drun` | one-shot request, spec immutable: `spec.pipeline`, `spec.ref` (full 40-hex SHA), `spec.requestedBy` (Keycloak subject, informational). Status `phase` PENDING, RUNNING, SUCCEEDED or FAILED, `executionId`, `message` |
+
+**Pipeline.** Needs a live WorkloadIdentity (else FAILED `WorkloadNotFound`, retried every 30 s and on the WorkloadIdentity's creation). Creates the Spinnaker application `<ns>-<workload>` (the namespace must start with a letter, 62 characters at most) with a description marker `idp-managed namespace=<ns> workload=<workload>`: an existing application whose marker names another pair (the join `a-b` + `c` versus `a` + `b-c` is ambiguous) is refused (`ApplicationConflict`); one without a marker (the hand-made milestone 1 application) is adopted. Then saves the pipeline `deploy` from the template in `internal/delivery/template.go` (golden file `testdata/pipeline.golden.json`): Bake (Manifest, KUSTOMIZE, git/repo artifact, version `${parameters.ref}`) then Deploy (Manifest) to account = namespace. READY only after Gate lists the pipeline; a resync every 10 min repairs a deleted one. Gate failures keep the phase BUILDING (READY stays READY) with a message of the form `gate: HTTP 503 (Service Unavailable)`; a response body is never copied anywhere. The pipeline adds nothing to the manifests: `serviceAccountName`, the pod label `idp.ithaca-idp.com/workload` and the image digest come from the app repo's Kustomize base, and `idp-spinnaker-scope` (idp-gitops) refuses a Deployment from Clouddriver without them.
+
+**Run.** Waits for the pipeline to be READY, triggers `POST /pipelines/<app>/deploy` with parameter `ref`, records `executionId` at once and polls every 8 s: SUCCEEDED, or TERMINAL/CANCELED/STOPPED to FAILED, and FAILED after 30 min. A crash between trigger and the status write would start the run twice (at-least-once). Terminal runs are never touched again.
+
+**Not done (follow-up).** Deleting a DeliveryPipeline does not delete the Spinnaker application or pipeline (no finalizer); nor are old DeliveryRuns cleaned up.
+
+| Flag (env) | Default | Meaning |
+|---|---|---|
+| `--enabled` (`DELIVERY_ENABLED`) | `false` | run the controllers; false is an idle process with probes and no Gate call |
+| `--gate-url` (`GATE_URL`) | `http://gate.spinnaker.svc:8084` | Gate; `/api/v1` is appended when the URL has no path |
+| `--allowed-repo-orgs` (`DELIVERY_ALLOWED_REPO_ORGS`) | `ithaca-lab-org` | comma separated GitHub owners |
+| `--metrics-bind-address` (`METRICS_BIND_ADDRESS`) | `0` (off) | plain HTTP |
+| `--health-probe-bind-address` (`HEALTH_PROBE_BIND_ADDRESS`) | `:8081` | `/healthz`, `/readyz` |
+| `--leader-elect` | `false` | Lease `idp-delivery` in `idp-system` |
+
+**RBAC** (`config/rbac/delivery-role.yaml`, ClusterRole and Role `idp-delivery`): get, list, watch on `deliverypipelines`, `deliveryruns`, `workloadidentities`; get, update on the first two `/status`; `events` create, patch; in `idp-system` Lease and core events for leader election. No Secrets, no writes on WorkloadIdentities.
+
+**Admission policy** (`config/policy/delivery-scope.yaml`): `idp-delivery-scope` lets only `idp-system:idp-delivery` UPDATE the status of the two kinds (spec, labels, annotations, ownerReferences, finalizers unchanged; `applicationName` must be `<ns>-<name>`); `idp-delivery-writers` refuses CREATE/UPDATE by anyone except `portal-api`, `idp-delivery` and `system:masters`. `idp-portal-scope` lets `portal-api` only CREATE the two kinds, in managed namespaces, without labels.
+
 ## Develop
 
 ```sh
