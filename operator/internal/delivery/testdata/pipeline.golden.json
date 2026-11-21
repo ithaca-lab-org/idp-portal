@@ -1,0 +1,51 @@
+{
+  "application": "demo-orders",
+  "name": "deploy",
+  "description": "idp-managed namespace=demo workload=orders",
+  "keepWaitingPipelines": false,
+  "limitConcurrent": true,
+  "expectedArtifacts": [],
+  "triggers": [],
+  "parameterConfig": [
+    {"name": "ref", "label": "Git commit SHA", "required": true, "hasOptions": false, "options": []}
+  ],
+  "stages": [
+    {
+      "refId": "1",
+      "requisiteStageRefIds": [],
+      "type": "bakeManifest",
+      "name": "Bake kustomize",
+      "templateRenderer": "KUSTOMIZE",
+      "kustomizeFilePath": "deploy/base/kustomization.yaml",
+      "namespace": "demo",
+      "outputName": "app",
+      "expectedArtifacts": [
+        {
+          "id": "baked-app",
+          "displayName": "baked-app",
+          "usePriorArtifact": false,
+          "useDefaultArtifact": false,
+          "matchArtifact": {"type": "embedded/base64", "name": "app", "artifactAccount": "embedded-artifact"}
+        }
+      ],
+      "inputArtifact": {
+        "account": "public-git",
+        "artifact": {"type": "git/repo", "artifactAccount": "public-git", "reference": "https://github.com/ithaca-lab-org/sample-orders-api", "version": "${parameters.ref}"}
+      }
+    },
+    {
+      "refId": "2",
+      "requisiteStageRefIds": ["1"],
+      "type": "deployManifest",
+      "name": "Deploy",
+      "account": "demo",
+      "cloudProvider": "kubernetes",
+      "moniker": {"app": "demo-orders"},
+      "source": "artifact",
+      "manifestArtifactAccount": "embedded-artifact",
+      "manifestArtifactId": "baked-app",
+      "namespaceOverride": "demo",
+      "skipExpressionEvaluation": true
+    }
+  ]
+}
