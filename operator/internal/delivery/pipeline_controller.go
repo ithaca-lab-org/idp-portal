@@ -117,16 +117,11 @@ func (r *PipelineReconciler) sync(ctx context.Context, dp *idpv1alpha1.DeliveryP
 	}
 	want := AppDescription(dp.Namespace, dp.Spec.Workload)
 	if exists && desc != want {
-		if desc != "" {
-			msg := fmt.Sprintf("Spinnaker application %s belongs to another namespace and workload pair", app)
-			return &ctrl.Result{}, r.fail(ctx, dp, ReasonAppConflict, msg)
-		}
-		// Unmarked (the hand-made milestone 1 application): adopt it by stamping the marker
-		// first, so that a second pair that joins to the same name is refused from now on.
-		if err := r.Gate.SetApplicationDescription(ctx, app, want); err != nil {
-			return nil, err
-		}
-		return &ctrl.Result{RequeueAfter: buildRetry}, nil
+		// Anything but this pair's own marker is refused: never adopted, never stamped. That covers
+		// another pair (the join <ns>-<workload> is ambiguous) and applications made outside the
+		// controller (Deck, scripts).
+		msg := fmt.Sprintf("Spinnaker application %s exists and is not managed by idp for this namespace and workload", app)
+		return &ctrl.Result{}, r.fail(ctx, dp, ReasonAppConflict, msg)
 	}
 	if !exists {
 		if err := r.Gate.CreateApplication(ctx, app, want); err != nil {

@@ -108,17 +108,6 @@ func (g *fakeGate) Trigger(_ context.Context, app, pipeline string, params map[s
 	return g.TriggerID, nil
 }
 
-func (g *fakeGate) SetApplicationDescription(_ context.Context, app, description string) error {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	g.call("stamp:" + app)
-	if g.Err != nil {
-		return g.Err
-	}
-	g.pending[app] = description
-	return nil
-}
-
 func (g *fakeGate) ExecutionStatus(_ context.Context, id string) (string, string, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()

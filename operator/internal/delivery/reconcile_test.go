@@ -268,24 +268,19 @@ func TestPipelineApplicationConflict(t *testing.T) {
 	if _, ok := g.Pipelines["demo-orders"]; ok {
 		t.Error("pipeline written into a foreign application")
 	}
-	// An application without a marker (the hand-made milestone 1 one) is adopted only by
-	// stamping the marker first; the pipeline is saved after the stamp is visible.
+	// An application without a marker (made in Deck or by a script) is refused: never adopted,
+	// never stamped, its pipeline untouched.
 	g2 := newFakeGate()
 	g2.Apps["demo-orders"] = ""
 	c2 := newClient(t, pipelineObj(goodRepo), workload("demo", "orders"))
-	r2 := pipelineRec(c2, g2)
-	_, dp = reconcilePipeline(t, r2, c2)
-	if dp.Status.Phase != idpv1alpha1.DeliveryPhaseBuilding || len(g2.Pipelines) != 0 || g2.pending["demo-orders"] != AppDescription("demo", "orders") {
-		t.Fatalf("unmarked application not stamped first: %+v pipelines=%d", dp.Status, len(g2.Pipelines))
-	}
-	_, dp = reconcilePipeline(t, r2, c2)
-	if dp.Status.Phase != idpv1alpha1.DeliveryPhaseReady {
-		t.Errorf("stamped application not adopted: %+v", dp.Status)
+	_, dp = reconcilePipeline(t, pipelineRec(c2, g2), c2)
+	if dp.Status.Phase != idpv1alpha1.DeliveryPhaseFailed || dp.Status.Conditions[0].Reason != ReasonAppConflict ||
+		!strings.Contains(dp.Status.Message, "not managed by idp") || len(g2.Pipelines) != 0 || g2.Apps["demo-orders"] != "" || len(g2.pending) != 0 {
+		t.Errorf("unmarked application not refused: %+v", dp.Status)
 	}
 	// Collision: namespace "a-b" + workload "c" and namespace "a" + workload "b-c" both want
-	// "a-b-c". Whichever stamped it first keeps it; the other pair is refused, never adopted.
+	// "a-b-c". Whichever created it first keeps it; the other pair is refused, never adopted.
 	g3 := newFakeGate()
-	g3.Apps["a-b-c"] = ""
 	first := collisionPipeline("a-b", "c")
 	c3 := newClient(t, first, workload("a-b", "c"))
 	r3 := pipelineRec(c3, g3)
