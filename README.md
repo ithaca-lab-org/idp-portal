@@ -60,6 +60,19 @@ Known limits: group membership comes from the session, so a group change applies
 
 Environment: `SECRETS_ENABLED`, `VAULT_ADDR` (default `https://vault.vault.svc.cluster.local:8200`), `VAULT_SECRETS_ROLE` (`portal-secrets`), `VAULT_AUTH_MOUNT` (`kubernetes`), `VAULT_KV_MOUNT` (`kv`), `VAULT_TOKEN_PATH` (`/var/run/secrets/vault/token`, a projected ServiceAccount token with audience `vault`, re-read at every login), `VAULT_CACERT` (PEM file with the CA of Vault's TLS listener; when set it is the only trusted root for Vault and `VAULT_ADDR` must be `https`; read once at start). The ServiceAccount additionally needs `create`, `get` and `delete` on `managedsecrets.idp.ithaca-idp.com`.
 
+### Pipelines page (ADR 0011; off unless `PIPELINES_ENABLED=true`; off, every route answers 404, nothing calls the cluster and the page is hidden)
+
+Orders a delivery pipeline for a workload (a `DeliveryPipeline`) and deploys a commit (a `DeliveryRun`). The portal only creates the two resources; the idp-delivery controller is the only caller of Spinnaker's Gate and reports `phase` and `message` in the status. The portal never calls Gate or Spinnaker. The namespace check is the one of Secrets and Workloads (a foreign, unknown or malformed namespace is the same 404); any member of the namespace's business unit may do all of it.
+
+- `GET /api/pipelines/namespaces`: the caller's namespaces plus the rules (`allowedOrgs`, `defaultPath`, `maxRuns`);
+- `GET /api/namespaces/{ns}/pipelines`: pipelines with `workload`, `repo`, `path`, `phase` (`PENDING|BUILDING|READY|FAILED`), `message`, `applicationName`;
+- `POST /api/namespaces/{ns}/pipelines` `{"workload","repo","path"?}` -> 202, a `DeliveryPipeline` named after the workload (no labels, annotations, finalizers or ownerReferences). The `WorkloadIdentity` must exist (400 otherwise); `repo` is `https://github.com/<org>/<repo>` with `<org>` in `PIPELINES_ALLOWED_REPO_ORGS` (400); `path` defaults to `deploy/base`, relative, without `..`, `//` or a trailing `/` (400); a repeat is a 409;
+- `GET /api/namespaces/{ns}/pipelines/{name}/runs`: the 20 newest runs of the pipeline with `phase` (`PENDING|RUNNING|SUCCEEDED|FAILED`), `message`, `executionId`, `ref`, `requestedBy`, `createdAt`;
+- `POST /api/namespaces/{ns}/pipelines/{name}/runs` `{"ref"}` -> 202, a `DeliveryRun` named `<pipeline>-<8 hex>`. `ref` must be a full 40-hex lowercase commit SHA (deploy by commit; the image digest is pinned in the repository manifests); the pipeline must exist (404). `requestedBy` is the session's Keycloak subject; a body field for it is refused (unknown field). At most 100 runs per namespace (429): the portal cannot delete runs.
+- Creations are logged (`audit: deliverypipeline created`, `audit: deliveryrun created`, with namespace, names and subject). Same rules as the other pages: JSON only, 8 KB, unknown fields rejected, same-origin for writes, 10 writes and 120 reads per user per minute. A test fails if the patterns drift from the CRDs.
+
+Environment: `PIPELINES_ENABLED`, `PIPELINES_ALLOWED_REPO_ORGS` (comma list, default `ithaca-lab-org`). The ServiceAccount additionally needs `get`, `list`, `create` on `deliverypipelines.idp.ithaca-idp.com` and `deliveryruns.idp.ithaca-idp.com` (and `get` on `workloadidentities`); no update, patch, delete or watch. The admission policy `idp-portal-scope` pins what it may write.
+
 ### Resources page (ADR 0010; off unless `RESOURCES_ENABLED=true`; off, every route answers 404, nothing calls the cluster and the page is hidden)
 
 Orders a Cloud Storage bucket (a `BucketClaim`) and gives a workload access to it (a `ResourceGrant`). The portal only writes the two resources; the resource broker creates the bucket and the IAM binding and reports in the status. The namespace check is the one of Secrets and Workloads (a foreign, unknown or malformed namespace is the same 404).

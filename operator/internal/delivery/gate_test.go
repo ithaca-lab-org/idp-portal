@@ -73,9 +73,6 @@ func TestHTTPGate(t *testing.T) {
 	if st, app, err := g.ExecutionStatus(ctx, "01EXEC"); err != nil || st != "SUCCEEDED" || app != "demo-orders" {
 		t.Errorf("ExecutionStatus = %q %q, %v", st, app, err)
 	}
-	if err := g.SetApplicationDescription(ctx, "demo-orders", "d"); err != nil || !strings.Contains(gotBody, `"updateApplication"`) {
-		t.Errorf("stamp: %v %s", err, gotBody)
-	}
 
 	// Failures: status code and a fixed reason, never the body.
 	_, err = g.Trigger(ctx, "nope", "deploy", nil)

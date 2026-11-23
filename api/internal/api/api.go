@@ -17,6 +17,7 @@ import (
 
 	"github.com/ithaca-lab-org/idp-portal/api/internal/auth"
 	"github.com/ithaca-lab-org/idp-portal/api/internal/orders"
+	"github.com/ithaca-lab-org/idp-portal/api/internal/pipelines"
 	"github.com/ithaca-lab-org/idp-portal/api/internal/resources"
 	"github.com/ithaca-lab-org/idp-portal/api/internal/secrets"
 	"github.com/ithaca-lab-org/idp-portal/api/internal/workloads"
@@ -44,6 +45,11 @@ type API struct {
 	Workloads      *workloads.Service
 	workloadWrites *limiter
 	workloadReads  *limiter
+	// Pipelines is the Pipelines page backend (DeliveryPipeline and DeliveryRun); nil
+	// (PIPELINES_ENABLED not true) makes its routes 404.
+	Pipelines      *pipelines.Service
+	pipelineWrites *limiter
+	pipelineReads  *limiter
 	// Resources is the Resources page backend (buckets and grants); nil (RESOURCES_ENABLED not
 	// true) makes its routes 404.
 	Resources      *resources.Service
@@ -57,6 +63,7 @@ func New(a *auth.Handler, svc *orders.Service) *API {
 	return &API{Auth: a, Svc: svc, limiter: newLimiter(10, time.Minute),
 		secretWrites: newLimiter(secretWritesPerMinute, time.Minute), secretReads: newLimiter(secretReadsPerMinute, time.Minute),
 		workloadWrites: newLimiter(workloadWritesPerMinute, time.Minute), workloadReads: newLimiter(workloadReadsPerMinute, time.Minute),
+		pipelineWrites: newLimiter(pipelineWritesPerMinute, time.Minute), pipelineReads: newLimiter(pipelineReadsPerMinute, time.Minute),
 		resourceWrites: newLimiter(resourceWritesPerMinute, time.Minute), resourceReads: newLimiter(resourceReadsPerMinute, time.Minute)}
 }
 
@@ -106,6 +113,7 @@ func (a *API) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/orders/{id}", a.user(a.getOrder))
 	a.secretRoutes(mux)
 	a.workloadRoutes(mux)
+	a.pipelineRoutes(mux)
 	a.resourceRoutes(mux)
 }
 

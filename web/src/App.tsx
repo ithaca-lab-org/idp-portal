@@ -2,11 +2,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   businessUnits,
   listNamespaces,
+  listPipelineNamespaces,
   listResourceNamespaces,
   listWorkloadNamespaces,
   logout,
   me,
   type Order,
+  type PipelinesInfo,
   type ResourcesInfo,
   type SecretsInfo,
   type User,
@@ -14,6 +16,7 @@ import {
 import { OrderForm } from "./OrderForm";
 import { rememberedNs, rememberNs } from "./namespaces";
 import { OrderHistory } from "./OrderHistory";
+import { PipelinesPage } from "./PipelinesPage";
 import { ResourcesPage } from "./ResourcesPage";
 import { SecretsPage } from "./SecretsPage";
 import { WorkloadsPage } from "./WorkloadsPage";
@@ -25,7 +28,8 @@ type Session =
   // secrets is null when the Secrets page is turned off on the server
   // workloads is null when the Workloads page is turned off on the server
   // resources is null when the Resources page is turned off on the server
-  | { state: "in"; user: User; units: string[]; secrets: SecretsInfo | null; workloads: SecretsInfo | null; resources: ResourcesInfo | null };
+  // pipelines is null when the Pipelines page is turned off on the server
+  | { state: "in"; user: User; units: string[]; secrets: SecretsInfo | null; workloads: SecretsInfo | null; resources: ResourcesInfo | null; pipelines: PipelinesInfo | null };
 
 /** The Secrets page is optional: any failure to list namespaces just hides it. */
 async function secretNamespaces(): Promise<SecretsInfo | null> {
@@ -54,7 +58,16 @@ async function resourceNamespaces(): Promise<ResourcesInfo | null> {
   }
 }
 
-type Page = "orders" | "secrets" | "workloads" | "resources";
+/** The Pipelines page is optional too. */
+async function pipelineNamespaces(): Promise<PipelinesInfo | null> {
+  try {
+    return await listPipelineNamespaces();
+  } catch {
+    return null;
+  }
+}
+
+type Page = "orders" | "secrets" | "workloads" | "resources" | "pipelines";
 const REFRESH_MS = 30_000;
 
 export function App() {
@@ -73,10 +86,10 @@ export function App() {
   }
 
   /** Reloads one namespace list in the background. A failure keeps the old value; an unchanged list keeps the state. */
-  const refresh = useCallback(async (key: "secrets" | "workloads" | "resources") => {
+  const refresh = useCallback(async (key: "secrets" | "workloads" | "resources" | "pipelines") => {
     lastRefresh.current = Date.now();
     try {
-      const next = await (key === "secrets" ? listNamespaces : key === "workloads" ? listWorkloadNamespaces : listResourceNamespaces)();
+      const next = await (key === "secrets" ? listNamespaces : key === "workloads" ? listWorkloadNamespaces : key === "pipelines" ? listPipelineNamespaces : listResourceNamespaces)();
       if (!next) return;
       setSession((s) => (s.state === "in" && JSON.stringify(s[key]) !== JSON.stringify(next) ? ({ ...s, [key]: next } as Session) : s));
     } catch {
@@ -106,13 +119,14 @@ export function App() {
       try {
         const user = await me();
         if (!user) return setSession({ state: "anonymous" });
-        const [units, secrets, workloads, resources] = await Promise.all([
+        const [units, secrets, workloads, resources, pipelines] = await Promise.all([
           businessUnits(),
           secretNamespaces(),
           workloadNamespaces(),
           resourceNamespaces(),
+          pipelineNamespaces(),
         ]);
-        setSession({ state: "in", user, units, secrets, workloads, resources });
+        setSession({ state: "in", user, units, secrets, workloads, resources, pipelines });
       } catch {
         setSession({ state: "error" });
       }
@@ -148,7 +162,7 @@ export function App() {
         </span>
         <button onClick={signOut}>Sign out</button>
       </header>
-      {(session.secrets !== null || session.workloads !== null || session.resources !== null) && (
+      {(session.secrets !== null || session.workloads !== null || session.resources !== null || session.pipelines !== null) && (
         <nav aria-label="Pages">
           <button aria-current={page === "orders" ? "page" : undefined} onClick={() => go("orders")}>
             Orders
@@ -161,6 +175,11 @@ export function App() {
           {session.workloads !== null && (
             <button aria-current={page === "workloads" ? "page" : undefined} onClick={() => go("workloads")}>
               Workloads
+            </button>
+          )}
+          {session.pipelines !== null && (
+            <button aria-current={page === "pipelines" ? "page" : undefined} onClick={() => go("pipelines")}>
+              Pipelines
             </button>
           )}
           {session.resources !== null && (
@@ -179,6 +198,11 @@ export function App() {
       {session.workloads !== null && visited.includes("workloads") && (
         <div hidden={page !== "workloads"}>
           <WorkloadsPage namespaces={session.workloads.namespaces} rules={session.workloads} active={page === "workloads"} ns={ns} onNs={chooseNs} />
+        </div>
+      )}
+      {session.pipelines !== null && visited.includes("pipelines") && (
+        <div hidden={page !== "pipelines"}>
+          <PipelinesPage info={session.pipelines} active={page === "pipelines"} ns={ns} onNs={chooseNs} />
         </div>
       )}
       {session.resources !== null && visited.includes("resources") && (
