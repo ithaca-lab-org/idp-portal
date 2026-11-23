@@ -20,6 +20,7 @@ import (
 	"github.com/ithaca-lab-org/idp-portal/api/internal/api"
 	"github.com/ithaca-lab-org/idp-portal/api/internal/auth"
 	"github.com/ithaca-lab-org/idp-portal/api/internal/orders"
+	"github.com/ithaca-lab-org/idp-portal/api/internal/pipelines"
 	"github.com/ithaca-lab-org/idp-portal/api/internal/pubsubpub"
 	"github.com/ithaca-lab-org/idp-portal/api/internal/resources"
 	"github.com/ithaca-lab-org/idp-portal/api/internal/secrets"
@@ -169,6 +170,18 @@ func main() {
 		workloadSvc = workloads.NewService(workloads.DynamicCluster{Client: dyn}, store)
 		slog.Info("workloads page enabled")
 	}
+	// The Pipelines page (DeliveryPipeline and DeliveryRun, ADR 0011) is off unless PIPELINES_ENABLED
+	// is exactly "true"; off, its routes answer 404. The portal only writes the two resources.
+	var pipelineSvc *pipelines.Service
+	if os.Getenv("PIPELINES_ENABLED") == "true" {
+		orgs := pipelines.ParseOrgs(envOr("PIPELINES_ALLOWED_REPO_ORGS", pipelines.DefaultAllowedOrgs))
+		if len(orgs) == 0 {
+			slog.Error("PIPELINES_ALLOWED_REPO_ORGS must name at least one organisation")
+			os.Exit(1)
+		}
+		pipelineSvc = pipelines.NewService(pipelines.DynamicCluster{Client: dyn}, store, orgs)
+		slog.Info("pipelines page enabled", "allowedRepoOrgs", orgs)
+	}
 	// The Resources page (buckets and grants, ADR 0010) is off unless RESOURCES_ENABLED is exactly
 	// "true"; off, its routes answer 404 and nothing calls the cluster.
 	var resourceSvc *resources.Service
@@ -184,6 +197,7 @@ func main() {
 	apiHandler := api.New(h, svc)
 	apiHandler.Secrets = secretSvc
 	apiHandler.Workloads = workloadSvc
+	apiHandler.Pipelines = pipelineSvc
 	apiHandler.Resources = resourceSvc
 	apiHandler.Routes(mux)
 	mux.Handle("GET /", webui.Handler())
