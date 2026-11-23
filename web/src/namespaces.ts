@@ -1,4 +1,4 @@
-// The namespace picked on the Secrets, Workloads and Resources pages is shared and kept for the browser session.
+// The namespace picked on the Secrets, Workloads, Pipelines and Resources pages is shared and kept for the browser session.
 const KEY = "idp.ns";
 
 export function rememberedNs(): string {

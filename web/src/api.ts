@@ -271,3 +271,70 @@ export async function revokeGrant(ns: string, name: string): Promise<void> {
     throw new ApiError(res.status, msg);
   }
 }
+
+export type Phase = "PENDING" | "BUILDING" | "READY" | "RUNNING" | "SUCCEEDED" | "FAILED";
+
+/** What the Pipelines page needs up front: the namespaces and the rules the API applies. */
+export interface PipelinesInfo {
+  namespaces: Namespace[];
+  allowedOrgs: string[];
+  defaultPath: string;
+  maxRuns: number;
+}
+
+/** A DeliveryPipeline as the delivery controller reports it. */
+export interface Pipeline {
+  namespace: string;
+  name: string;
+  workload: string;
+  repo: string;
+  path: string;
+  phase: Phase;
+  message?: string;
+  applicationName?: string;
+  createdAt?: string;
+}
+
+/** A DeliveryRun: one deploy of one commit. */
+export interface Run {
+  namespace: string;
+  name: string;
+  pipeline: string;
+  ref: string;
+  requestedBy?: string;
+  phase: Phase;
+  message?: string;
+  executionId?: string;
+  createdAt?: string;
+}
+
+/** The namespaces the user may use for pipelines; null when the Pipelines page is turned off (404). */
+export async function listPipelineNamespaces(): Promise<PipelinesInfo | null> {
+  try {
+    return await call<PipelinesInfo>("/api/pipelines/namespaces");
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404) return null;
+    throw e;
+  }
+}
+
+export const listPipelines = async (ns: string) =>
+  (await call<{ pipelines: Pipeline[] }>(`/api/namespaces/${seg(ns)}/pipelines`)).pipelines;
+
+export const placePipeline = (ns: string, workload: string, repo: string, path?: string) =>
+  call<Pipeline>(`/api/namespaces/${seg(ns)}/pipelines`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(path ? { workload, repo, path } : { workload, repo }),
+  });
+
+export const listRuns = async (ns: string, pipeline: string) =>
+  (await call<{ runs: Run[] }>(`/api/namespaces/${seg(ns)}/pipelines/${seg(pipeline)}/runs`)).runs;
+
+/** Deploys a commit; who asked is taken from the session on the server, never sent. */
+export const placeRun = (ns: string, pipeline: string, ref: string) =>
+  call<Run>(`/api/namespaces/${seg(ns)}/pipelines/${seg(pipeline)}/runs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ref }),
+  });
